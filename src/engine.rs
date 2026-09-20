@@ -21,7 +21,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::summary::Summary;
 use crate::util::{self, from_wide, ms_to_ticks, wide};
-use crate::{analyze, etw, modules, probe, say, state};
+use crate::{analyze, cpuclock, etw, modules, probe, say, state};
+
+pub use crate::analyze::mark_now;
 
 pub enum LogTarget {
     /// WTFIsStalling-<timestamp>.txt in the current directory, else in %TEMP%.
@@ -260,6 +262,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     let probe_stop = Arc::new(AtomicBool::new(false));
     let probe_stats = Arc::new(probe::ProbeStats::default());
     probe::spawn_scheduler_probe(cfg.sched_stall_ms, tx.clone(), probe_stop.clone(), probe_stats.clone());
+    let cpu_clock = cpuclock::spawn(probe_stop.clone());
     let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, tx, probe_stats.clone()) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -328,7 +331,8 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
         Ok(Ok(())) => {}
     }
     analyzer.tick(true);
-    let summary = analyzer.summarize(started.elapsed().as_secs_f64(), lost, &probe_stats, shared.exec_warn, shared.io_warn);
+    let clock_samples = cpu_clock.lock().unwrap().clone();
+    let summary = analyzer.summarize(started.elapsed().as_secs_f64(), lost, &probe_stats, shared.exec_warn, shared.io_warn, &clock_samples);
     // Streamed order ends with the result, because on a console the bottom is what you see.
     say!("");
     for line in summary.detail_lines().iter().chain(summary.result_lines().iter()) {

@@ -84,7 +84,10 @@ running with RGB/monitoring utilities open (DPC latency).
 | `src/engine.rs` | One monitoring run from start to summary; shared by both front ends |
 | `src/etw.rs` | Kernel trace session and event payload parsing |
 | `src/probe.rs` | Latency probes and the real-time helper process |
-| `src/analyze.rs` | Correlation, verdicts, summary text |
+| `src/analyze.rs` | Correlation and per-incident verdicts, including user-flagged moments |
+| `src/summary.rs` | Ranked findings, verdict and report text built from a finished run |
+| `src/period.rs` | Detects events that repeat on a timer |
+| `src/cpuclock.rs` | Per-core effective speed sampling (throttling) |
 | `src/modules.rs` | Kernel address → driver, and the driver knowledge base |
 | `src/procs.rs` | PID → process name |
 | `src/state.rs` | Records and ring buffers shared between the trace thread and the analyzer |

@@ -25,6 +25,8 @@ nothing on the system.
    Say **Yes** to the administrator prompt (tracing the kernel requires it).
 2. Click **Start monitoring**.
 3. Use the PC until the hitch happens, ideally a few times. Run the game or app that has the problem.
+   **When you feel a hitch, press Ctrl+Shift+F9** (works inside games) or click **I felt it!** The report
+   then zooms in on the seconds before each press, with no thresholds.
 4. Click **Stop**. Read the summary, or click **Copy report** and paste it to whoever is helping you.
 
 > **"Windows protected your PC"?** That is SmartScreen reacting to a new, unsigned program that few
@@ -49,11 +51,14 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file, with advice for the usual suspects |
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
+| **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide |
+| Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them |
 
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
-overflow, frame pacing). If a hitch happened and the report is clean, that's where to look next.
+overflow, frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was
+interrupted for even a millisecond around it, the report says so, and that's where to look next.
 
 ## Example report (illustrative)
 
@@ -112,6 +117,13 @@ on that CPU during that window and issues a verdict:
    Windows entirely: SMI/firmware, hypervisor, or interrupts disabled.
 3. Otherwise → whichever kernel module or process the CPU samples show.
 
+**Flagged moments.** Wake-up delays from 1 ms up are kept for 30 seconds even though they are far below
+the stall threshold. When you press "I felt it", the worst one in the 3 seconds before the press goes
+through the same verdict logic as a full stall; if there is none, the CPU side is cleared for that hitch.
+
+**CPU clock.** Once a second the "Processor Information" counters are read per core. Only cores that are
+busy are judged: an idle core clocking down is normal, a busy core at half speed is throttling.
+
 Individually slow events (DPC ≥ 1 ms, hard fault ≥ 50 ms, disk request ≥ 200 ms) are logged even when no
 probe stalls.
 
@@ -123,7 +135,8 @@ probe stalls.
 wtfis-cli --duration 300 --stall-ms 2 --dpc-warn-us 500
 ```
 
-Run `wtfis-cli --help` for all options. Press Ctrl+C to stop and print the summary.
+Run `wtfis-cli --help` for all options. Press Enter to flag a hitch, Ctrl+C to stop and print the
+summary.
 
 ## Building
 

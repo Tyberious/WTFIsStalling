@@ -44,7 +44,14 @@ pub struct Stall {
     pub start: i64,
     /// When it actually ran.
     pub end: i64,
+    /// Below the stall threshold: not reported by itself, but kept briefly so that a moment
+    /// the user flags ("I felt it") can be examined at finer grain.
+    pub minor: bool,
 }
+
+/// Lateness from which wake-ups are kept as minor, per probe kind (ms).
+const MINOR_KERNEL_MS: f64 = 1.0;
+const MINOR_SCHED_MS: f64 = 8.0;
 
 #[derive(Default)]
 pub struct ProbeStats {
@@ -91,6 +98,7 @@ fn run(
 
         let interval = ms_to_ticks(interval_ms);
         let threshold = ms_to_ticks(threshold_ms);
+        let minor_threshold = ms_to_ticks(threshold_ms.min(if kind == StallKind::Kernel { MINOR_KERNEL_MS } else { MINOR_SCHED_MS }));
         let due: i64 = -((interval_ms * 10_000.0) as i64); // relative, 100 ns units
         let warmup_until = qpc() + ms_to_ticks(500.0);
         let mut early_wakes = 0;
@@ -117,8 +125,8 @@ fn run(
                 continue;
             }
             max_slot.fetch_max(late, Ordering::Relaxed);
-            if late >= threshold {
-                let _ = tx.send(Stall { kind, cpu, start: t0 + interval, end: t1 });
+            if late >= minor_threshold {
+                let _ = tx.send(Stall { kind, cpu, start: t0 + interval, end: t1, minor: late < threshold });
             }
         }
     }
@@ -151,9 +159,10 @@ pub fn spawn_kernel_probes(threshold_ms: f64, tx: Sender<Stall>, stats: Arc<Prob
                 let tag = it.next().unwrap_or("");
                 let nums: Vec<i64> = it.filter_map(|x| x.parse().ok()).collect();
                 match (tag, nums.as_slice()) {
-                    ("S", [cpu, start, end]) => {
+                    ("S" | "L", [cpu, start, end]) => {
                         stats.max_kernel.fetch_max(end - start, Ordering::Relaxed);
-                        let _ = tx.send(Stall { kind: StallKind::Kernel, cpu: Some(*cpu as u16), start: *start, end: *end });
+                        let _ =
+                            tx.send(Stall { kind: StallKind::Kernel, cpu: Some(*cpu as u16), start: *start, end: *end, minor: tag == "L" });
                     }
                     ("M", [max]) => {
                         stats.max_kernel.fetch_max(*max, Ordering::Relaxed);
@@ -198,7 +207,7 @@ pub fn child_main(threshold_ms: f64) -> ! {
     let _ = writeln!(out, "C {}", unsafe { GetPriorityClass(GetCurrentProcess()) });
     loop {
         let msg = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(s) => format!("S {} {} {}", s.cpu.unwrap_or(0), s.start, s.end),
+            Ok(s) => format!("{} {} {} {}", if s.minor { "L" } else { "S" }, s.cpu.unwrap_or(0), s.start, s.end),
             Err(_) => format!("M {}", max.load(Ordering::Relaxed)),
         };
         if writeln!(out, "{msg}").and_then(|_| out.flush()).is_err() {

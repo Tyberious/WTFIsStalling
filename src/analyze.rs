@@ -1,9 +1,9 @@
 //! Correlates probe stalls with what ETW saw on the affected CPUs, prints incident
 //! reports as they happen and the final summary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
@@ -14,9 +14,27 @@ use crate::util::{clock, fmt_dur, ms_to_ticks, qpc, ticks_to_ms};
 
 pub(crate) struct IncidentSummary {
     pub(crate) kind: StallKind,
+    pub(crate) start: i64,
     pub(crate) dur: i64,
     pub(crate) culprit: String,
+    /// Below the stall threshold; only examined because the user flagged that moment.
+    pub(crate) marked: bool,
 }
+
+/// Moments the user flagged with "I felt it" (QPC), waiting for the analyzer to pick them up.
+static MARKS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+/// Called from a front end (button, hotkey, Enter key) the instant the user feels a hitch.
+pub fn mark_now() {
+    MARKS.lock().unwrap().push(qpc());
+}
+
+/// A person reacts a good while after the hitch; look this far back from the mark...
+const MARK_BEFORE_MS: f64 = 3000.0;
+/// ...and a little past it, in case they anticipated a periodic one.
+const MARK_AFTER_MS: f64 = 300.0;
+/// How long sub-threshold wake-up delays are kept for marks to draw on.
+const MINOR_KEEP_MS: f64 = 30_000.0;
 
 pub struct Analyzer {
     pub(crate) shared: Arc<Shared>,
@@ -26,6 +44,14 @@ pub struct Analyzer {
     pub procs: ProcNames,
     profile: bool,
     pub(crate) incidents: Vec<IncidentSummary>,
+    /// Recent wake-up delays under the stall threshold, newest last.
+    minor: VecDeque<Stall>,
+    marks_pending: Vec<i64>,
+    pub(crate) marks_total: u32,
+    /// Marks where nothing at all disturbed the CPUs.
+    pub(crate) marks_clean: u32,
+    /// Start times of over-threshold DPC/ISR runs per driver, for periodicity detection.
+    pub(crate) long_exec_times: HashMap<String, Vec<i64>>,
     notable_window_start: i64,
     notable_in_window: u32,
     pub(crate) notable_suppressed: u64,
@@ -51,6 +77,7 @@ type Shares = Vec<(String, f64)>;
 
 impl Analyzer {
     pub fn new(shared: Arc<Shared>, rx: Receiver<Stall>, modules: ModuleMap, profile: bool) -> Analyzer {
+        MARKS.lock().unwrap().clear(); // anything flagged before this run started is not about this run
         Analyzer {
             shared,
             rx,
@@ -59,6 +86,11 @@ impl Analyzer {
             procs: ProcNames::new(),
             profile,
             incidents: Vec::new(),
+            minor: VecDeque::new(),
+            marks_pending: Vec::new(),
+            marks_total: 0,
+            marks_clean: 0,
+            long_exec_times: HashMap::new(),
             notable_window_start: 0,
             notable_in_window: 0,
             notable_suppressed: 0,
@@ -69,8 +101,19 @@ impl Analyzer {
     /// Called ~10x per second. `force` analyzes everything pending (shutdown).
     pub fn tick(&mut self, force: bool) {
         self.procs.refresh_if_older_than(2);
-        self.pending.extend(self.rx.try_iter());
+        for s in self.rx.try_iter() {
+            if s.minor {
+                self.minor.push_back(s);
+            } else {
+                self.pending.push(s);
+            }
+        }
+        let now = qpc();
+        while self.minor.front().is_some_and(|s| s.end < now - ms_to_ticks(MINOR_KEEP_MS)) {
+            self.minor.pop_front();
+        }
         self.report_notables();
+        self.process_marks(force);
         if self.pending.is_empty() {
             return;
         }
@@ -89,7 +132,6 @@ impl Analyzer {
 
         // ETW delivers in ~1 s batches. A cluster is ripe once the trace has caught up past
         // its end, or we've waited long enough that it isn't going to.
-        let now = qpc();
         let latest = self.shared.inner.lock().unwrap().latest_ts;
         for c in clusters {
             let end = c.iter().map(|s| s.end).max().unwrap();
@@ -160,7 +202,96 @@ impl Analyzer {
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
-        self.incidents.push(IncidentSummary { kind, dur: worst, culprit });
+        self.incidents.push(IncidentSummary { kind, start, dur: worst, culprit, marked: false });
+    }
+
+    /// Marks wait for the trace to catch up just like stalls do.
+    fn process_marks(&mut self, force: bool) {
+        self.marks_pending.append(&mut MARKS.lock().unwrap());
+        if self.marks_pending.is_empty() {
+            return;
+        }
+        let now = qpc();
+        let latest = self.shared.inner.lock().unwrap().latest_ts;
+        let after = ms_to_ticks(MARK_AFTER_MS);
+        let (ripe, waiting): (Vec<i64>, Vec<i64>) = std::mem::take(&mut self.marks_pending).into_iter().partition(|&t| {
+            let caught_up = latest > t + after + ms_to_ticks(50.0);
+            force || (caught_up && now - t > ms_to_ticks(1000.0)) || now - t > ms_to_ticks(5000.0)
+        });
+        self.marks_pending = waiting;
+        for t in ripe {
+            self.analyze_mark(t, latest > t + after);
+        }
+    }
+
+    /// The user felt something at `t`. Look at the seconds before it with no threshold at all.
+    fn analyze_mark(&mut self, t: i64, caught_up: bool) {
+        self.marks_total += 1;
+        let (from, to) = (t - ms_to_ticks(MARK_BEFORE_MS), t + ms_to_ticks(MARK_AFTER_MS));
+        say!("");
+        say!(
+            "[{}] MARK #{}  you flagged a hitch; examining the {:.0} s before it",
+            clock().fmt(t),
+            self.marks_total,
+            MARK_BEFORE_MS / 1000.0
+        );
+
+        // A full stall in the window already has (or will get) its own entry and verdict.
+        let full = self.incidents.iter().filter(|i| !i.marked && i.start >= from && i.start <= to).count()
+            + self.pending.iter().filter(|s| s.start >= from && s.start <= to).count();
+        if full > 0 {
+            say!("    A full stall was detected at this moment; see the STALL entries around this time.");
+            return;
+        }
+
+        let in_window: Vec<Stall> =
+            self.minor.iter().filter(|s| s.kind == StallKind::Kernel && s.end >= from && s.start <= to).copied().collect();
+        let Some(worst) = in_window.iter().max_by_key(|s| s.end - s.start).copied() else {
+            let ev = self.gather(from, to, from, caught_up);
+            say!("    No CPU was interrupted for even 1 ms in that window, so drivers, interrupts and firmware are in the clear.");
+            self.print_longest_execs(&ev);
+            self.print_io_context(&ev);
+            let all: Vec<&(SampleRec, u32)> = ev.samples.iter().collect();
+            let (procs, _) = self.sample_breakdown(&all);
+            let busy: Vec<_> = procs.into_iter().filter(|(p, _)| p != "Idle").collect();
+            self.print_on_cpu(&busy, &[]);
+            say!("    -> If the hitch was real, look inside the app or at the GPU (frame pacing, shader compilation, VRAM).");
+            self.marks_clean += 1;
+            return;
+        };
+
+        // Examine the worst interruption (with whatever hit other CPUs at the same instant)
+        // exactly like a full stall, just without the threshold.
+        let gap = ms_to_ticks(2.0);
+        let cluster: Vec<Stall> = in_window.iter().filter(|s| s.start <= worst.end + gap && s.end >= worst.start - gap).copied().collect();
+        let start = cluster.iter().map(|s| s.start).min().unwrap();
+        let end = cluster.iter().map(|s| s.end).max().unwrap();
+        let dur = worst.end - worst.start;
+        say!(
+            "    {} brief CPU interruption(s) in that window; the worst held CPU {} for {} at {} ({:.1} s before your mark)",
+            in_window.len(),
+            worst.cpu.unwrap_or(0),
+            fmt_dur(dur),
+            clock().fmt(worst.start),
+            ticks_to_ms(t - worst.start) / 1000.0
+        );
+        let ev = self.gather(start - ms_to_ticks(0.5), end, from, caught_up);
+        let culprit = self.verdict_kernel(&cluster, &ev);
+        self.print_io_context(&ev);
+        self.incidents.push(IncidentSummary { kind: StallKind::Kernel, start, dur, culprit, marked: true });
+    }
+
+    fn print_longest_execs(&mut self, ev: &Evidence) {
+        let mut execs: Vec<&ExecRec> = ev.execs.iter().collect();
+        execs.sort_by_key(|e| std::cmp::Reverse(e.end - e.start));
+        let txt: Vec<String> = execs
+            .iter()
+            .take(3)
+            .map(|e| format!("{} {} {}", self.modules.name(e.routine), kind_name(e.kind), fmt_dur(e.end - e.start)))
+            .collect();
+        if !txt.is_empty() {
+            say!("    Longest DPC/ISR runs then: {}", txt.join(", "));
+        }
     }
 
     fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> String {
@@ -341,6 +472,12 @@ impl Analyzer {
         let notables = std::mem::take(&mut self.shared.inner.lock().unwrap().notable);
         for n in notables {
             self.notable_total += 1;
+            if let Notable::LongExec(e) = &n {
+                let times = self.long_exec_times.entry(self.modules.name(e.routine)).or_default();
+                if times.len() < 5000 {
+                    times.push(e.start);
+                }
+            }
             let now = qpc();
             if now - self.notable_window_start > ms_to_ticks(1000.0) {
                 self.notable_window_start = now;

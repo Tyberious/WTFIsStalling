@@ -4,9 +4,11 @@
 //! front ends over it.
 
 pub mod analyze;
+pub mod cpuclock;
 pub mod engine;
 pub mod etw;
 pub mod modules;
+pub mod period;
 pub mod probe;
 pub mod procs;
 pub mod state;

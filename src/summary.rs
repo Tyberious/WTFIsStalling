@@ -8,10 +8,12 @@ use std::sync::atomic::Ordering;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::analyze::Analyzer;
+use crate::cpuclock::ClockSample;
 use crate::modules::knowledge;
+use crate::period;
 use crate::probe::{ProbeStats, StallKind};
 use crate::state::*;
-use crate::util::{fmt_dur, ms_to_ticks, qpc};
+use crate::util::{fmt_dur, ms_to_ticks, qpc, qpc_freq};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Severity {
@@ -64,11 +66,15 @@ pub struct Summary {
 
 const WIDTH: usize = 100;
 
-fn wrap(text: &str, indent: &str, out: &mut Vec<String>) {
+/// Word-wraps `text`; the first line starts with `first`, the rest align under its text.
+fn wrap(text: &str, first: &str, out: &mut Vec<String>) {
+    let hang = " ".repeat(first.len());
+    let mut indent = first;
     let mut line = String::new();
     for word in text.split_whitespace() {
         if !line.is_empty() && indent.len() + line.len() + 1 + word.len() > WIDTH {
             out.push(format!("{indent}{line}"));
+            indent = &hang;
             line.clear();
         }
         if !line.is_empty() {
@@ -183,10 +189,34 @@ impl Findings {
             None => self.0.push((key.to_string(), Finding { severity, title, evidence: vec![evidence], advice, impact })),
         }
     }
+
+    /// Extra evidence for a subject that is already a finding. Returns whether it was.
+    fn note(&mut self, key: &str, evidence: String) -> bool {
+        match self.0.iter_mut().find(|(k, _)| k == key) {
+            Some((_, f)) => {
+                f.evidence.push(evidence);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 const GENERIC_DRIVER_ADVICE: &str = "Update this driver from the device maker's site, or roll it back if the problem started after an \
     update. To confirm, temporarily disable the device (or close the software it belongs to) and monitor again.";
+
+const POLLING_ADVICE: &str = "Something runs on a timer. The usual suspects poll hardware sensors: RGB and fan utilities (iCUE, Armoury \
+    Crate, Aura, RGB Fusion, MSI Center, NZXT CAM), monitoring tools (HWiNFO, Afterburner/RTSS, Ryzen Master), vendor 'control \
+    center' and battery utilities. Fully exit them one at a time (not just close the window) and monitor again.";
+
+const THROTTLE_ADVICE: &str = "The CPU is being held back by heat or a power limit. Watch temperatures under load (HWiNFO or the \
+    vendor's tool): clean dust, check the cooler is seated and the fans spin, renew thermal paste on older machines. On laptops \
+    plug in the charger and pick the 'Best performance' power mode. In the BIOS check that power limits, ECO mode or an undervolt \
+    are not set too aggressively.";
+
+fn secs(ticks: &[i64]) -> Vec<f64> {
+    ticks.iter().map(|t| *t as f64 / qpc_freq() as f64).collect()
+}
 
 const DARK_ADVICE: &str = "Windows itself was frozen out, which points below the operating system. Update the BIOS/UEFI, load BIOS \
     defaults (undo overclocks and memory tweaks), disable 'Legacy USB support' and unused onboard devices as a test, check for \
@@ -210,7 +240,15 @@ struct DriverAgg {
 }
 
 impl Analyzer {
-    pub fn summarize(&mut self, elapsed_s: f64, events_lost: u32, stats: &ProbeStats, exec_warn: i64, io_warn: i64) -> Summary {
+    pub fn summarize(
+        &mut self,
+        elapsed_s: f64,
+        events_lost: u32,
+        stats: &ProbeStats,
+        exec_warn: i64,
+        io_warn: i64,
+        clock: &[ClockSample],
+    ) -> Summary {
         let inner = self.shared.inner.lock().unwrap();
         let routines = inner.routines.clone();
         let faults = inner.faults_by_pid.clone();
@@ -228,7 +266,7 @@ impl Analyzer {
 
         // ---- Stalls, by who was blamed -------------------------------------------------
         let mut tally: HashMap<String, (u32, i64, i64)> = HashMap::new();
-        for i in &self.incidents {
+        for i in self.incidents.iter().filter(|i| !i.marked) {
             let t = tally.entry(i.culprit.clone()).or_default();
             t.0 += 1;
             t.1 += i.dur;
@@ -295,6 +333,54 @@ impl Analyzer {
                     *total,
                 );
             }
+        }
+
+        // ---- Moments the user flagged ("I felt it") ----------------------------------------
+        let mut marked: HashMap<String, (u32, i64)> = HashMap::new();
+        for i in self.incidents.iter().filter(|i| i.marked) {
+            let m = marked.entry(i.culprit.clone()).or_default();
+            m.0 += 1;
+            m.1 = m.1.max(i.dur);
+        }
+        let marks_total = self.marks_total;
+        for (culprit, (n, worst)) in &marked {
+            let sev = if *n >= 3 { Severity::High } else { Severity::Medium };
+            let evidence = format!(
+                "Was interrupting a CPU core (for up to {}) at {n} of the {marks_total} moment{} you flagged with 'I felt it'.",
+                fmt_dur(*worst),
+                if marks_total == 1 { "" } else { "s" }
+            );
+            if let Some(m) = culprit.strip_prefix("driver ") {
+                let what = self.modules.describe(m);
+                let advice = knowledge(m).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
+                found.add(culprit, sev, format!("{m}  -  {what}"), evidence, advice.into(), *worst * *n as i64);
+            } else if let Some(p) = culprit.strip_prefix("process ") {
+                found.add(
+                    culprit,
+                    sev,
+                    format!("{p}  -  program"),
+                    evidence,
+                    "Close this program and monitor again; if the hitches disappear, update or replace it.".into(),
+                    *worst * *n as i64,
+                );
+            }
+        }
+        if self.marks_clean > 0 {
+            found.add(
+                "clean marks",
+                Severity::Low,
+                "Hitches you flagged that left no trace on the CPU side".into(),
+                format!(
+                    "At {} of the {marks_total} moment{} you flagged, no CPU core was interrupted for even 1 ms and nothing else stood out.",
+                    self.marks_clean,
+                    if marks_total == 1 { "" } else { "s" }
+                ),
+                "That rules out drivers, interrupts and firmware for those hitches. Look inside the app or at the GPU: shader \
+                 compilation, VRAM running out (lower texture quality), frame pacing / V-Sync settings, overlays, or the game's own \
+                 asset streaming."
+                    .into(),
+                0,
+            );
         }
 
         // ---- Drivers: DPC/ISR execution times ---------------------------------------------
@@ -404,15 +490,76 @@ impl Analyzer {
             );
         }
 
+        // ---- Does it keep time? ------------------------------------------------------------
+        let mut periodic_noted = false;
+        let culprits: Vec<String> = tally.iter().map(|(c, _)| c.clone()).collect();
+        for culprit in culprits {
+            let times: Vec<i64> = self.incidents.iter().filter(|i| !i.marked && i.culprit == culprit).map(|i| i.start).collect();
+            if let Some(p) = period::detect(&secs(&times)) {
+                periodic_noted |= found.note(&culprit, format!("The stalls keep time. {}", p.describe()));
+            }
+        }
+        for (module, times) in &self.long_exec_times {
+            if let Some(p) = period::detect(&secs(times)) {
+                periodic_noted |= found.note(&format!("driver {module}"), format!("Its long interrupt runs keep time. {}", p.describe()));
+            }
+        }
+        if !periodic_noted {
+            let all: Vec<i64> = self.incidents.iter().filter(|i| !i.marked).map(|i| i.start).collect();
+            if let Some(p) = period::detect(&secs(&all)) {
+                found.add("periodic", Severity::Medium, "Stalls repeat on a timer".into(), p.describe(), POLLING_ADVICE.into(), 0);
+            }
+        } else {
+            for (_, f) in found.0.iter_mut().filter(|(_, f)| f.evidence.iter().any(|e| e.contains("keep time"))) {
+                f.advice = format!(
+                    "{} Because it repeats on a timer: {}",
+                    f.advice,
+                    POLLING_ADVICE.to_lowercase().replacen("something", "something software-driven", 1)
+                );
+            }
+        }
+
+        // ---- CPU throttling ----------------------------------------------------------------
+        let throttled: Vec<&ClockSample> = clock.iter().filter(|c| c.throttled()).collect();
+        if throttled.len() >= 3.max(clock.len() / 20) {
+            let near = ms_to_ticks(1500.0);
+            let hits = self.incidents.iter().filter(|i| throttled.iter().any(|c| (c.ts - i.start).abs() <= near)).count();
+            let share = throttled.len() as f64 / clock.len() as f64;
+            let sev = if share >= 0.3 || (hits >= 2 && hits * 2 >= self.incidents.len()) { Severity::High } else { Severity::Medium };
+            let slowest = throttled.iter().map(|c| c.min_busy_perf).fold(100.0, f64::min);
+            let cap = throttled.iter().map(|c| c.limit).fold(100.0, f64::min);
+            let mut evidence = format!(
+                "In {} of {} seconds, cores that were busy ran at as little as {slowest:.0}% of their rated speed.",
+                throttled.len(),
+                clock.len()
+            );
+            if cap < 99.5 {
+                evidence.push_str(&format!(" Windows reported an active performance cap down to {cap:.0}% (thermal or power limit)."));
+            }
+            if hits > 0 {
+                evidence
+                    .push_str(&format!(" {hits} of {} stalls / flagged moments happened while it was throttled.", self.incidents.len()));
+            }
+            found.add(
+                "throttling",
+                sev,
+                "CPU throttling  -  the processor is being slowed down".into(),
+                evidence,
+                THROTTLE_ADVICE.into(),
+                ms_to_ticks(1000.0) * throttled.len() as i64,
+            );
+        }
+
         let mut findings: Vec<Finding> = found.0.into_iter().map(|(_, f)| f).collect();
         findings.sort_by_key(|f| (std::cmp::Reverse(f.severity), std::cmp::Reverse(f.impact)));
 
         // ---- Verdict -----------------------------------------------------------------
-        let kernel_stalls = self.incidents.iter().filter(|i| i.kind == StallKind::Kernel).count();
-        let sched_stalls = self.incidents.len() - kernel_stalls;
+        let kernel_stalls = self.incidents.iter().filter(|i| !i.marked && i.kind == StallKind::Kernel).count();
+        let sched_stalls = self.incidents.iter().filter(|i| !i.marked).count() - kernel_stalls;
+        let marks_txt = if marks_total > 0 { format!(", {marks_total} moment(s) flagged by you") } else { String::new() };
         let secs = elapsed_s as u64;
         let overview = format!(
-            "Monitored {:02}:{:02}  |  {kernel_stalls} kernel-level stall(s), {sched_stalls} CPU-starvation stall(s)  |  worst wake-up delay {} (real-time thread), {} (normal thread)",
+            "Monitored {:02}:{:02}  |  {kernel_stalls} kernel-level stall(s), {sched_stalls} CPU-starvation stall(s){marks_txt}  |  worst wake-up delay {} (real-time thread), {} (normal thread)",
             secs / 60,
             secs % 60,
             fmt_dur(stats.max_kernel.load(Ordering::Relaxed)),
@@ -422,7 +569,7 @@ impl Analyzer {
         let more =
             |n: usize| if n > 1 { format!("  (+{} more finding{} below)", n - 1, if n == 2 { "" } else { "s" }) } else { String::new() };
         let top = findings.first();
-        let (health, headline, subline) = if events == 0 {
+        let (health, mut headline, mut subline) = if events == 0 {
             (
                 Health::NoData,
                 "Windows delivered no kernel trace data".to_string(),
@@ -454,6 +601,16 @@ impl Analyzer {
                 }
             }
         };
+
+        if health == Health::Ok && self.marks_clean > 0 {
+            headline = "The hitches you flagged did not come from drivers, interrupts or the CPU".to_string();
+            subline = format!(
+                "At {} of the {marks_total} moment(s) you flagged, no CPU core was interrupted for even 1 ms and no disk, paging or \
+                 throttling problem showed up. That clears the system side: look inside the app or at the GPU (shader compilation, \
+                 VRAM running out, frame pacing, overlays).",
+                self.marks_clean
+            );
+        }
 
         // ---- Supporting tables ---------------------------------------------------------
         d!("");
@@ -500,6 +657,22 @@ impl Analyzer {
             d!("  {:<8} {:>10} {:>10} {:>10} {:>7}", "disk", "requests", "average", "worst", "slow");
             for (n, s) in &disks {
                 d!("  {:<8} {:>10} {:>10} {:>10} {:>7}", n, s.count, fmt_dur(s.total / s.count.max(1) as i64), fmt_dur(s.max), s.slow);
+            }
+        }
+        if !clock.is_empty() {
+            let busy: Vec<f64> = clock.iter().filter(|c| c.busy_cores > 0).map(|c| c.min_busy_perf).collect();
+            d!("");
+            d!("CPU CLOCK  (slowest busy core each second, % of rated speed; 100+ is normal)");
+            if busy.is_empty() {
+                d!("  no core was busy enough to judge in {} samples", clock.len());
+            } else {
+                d!(
+                    "  lowest {:.0}%   typical {:.0}%   throttled in {} of {} seconds",
+                    busy.iter().copied().fold(f64::MAX, f64::min),
+                    busy.iter().sum::<f64>() / busy.len() as f64,
+                    throttled.len(),
+                    clock.len()
+                );
             }
         }
         if !debug_counts.is_empty() {

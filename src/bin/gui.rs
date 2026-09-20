@@ -3,6 +3,9 @@
 //! Deliberately plain Win32 controls: no GPU rendering and no repaint loop, so the tool
 //! doesn't disturb the very latencies it measures. Follows the system light/dark app theme.
 //!
+//! While monitoring, the "I felt it!" button (or the Ctrl+Shift+F9 global hotkey) marks the
+//! moment a hitch was felt so the report can zoom in on it.
+//!
 //! Environment switches for working on the UI without admin rights:
 //! * `WTFIS_SKIP_ELEVATION=1`  don't ask for elevation (real monitoring then fails)
 //! * `WTFIS_DEMO=problem|warning|ok`  Start/Stop shows a canned result instead of monitoring
@@ -30,7 +33,9 @@ use windows_sys::Win32::UI::Controls::{
     INITCOMMONCONTROLSEX,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_F9,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -41,6 +46,9 @@ use wtfis::util::{self, wide};
 const ID_TOGGLE: usize = 1;
 const ID_COPY: usize = 2;
 const ID_SHOW: usize = 3;
+const ID_MARK: usize = 4;
+
+const HOTKEY_MARK: i32 = 1;
 
 const WM_APP_LINES: u32 = WM_APP + 1;
 const WM_APP_STATUS: u32 = WM_APP + 2;
@@ -53,6 +61,8 @@ const INTRO: &str = "How to use\r\n\
     \x20 1. Click \"Start monitoring\".\r\n\
     \x20 2. Use the PC normally until the hitch / stall / audio crackle happens, ideally a few times.\r\n\
     \x20    (Run the game or app that has the problem. A few minutes is usually enough.)\r\n\
+    \x20    Felt one? Press Ctrl+Shift+F9 (works inside games) or click \"I felt it!\" so the report can\r\n\
+    \x20    zoom in on that exact moment.\r\n\
     \x20 3. Click \"Stop\". The colored bar above names the driver, program or hardware responsible,\r\n\
     \x20    and the report below says what to do about it.\r\n\
     \r\n\
@@ -172,7 +182,7 @@ unsafe fn apply_theme(hwnd: HWND) {
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &flag as *const i32 as *const c_void, 4);
     if let Some(ui) = UI.get() {
         let theme = wide(if dark { "DarkMode_Explorer" } else { "Explorer" });
-        for h in [ui.toggle, ui.copy, ui.show, ui.log] {
+        for h in [ui.toggle, ui.copy, ui.show, ui.mark, ui.log] {
             SetWindowTheme(h as HWND, theme.as_ptr(), null());
         }
     }
@@ -186,6 +196,7 @@ struct Ui {
     toggle: usize,
     copy: usize,
     show: usize,
+    mark: usize,
     status: usize,
     log: usize,
     headline_font: isize,
@@ -203,6 +214,8 @@ static MAIN: AtomicUsize = AtomicUsize::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CLOSING: AtomicBool = AtomicBool::new(false);
+static HOTKEY_OK: AtomicBool = AtomicBool::new(false);
+static MARKS: AtomicUsize = AtomicUsize::new(0);
 
 static BANNER: Mutex<Banner> = Mutex::new(Banner { tone: Tone::Neutral, headline: String::new(), sub: String::new() });
 /// Lines from the engine thread waiting to be appended by the UI thread.
@@ -250,16 +263,27 @@ fn demo_health() -> Option<Health> {
 fn start_monitoring(hwnd: HWND, ui: &Ui) {
     STOP.store(false, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
+    MARKS.store(0, Ordering::SeqCst);
     REPORT.lock().unwrap().clear();
     *REPORT_PATH.lock().unwrap() = None;
     set_text(ui.log, "");
     set_text(ui.toggle, "Stop && show result");
-    set_text(ui.status, "");
-    set_banner(hwnd, Tone::Info, "Monitoring - reproduce the hitch now", "Starting...");
     unsafe {
         EnableWindow(ui.copy as HWND, 0);
         EnableWindow(ui.show as HWND, 0);
+        EnableWindow(ui.mark as HWND, 1);
+        let ok = RegisterHotKey(hwnd, HOTKEY_MARK, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F9 as u32) != 0;
+        HOTKEY_OK.store(ok, Ordering::SeqCst);
     }
+    set_text(
+        ui.status,
+        if HOTKEY_OK.load(Ordering::SeqCst) {
+            "Felt a hitch? Press Ctrl+Shift+F9 (works inside games) or click \"I felt it!\"."
+        } else {
+            "Felt a hitch? Click \"I felt it!\" right away."
+        },
+    );
+    set_banner(hwnd, Tone::Info, "Monitoring - reproduce the hitch now", "Starting...");
     std::thread::spawn(|| {
         let outcome = match demo_health() {
             Some(health) => {
@@ -280,7 +304,19 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
 fn request_stop(ui: &Ui) {
     STOP.store(true, Ordering::SeqCst);
     set_text(ui.toggle, "Stopping...");
-    unsafe { EnableWindow(ui.toggle as HWND, 0) };
+    unsafe {
+        EnableWindow(ui.toggle as HWND, 0);
+        EnableWindow(ui.mark as HWND, 0);
+    }
+}
+
+/// Record that the user felt a hitch right now, while monitoring is actually running.
+fn mark(ui: &Ui) {
+    if RUNNING.load(Ordering::SeqCst) && !STOP.load(Ordering::SeqCst) {
+        engine::mark_now();
+        let n = MARKS.fetch_add(1, Ordering::SeqCst) + 1;
+        set_text(ui.status, &format!("Marked ({n}). The report will show what happened just before each mark."));
+    }
 }
 
 /// Replace the live log with the answer-first report and light up the banner.
@@ -289,8 +325,10 @@ fn show_outcome(hwnd: HWND, ui: &Ui) {
     unsafe { SendMessageW(hwnd, WM_APP_LINES, 0, 0) };
     set_text(ui.toggle, "Start monitoring");
     unsafe {
+        UnregisterHotKey(hwnd, HOTKEY_MARK);
         EnableWindow(ui.toggle as HWND, 1);
         EnableWindow(ui.copy as HWND, 1);
+        EnableWindow(ui.mark as HWND, 0);
     }
     match OUTCOME.lock().unwrap().take() {
         Some(Ok(out)) => {
@@ -395,6 +433,7 @@ unsafe fn create_controls(hwnd: HWND) {
         toggle: child("BUTTON", "Start monitoring", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, ID_TOGGLE, button_font),
         copy: child("BUTTON", "Copy report", WS_TABSTOP | WS_DISABLED, 0, ID_COPY, ui_font),
         show: child("BUTTON", "Show report file", WS_TABSTOP | WS_DISABLED, 0, ID_SHOW, ui_font),
+        mark: child("BUTTON", "I felt it!", WS_TABSTOP | WS_DISABLED, 0, ID_MARK, ui_font),
         status: child("STATIC", "", SS_ENDELLIPSIS | SS_RIGHT, 0, 0, ui_font),
         log: child(
             "EDIT",
@@ -436,7 +475,10 @@ unsafe fn layout(hwnd: HWND, ui: &Ui) {
     let copy_x = show_x - s(8) - side_w;
     MoveWindow(ui.show as HWND, show_x, m + s(6), side_w, row_h - s(12), 1);
     MoveWindow(ui.copy as HWND, copy_x, m + s(6), side_w, row_h - s(12), 1);
-    let status_x = m + toggle_w + m;
+    let mark_x = m + toggle_w + s(8);
+    let mark_w = s(110);
+    MoveWindow(ui.mark as HWND, mark_x, m + s(6), mark_w, row_h - s(12), 1);
+    let status_x = mark_x + mark_w + m;
     MoveWindow(ui.status as HWND, status_x, m + s(12), (copy_x - m - status_x).max(0), s(20), 1);
     let top = banner_rect(hwnd).bottom + m;
     MoveWindow(ui.log as HWND, m, top, (w - 2 * m).max(0), (h - top - m).max(0), 1);
@@ -521,8 +563,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 set_text(ui.status, "Report copied to the clipboard.");
             }
             ID_SHOW => show_report_file(),
+            ID_MARK => mark(ui),
             _ => {}
         },
+        (WM_HOTKEY, Some(ui)) if wp as i32 == HOTKEY_MARK => mark(ui),
         (WM_APP_LINES, Some(ui)) => {
             let lines = std::mem::take(&mut *PENDING.lock().unwrap());
             if !lines.is_empty() {

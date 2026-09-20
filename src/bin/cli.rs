@@ -50,6 +50,9 @@ struct Args {
     /// Print kernel event counts by type after the summary
     #[arg(long, hide = true)]
     debug: bool,
+    /// Flag a hitch automatically this many seconds in (for unattended testing of marks)
+    #[arg(long, hide = true)]
+    mark_at: Option<u64>,
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -85,6 +88,36 @@ fn main() {
     }
 
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
+
+    // A background thread reads stdin so pressing Enter marks a hitch while `engine::run`
+    // (below) blocks the main thread. After the run finishes it instead forwards Enter presses
+    // through this channel, since `--pause-on-exit`'s final "press Enter to close" wait would
+    // otherwise race the same stdin against this thread.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || loop {
+        let mut buf = String::new();
+        match std::io::stdin().read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if DONE.load(Ordering::SeqCst) {
+                    if tx.send(()).is_err() {
+                        break;
+                    }
+                } else {
+                    engine::mark_now();
+                    println!("  marked - the report will show what happened just before this moment");
+                }
+            }
+        }
+    });
+
+    if let Some(secs) = args.mark_at {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            engine::mark_now();
+        });
+    }
+
     let cfg = Config {
         duration: args.duration,
         stall_ms: args.stall_ms,
@@ -100,7 +133,7 @@ fn main() {
         },
         debug: args.debug,
     };
-    println!("Press Ctrl+C to stop and see the summary.");
+    println!("Press Enter whenever you feel a hitch to mark that moment. Press Ctrl+C to stop and see the summary.");
     let result = engine::run(&cfg, &STOP);
     DONE.store(true, Ordering::SeqCst);
     if let Some(path) = result.as_ref().ok().and_then(|out| out.log_path.as_ref()) {
@@ -108,7 +141,7 @@ fn main() {
     }
     if args.pause_on_exit {
         println!("\nPress Enter to close...");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        let _ = rx.recv();
     }
     std::process::exit(if result.is_ok() { 0 } else { 2 });
 }
