@@ -27,6 +27,11 @@ nothing on the system.
 3. Use the PC until the hitch happens, ideally a few times. Run the game or app that has the problem.
 4. Click **Stop**. Read the summary, or click **Copy report** and paste it to whoever is helping you.
 
+> **"Windows protected your PC"?** That is SmartScreen reacting to a new, unsigned program that few
+> people have downloaded yet, not a virus detection. Click **More info**, then **Run anyway**. If you
+> would rather verify first, compare the file against `SHA256SUMS.txt` from the same release
+> (`Get-FileHash WTFIsStalling.exe` in PowerShell), or build it yourself from this source.
+
 The colored bar gives the verdict; the report underneath starts with the ranked findings and what to
 try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as
 `WTFIsStalling-<date>.txt`. The window follows the system light / dark theme.
