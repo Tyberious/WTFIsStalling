@@ -295,7 +295,7 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
     set_text(
         ui.status,
         if HOTKEY_OK.load(Ordering::SeqCst) {
-            "Felt a hitch? Press Ctrl+Shift+F9 (works inside games) or click \"I felt it!\"."
+            "Felt a hitch? Press Ctrl+Shift+F9, even in a game."
         } else {
             "Felt a hitch? Click \"I felt it!\" right away."
         },
@@ -450,7 +450,7 @@ unsafe fn create_controls(hwnd: HWND) {
         toggle: child("BUTTON", "Start monitoring", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, ID_TOGGLE, button_font),
         copy: child("BUTTON", "Copy report", WS_TABSTOP | WS_DISABLED, 0, ID_COPY, ui_font),
         show: child("BUTTON", "Show report file", WS_TABSTOP | WS_DISABLED, 0, ID_SHOW, ui_font),
-        mark: child("BUTTON", "I felt it!", WS_TABSTOP | WS_DISABLED, 0, ID_MARK, ui_font),
+        mark: child("BUTTON", "I felt it!", WS_TABSTOP | WS_DISABLED, 0, ID_MARK, button_font),
         status: child("STATIC", "", SS_ENDELLIPSIS | SS_RIGHT, 0, 0, ui_font),
         log: child(
             "EDIT",
@@ -495,8 +495,8 @@ unsafe fn layout(hwnd: HWND, ui: &Ui) {
     MoveWindow(ui.show as HWND, show_x, m + s(6), side_w, row_h - s(12), 1);
     MoveWindow(ui.copy as HWND, copy_x, m + s(6), side_w, row_h - s(12), 1);
     let mark_x = m + toggle_w + s(8);
-    let mark_w = s(110);
-    MoveWindow(ui.mark as HWND, mark_x, m + s(6), mark_w, row_h - s(12), 1);
+    let mark_w = s(150);
+    MoveWindow(ui.mark as HWND, mark_x, m, mark_w, row_h, 1);
     let status_x = mark_x + mark_w + m;
     MoveWindow(ui.status as HWND, status_x, m + s(12), (copy_x - m - status_x).max(0), s(20), 1);
     let top = banner_rect(hwnd).bottom + m;
