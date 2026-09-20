@@ -202,31 +202,30 @@ impl Analyzer {
 
         let (on_cpu_procs, on_cpu_mods) = self.sample_breakdown(&window_samples);
 
-        let culprit;
-        if let (true, Some((module, _))) = (coverage >= 0.35, &top_module) {
+        let culprit = if let (true, Some((module, _))) = (coverage >= 0.35, &top_module) {
             let what = self.modules.describe(module);
             say!("    VERDICT: {module} [{what}] kept the CPU in DPC/ISR code for {:.0}% of the stall", coverage * 100.0);
-            culprit = format!("driver {module}");
+            format!("driver {module}")
         } else if self.profile && expected_samples >= 3.0 && seen_samples < expected_samples * 0.3 {
             say!(
                 "    VERDICT: the CPU went dark: only {seen_samples:.0} of ~{expected_samples:.0} expected profiler interrupts arrived and no DPC/ISR explains it."
             );
             say!("             Windows itself was frozen out -> firmware SMI (BIOS, USB legacy, thermal/EC), a hypervisor, or a driver");
             say!("             running with interrupts disabled. Think BIOS update/settings and failing or misbehaving hardware.");
-            culprit = "CPU went dark (firmware SMI / hypervisor / interrupts off)".to_string();
+            "CPU went dark (firmware SMI / hypervisor / interrupts off)".to_string()
         } else if let Some((m, share)) = on_cpu_mods.first().filter(|(_, share)| *share >= 0.4) {
             let what = self.modules.describe(m);
             say!("    VERDICT: {m} [{what}] was executing for {:.0}% of the stall at raised IRQL (not as a DPC/ISR,", share * 100.0);
             say!("             e.g. holding a spinlock or inside a long driver call), which blocks every thread on that CPU");
-            culprit = format!("driver {m}");
+            format!("driver {m}")
         } else if let Some((p, share)) = on_cpu_procs.first().filter(|(p, share)| *share >= 0.4 && !p.starts_with("Idle")) {
             say!("    VERDICT: {p} was on the CPU for {:.0}% of the stall. Nothing can outrank the probe thread, so it was", share * 100.0);
             say!("             inside kernel/driver code at raised IRQL on this process's behalf (see kernel modules below)");
-            culprit = format!("process {p}");
+            format!("process {p}")
         } else {
             say!("    VERDICT: no clear culprit in the trace (DPC/ISR covered only {:.0}% of the stall)", coverage * 100.0);
-            culprit = "unexplained".to_string();
-        }
+            "unexplained".to_string()
+        };
 
         if !routines.is_empty() {
             say!("    DPC/ISR activity on the stalled CPU(s):");
@@ -249,10 +248,9 @@ impl Analyzer {
         let (procs, mods) = self.sample_breakdown(&all);
         let idle = procs.iter().find(|(p, _)| p == "Idle").map(|(_, s)| *s).unwrap_or(0.0);
         let busy: Vec<_> = procs.iter().filter(|(p, _)| p != "Idle").cloned().collect();
-        let culprit;
-        if !self.profile || all.is_empty() {
+        let culprit = if !self.profile || all.is_empty() {
             say!("    VERDICT: all CPUs were busy, but CPU sampling is unavailable so the process can't be named");
-            culprit = "CPU starvation (unattributed)".to_string();
+            "CPU starvation (unattributed)".to_string()
         } else if idle < 0.25 {
             let (top, share) = busy.first().cloned().unwrap_or(("?".into(), 0.0));
             say!(
@@ -260,11 +258,11 @@ impl Analyzer {
                 (1.0 - idle) * 100.0,
                 share * 100.0
             );
-            culprit = format!("process {top}");
+            format!("process {top}")
         } else {
             say!("    VERDICT: inconclusive, CPUs were {:.0}% idle during this delay (likely a one-off scheduling quirk; ignore unless frequent)", idle * 100.0);
-            culprit = "scheduling delay with idle CPUs".to_string();
-        }
+            "scheduling delay with idle CPUs".to_string()
+        };
         self.print_on_cpu(&busy, &mods);
         culprit
     }
