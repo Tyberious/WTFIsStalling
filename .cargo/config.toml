@@ -1,0 +1,8 @@
+# Static CRT so the released exes run on a clean Windows install with nothing else present.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Target-level rustflags take precedence over any [build] rustflags in a user-level cargo
+# config, so this also pins the linker to MinGW gcc (MSYS2's Rust ships no rust-lld).
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "linker=gcc", "-C", "target-feature=+crt-static"]

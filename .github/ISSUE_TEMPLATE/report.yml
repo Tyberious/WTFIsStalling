@@ -1,0 +1,24 @@
+name: Report from a stalling PC
+description: Share a WTFIsStalling report, especially one where the verdict was wrong, missing or unhelpful
+labels: [report]
+body:
+  - type: textarea
+    id: symptom
+    attributes:
+      label: What does the problem feel like?
+      description: e.g. "game freezes for a split second every 10-20 s", "audio crackles when the mouse moves"
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: Click "Copy report" and paste here. It lists hardware, driver file names and running program names; trim anything you don't want public.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: truth
+    attributes:
+      label: Was the verdict right?
+      description: If you know the real cause or what fixed it, say so. That is how the tool gets smarter.
