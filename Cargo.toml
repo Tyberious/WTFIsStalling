@@ -30,6 +30,7 @@ clap = { version = "4", features = ["derive"] }
 [dependencies.windows-sys]
 version = "0.61"
 features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

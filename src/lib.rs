@@ -11,6 +11,7 @@ pub mod engine;
 pub mod etw;
 pub mod evlog;
 pub mod modules;
+pub mod pci;
 pub mod period;
 pub mod probe;
 pub mod procs;

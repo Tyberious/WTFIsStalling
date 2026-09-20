@@ -1,12 +1,14 @@
-//! Storage trouble Windows itself has written to the System event log: device resets,
-//! retried I/O, bad blocks. These are the closest thing to seeing the disk protocol go wrong.
+//! Trouble Windows itself has written to the System event log. Storage: device resets, retried
+//! I/O, bad blocks (the closest thing to seeing the disk protocol go wrong). Hardware (WHEA):
+//! corrected memory, CPU and PCI Express errors, which are handled in firmware while the rest of
+//! the PC waits, and fatal ones that crashed it.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
 use windows_sys::Win32::System::EventLog::{
-    EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection, EvtRender, EvtRenderEventXml, EVT_HANDLE,
+    EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EvtRender, EvtRenderEventXml, EVT_HANDLE,
 };
 
 use crate::util::wide;
@@ -49,15 +51,27 @@ impl Drop for EvtHandleGuard {
 
 /// Storage events from the last `days` days, oldest first. Empty on any failure.
 pub fn storage_events(days: u32) -> Vec<StorageEvent> {
+    // The ID list is shared with unrelated providers (Time-Service logs a 129 too); parse_event
+    // keeps only the storage ones.
+    let filter = "(EventID=129 or EventID=153 or EventID=7 or EventID=51 or EventID=11 or EventID=157)";
+    query_system(filter, days).iter().filter_map(|xml| parse_event(xml)).collect()
+}
+
+/// Hardware errors (WHEA) from the last `days` days, oldest first. Empty on any failure.
+pub fn hardware_events(days: u32) -> Vec<HardwareEvent> {
+    query_system("Provider[@Name='Microsoft-Windows-WHEA-Logger']", days).iter().filter_map(|xml| parse_whea(xml)).collect()
+}
+
+/// XML of the newest (at most 500) System-log events matching `filter` (an XPath condition on the
+/// System element), returned oldest first. The time filter runs server-side, so the channel is
+/// not walked end to end.
+fn query_system(filter: &str, days: u32) -> Vec<String> {
     let ms = days as u64 * 86_400_000;
-    // (EventID list) picked for disk/storport/stornvme/NTFS-visible transport trouble; TimeCreated
-    // filter is done server-side so we do not have to walk the whole channel.
-    let xpath = format!(
-        "*[System[(EventID=129 or EventID=153 or EventID=7 or EventID=51 or EventID=11 or EventID=157) and TimeCreated[timediff(@SystemTime) <= {ms}]]]"
-    );
+    let xpath = format!("*[System[{filter} and TimeCreated[timediff(@SystemTime) <= {ms}]]]");
     let channel = wide("System");
     let query = wide(&xpath);
-    let h = unsafe { EvtQuery(0, channel.as_ptr(), query.as_ptr(), EvtQueryChannelPath | EvtQueryForwardDirection) };
+    // Newest first, so that when a device floods the log the cap drops the oldest entries.
+    let h = unsafe { EvtQuery(0, channel.as_ptr(), query.as_ptr(), EvtQueryChannelPath | EvtQueryReverseDirection) };
     if h == 0 {
         return Vec::new();
     }
@@ -71,18 +85,18 @@ pub fn storage_events(days: u32) -> Vec<StorageEvent> {
         if ok == 0 || returned == 0 {
             break;
         }
-        for &raw in &batch[..returned as usize] {
-            let event = EvtHandleGuard(raw);
+        // Every handle in the batch must be closed, so wrap them all before any early exit.
+        let events: Vec<EvtHandleGuard> = batch[..returned as usize].iter().map(|&raw| EvtHandleGuard(raw)).collect();
+        for event in &events {
             if let Some(xml) = render_event(event.0) {
-                if let Some(ev) = parse_event(&xml) {
-                    out.push(ev);
-                }
+                out.push(xml);
             }
             if out.len() >= 500 {
                 break 'outer;
             }
         }
     }
+    out.reverse();
     out
 }
 
@@ -202,9 +216,147 @@ fn parse_event(xml: &str) -> Option<StorageEvent> {
     Some(StorageEvent { unix_time, id, provider, disk })
 }
 
+/// What kind of hardware a WHEA event is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HardwareKind {
+    /// The PC crashed or reset because of a hardware error (events 1, 18, 20, 46).
+    Fatal,
+    /// Corrected memory error (47).
+    Memory,
+    /// Corrected machine check: CPU cache, bus or interconnect (19).
+    Processor,
+    /// Corrected PCI Express error (17).
+    PciExpress,
+    Other,
+}
+
+/// Where on the PCI bus an event 17 points.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PciRef {
+    pub bus: u32,
+    pub device: u32,
+    pub function: u32,
+    /// For a bridge or root port: the bus behind it, where the actual card sits.
+    pub secondary_bus: Option<u32>,
+    /// `PCI\VEN_10DE&DEV_2684...` when Windows recorded it.
+    pub hardware_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HardwareEvent {
+    pub unix_time: i64,
+    pub id: u32,
+    pub kind: HardwareKind,
+    /// Logical processor (APIC ID) that reported a machine check.
+    pub apic_id: Option<u32>,
+    pub pci: Option<PciRef>,
+}
+
+/// Text of `<Data Name='name'>...</Data>`, name matched case-insensitively.
+fn data_named(xml: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = find_ci(&xml[from..], "<Data ") {
+        let open = from + rel;
+        let gt = open + xml[open..].find('>')?;
+        let tag = &xml[open..gt];
+        if attr(tag, "Name").is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            if tag.ends_with('/') {
+                return None;
+            }
+            let close = find_ci(&xml[gt + 1..], "</Data>")?;
+            return Some(xml[gt + 1..gt + 1 + close].trim().to_string());
+        }
+        from = gt + 1;
+    }
+    None
+}
+
+/// "0x1f", "0X1F" or "31".
+fn number(s: &str) -> Option<u32> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// Field names differ between Windows builds, so each value is looked up under every name seen.
+fn parse_whea(xml: &str) -> Option<HardwareEvent> {
+    let provider = tag_attr(xml, "Provider", "Name")?;
+    if !provider.eq_ignore_ascii_case("Microsoft-Windows-WHEA-Logger") {
+        return None;
+    }
+    let id: u32 = tag_text(xml, "EventID")?.trim().parse().ok()?;
+    let unix_time = parse_iso(&tag_attr(xml, "TimeCreated", "SystemTime")?)?;
+    let kind = match id {
+        1 | 18 | 20 | 46 => HardwareKind::Fatal,
+        47 => HardwareKind::Memory,
+        19 => HardwareKind::Processor,
+        17 => HardwareKind::PciExpress,
+        _ => HardwareKind::Other,
+    };
+    let first = |names: &[&str]| names.iter().find_map(|n| data_named(xml, n));
+    let num = |names: &[&str]| first(names).and_then(|v| number(&v));
+    let pci = (kind == HardwareKind::PciExpress)
+        .then(|| {
+            Some(PciRef {
+                bus: num(&["PrimaryBusNumber", "Bus", "BusNumber"])?,
+                device: num(&["PrimaryDeviceNumber", "Device", "DeviceNumber"])?,
+                function: num(&["PrimaryFunctionNumber", "Function", "FunctionNumber"])?,
+                secondary_bus: num(&["SecondaryBusNumber", "SecondaryBus"]).filter(|b| *b != 0),
+                hardware_id: first(&["PrimaryDeviceName", "DeviceName"]).map(|v| v.replace("&amp;", "&")).filter(|v| !v.is_empty()),
+            })
+        })
+        .flatten();
+    let apic_id = if matches!(kind, HardwareKind::Processor | HardwareKind::Fatal) { num(&["ApicId", "ProcessorApicId"]) } else { None };
+    Some(HardwareEvent { unix_time, id, kind, apic_id, pci })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn whea(id: u32, data: &str) -> String {
+        format!(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-WHEA-Logger' \
+             Guid='{{c26c4f3c-3f66-4e99-8f8a-39405cfed220}}'/><EventID>{id}</EventID><TimeCreated \
+             SystemTime='2026-09-18T03:12:45.1234567Z'/><Channel>System</Channel></System><EventData>{data}</EventData></Event>"
+        )
+    }
+
+    #[test]
+    fn whea_pcie_event_yields_the_bus_address_and_hardware_id() {
+        let xml = whea(
+            17,
+            "<Data Name='ErrorSource'>4</Data><Data Name='FRUText'/><Data Name='PrimaryBusNumber'>0x0</Data><Data \
+             Name='PrimaryDeviceNumber'>0x1</Data><Data Name='PrimaryFunctionNumber'>0x1</Data><Data \
+             Name='SecondaryBusNumber'>0x1</Data><Data Name='PrimaryDeviceName'>PCI\\VEN_1022&amp;DEV_14DB&amp;SUBSYS_1</Data>",
+        );
+        let ev = parse_whea(&xml).unwrap();
+        assert_eq!((ev.id, ev.kind, ev.unix_time), (17, HardwareKind::PciExpress, 1_789_701_165));
+        let pci = ev.pci.unwrap();
+        assert_eq!((pci.bus, pci.device, pci.function, pci.secondary_bus), (0, 1, 1, Some(1)));
+        assert_eq!(pci.hardware_id.as_deref(), Some(r"PCI\VEN_1022&DEV_14DB&SUBSYS_1"));
+    }
+
+    #[test]
+    fn whea_kinds_and_processor_ids() {
+        let cpu = parse_whea(&whea(19, "<Data Name=\"ErrorSource\">1</Data><Data Name=\"ApicId\">0xb</Data>")).unwrap();
+        assert_eq!((cpu.kind, cpu.apic_id, cpu.pci), (HardwareKind::Processor, Some(11), None));
+        assert_eq!(parse_whea(&whea(47, "")).unwrap().kind, HardwareKind::Memory);
+        assert_eq!(parse_whea(&whea(18, "<Data Name='ApicId'>4</Data>")).unwrap().kind, HardwareKind::Fatal);
+        assert_eq!(parse_whea(&whea(1, "")).unwrap().kind, HardwareKind::Fatal);
+        // A PCIe event without an address is still counted.
+        assert_eq!(parse_whea(&whea(17, "")).unwrap().pci, None);
+        // Not WHEA: ignored even with a matching ID.
+        assert!(parse_whea(DISK_153_SINGLE).is_none());
+        assert_eq!((number("0x1F"), number("31"), number("zz")), (Some(31), Some(31), None));
+    }
+
+    #[test]
+    fn hardware_events_live_query_does_not_panic() {
+        println!("hardware_events(7): {} events", hardware_events(7).len());
+    }
 
     const DISK_153_SINGLE: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='disk'/><EventID Qualifiers='32772'>153</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime='2026-09-18T03:12:45.1234567Z'/><EventRecordID>12345</EventRecordID><Correlation/><Execution ProcessID='4' ThreadID='8'/><Channel>System</Channel><Computer>DESKTOP-TEST</Computer><Security/></System><EventData><Data>\Device\Harddisk2\DR2</Data></EventData></Event>"#;
 

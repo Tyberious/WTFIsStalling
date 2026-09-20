@@ -11,8 +11,9 @@ use crate::analyze::Analyzer;
 use crate::cpuclock::ClockSample;
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskwhy::{known_worker, Cause, DiskWhy};
-use crate::evlog;
+use crate::evlog::{self, HardwareEvent, HardwareKind};
 use crate::modules::knowledge;
+use crate::pci::{self, PciDevice};
 use crate::period;
 use crate::probe::{ProbeStats, StallKind};
 use crate::state::*;
@@ -349,6 +350,126 @@ fn why_sentences(why: &DiskWhy) -> Vec<String> {
     out
 }
 
+const MEMORY_ERROR_ADVICE: &str = "The PC corrected these errors, but each one pauses everything briefly and they are a warning sign: \
+    uncorrected ones crash programs and corrupt files. The usual cause is a memory overclock profile that is not quite stable: in the \
+    BIOS turn XMP / EXPO / DOCP off (or lower the memory speed one step) and monitor again. Update the BIOS. If errors continue at \
+    default settings, reseat the memory sticks and test them one at a time with MemTest86 or Windows Memory Diagnostic; replace the \
+    one that fails.";
+
+const PROCESSOR_ERROR_ADVICE: &str = "The processor reported errors it could correct; each one pauses everything briefly, and the \
+    uncorrected kind crashes the PC. The usual cause is settings pushed past stable: in the BIOS remove any undervolt, Curve Optimizer \
+    / PBO tuning or overclock (loading 'optimized defaults' does all of that), then monitor again. Update the BIOS and check CPU \
+    temperatures under load. If errors continue at default settings the CPU or motherboard may be faulty: use the warranty.";
+
+const PCIE_ERROR_ADVICE: &str = "Data on this PCI Express link arrived damaged and had to be sent again, which stalls the device and \
+    everything waiting on it. Reseat the card or M.2 drive; if a riser or extension cable is used, that is the prime suspect: test \
+    without it, or set that slot to a lower PCIe generation (Gen 4 -> Gen 3) in the BIOS. Also try Power Options > PCI Express > \
+    Link State Power Management = Off, update the BIOS and chipset driver, and try another slot.";
+
+const FATAL_ERROR_ADVICE: &str = "The PC crashed, froze or restarted because of a hardware error, not because of software. Load \
+    'optimized defaults' in the BIOS to remove every overclock, undervolt and memory profile (XMP / EXPO), update the BIOS, and check \
+    temperatures and that all power cables are firmly seated. If it still happens at default settings, test the memory (MemTest86) \
+    and suspect the power supply, CPU or motherboard.";
+
+/// (bus, device, function)
+type PciAddress = (u32, u32, u32);
+
+struct HardwareFinding {
+    key: String,
+    severity: Severity,
+    title: String,
+    evidence: String,
+    advice: &'static str,
+}
+
+/// One finding per failing component from the WHEA events Windows logged.
+fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], now: i64, run_start: i64) -> Vec<HardwareFinding> {
+    // PCIe errors are grouped per bus address; everything else per kind.
+    let mut groups: Vec<(HardwareKind, Option<PciAddress>)> = events
+        .iter()
+        .filter(|e| e.kind != HardwareKind::Other)
+        .map(|e| (e.kind, e.pci.as_ref().map(|p| (p.bus, p.device, p.function))))
+        .collect();
+    groups.sort();
+    groups.dedup();
+    let mut out = Vec::new();
+    for (kind, address) in groups {
+        let members: Vec<&HardwareEvent> =
+            events.iter().filter(|e| e.kind == kind && e.pci.as_ref().map(|p| (p.bus, p.device, p.function)) == address).collect();
+        let times: Vec<i64> = members.iter().map(|e| e.unix_time).collect();
+        let during = times.iter().any(|t| *t >= run_start);
+        let when = when_text(&times, now, run_start);
+        let ids = {
+            let mut ids: Vec<u32> = members.iter().map(|e| e.id).collect();
+            ids.sort();
+            ids.dedup();
+            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+        };
+        let source = format!("Windows event log, WHEA-Logger event {ids}");
+        let (key, title, evidence, advice, floor) = match kind {
+            HardwareKind::Memory => (
+                "whea memory".to_string(),
+                "Memory (RAM)  -  errors were detected and corrected".to_string(),
+                format!("Corrected memory errors {when}. ({source}.)"),
+                MEMORY_ERROR_ADVICE,
+                Severity::Medium,
+            ),
+            HardwareKind::Processor => {
+                let mut cpus: Vec<u32> = members.iter().filter_map(|e| e.apic_id).collect();
+                cpus.sort();
+                cpus.dedup();
+                let on = match cpus.len() {
+                    0 => String::new(),
+                    1..=4 => {
+                        format!(" Reported by logical processor {}.", cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "))
+                    }
+                    n => format!(" Reported by {n} different logical processors."),
+                };
+                (
+                    "whea processor".to_string(),
+                    "Processor  -  hardware errors were detected and corrected".to_string(),
+                    format!("Corrected processor errors (cache, bus or interconnect) {when}.{on} ({source}.)"),
+                    PROCESSOR_ERROR_ADVICE,
+                    Severity::Medium,
+                )
+            }
+            HardwareKind::PciExpress => {
+                let pci = members.iter().find_map(|e| e.pci.as_ref());
+                let name = pci.and_then(|p| pci::describe(devices, p.bus, p.device, p.function, p.secondary_bus));
+                let place = match (pci, &name) {
+                    (Some(p), Some(n)) => format!("{n} (PCI bus {}, device {}, function {})", p.bus, p.device, p.function),
+                    (Some(p), None) => format!(
+                        "the device at PCI bus {}, device {}, function {}{}",
+                        p.bus,
+                        p.device,
+                        p.function,
+                        p.hardware_id.as_ref().map_or(String::new(), |h| format!(" [{h}]"))
+                    ),
+                    (None, _) => "a PCI Express device Windows did not identify".to_string(),
+                };
+                (
+                    format!("whea pcie {address:?}"),
+                    format!("{}  -  PCI Express link errors", name.unwrap_or_else(|| "PCI Express device".to_string())),
+                    format!("Corrected PCI Express errors on {place}, {when}. ({source}.)"),
+                    PCIE_ERROR_ADVICE,
+                    // A handful per week is common and harmless; a stream of them is not.
+                    if times.len() >= 3 { Severity::Medium } else { Severity::Low },
+                )
+            }
+            HardwareKind::Fatal => (
+                "whea fatal".to_string(),
+                "Hardware error  -  it crashed or restarted this PC".to_string(),
+                format!("A fatal hardware error was recorded {when}. ({source}.)"),
+                FATAL_ERROR_ADVICE,
+                Severity::Medium,
+            ),
+            HardwareKind::Other => continue,
+        };
+        out.push(HardwareFinding { key, severity: if during { Severity::High } else { floor }, title, evidence, advice });
+    }
+    out
+}
+
 /// "3 times in the last 7 days (1 while monitoring), most recently 2 day(s) ago"
 fn when_text(times: &[i64], now: i64, run_start: i64) -> String {
     let during = times.iter().filter(|t| **t >= run_start).count();
@@ -660,6 +781,14 @@ impl Analyzer {
             }
         }
 
+        // ---- Hardware errors Windows logged (WHEA) ----------------------------------------------
+        let hardware_log = evlog::hardware_events(EVENT_LOG_DAYS);
+        if !hardware_log.is_empty() {
+            for f in hardware_findings(&hardware_log, &pci::devices(), now_unix, run_start_unix) {
+                found.add(&f.key, f.severity, f.title, f.evidence, f.advice.to_string(), 0);
+            }
+        }
+
         // ---- Does it keep time? ------------------------------------------------------------
         let mut periodic_noted = false;
         let culprits: Vec<String> = tally.iter().map(|(c, _)| c.clone()).collect();
@@ -841,6 +970,13 @@ impl Analyzer {
                 }
             }
         }
+        d!("");
+        d!("WINDOWS EVENT LOG  (last {EVENT_LOG_DAYS} days)");
+        d!("  storage errors (resets, retries, bad blocks): {}", storage_log.len());
+        d!(
+            "  hardware errors (WHEA: memory, processor, PCI Express): {}",
+            hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).count()
+        );
         if !clock.is_empty() {
             let busy: Vec<f64> = clock.iter().filter(|c| c.busy_cores > 0).map(|c| c.min_busy_perf).collect();
             d!("");
@@ -915,6 +1051,46 @@ mod tests {
         assert!(disk_advice(&usb_hdd(), Some(&why), false).contains("Turn off hard disk after"));
         let logged = disk_advice(&usb_hdd(), Some(&why), true);
         assert!(logged.contains("back up what matters now") && !logged.contains("Turn off hard disk"), "{logged}");
+    }
+
+    #[test]
+    fn hardware_errors_become_one_finding_per_component() {
+        use crate::evlog::PciRef;
+        let now = 2_000_000;
+        let ev = |unix_time, id, kind, apic_id, pci| HardwareEvent { unix_time, id, kind, apic_id, pci };
+        let port = PciRef { bus: 0, device: 1, function: 1, secondary_bus: Some(1), hardware_id: None };
+        let events = vec![
+            ev(now - 90_000, 47, HardwareKind::Memory, None, None),
+            ev(now - 50, 47, HardwareKind::Memory, None, None),
+            ev(now - 80_000, 19, HardwareKind::Processor, Some(11), None),
+            ev(now - 70_000, 17, HardwareKind::PciExpress, None, Some(port.clone())),
+            ev(now - 60_000, 17, HardwareKind::PciExpress, None, Some(port)),
+            ev(now - 60_000, 5, HardwareKind::Other, None, None),
+        ];
+        let devices = vec![PciDevice { bus: 1, device: 0, function: 0, name: "NVIDIA GeForce RTX 4090".into() }];
+        let f = hardware_findings(&events, &devices, now, now - 600);
+        assert_eq!(f.len(), 3, "memory, processor, one PCIe address; 'other' ignored");
+
+        let mem = f.iter().find(|f| f.key == "whea memory").unwrap();
+        assert_eq!(mem.severity, Severity::High, "it fired while monitoring");
+        assert!(
+            mem.evidence.contains("2 times") && mem.evidence.contains("1 while monitoring") && mem.advice.contains("XMP"),
+            "{}",
+            mem.evidence
+        );
+
+        let cpu = f.iter().find(|f| f.key == "whea processor").unwrap();
+        assert_eq!(cpu.severity, Severity::Medium);
+        assert!(cpu.evidence.contains("logical processor 11"), "{}", cpu.evidence);
+
+        let gpu = f.iter().find(|f| f.key.starts_with("whea pcie")).unwrap();
+        assert_eq!(gpu.severity, Severity::Low, "two corrected link errors in a week is only a lead");
+        assert!(
+            gpu.title.starts_with("NVIDIA GeForce RTX 4090") && gpu.evidence.contains("PCI bus 0, device 1, function 1"),
+            "{}",
+            gpu.evidence
+        );
+        assert!(hardware_findings(&[], &devices, now, now - 600).is_empty());
     }
 
     #[test]
