@@ -77,6 +77,24 @@ Useful for generating stalls on purpose: a CPU stress test (starvation), copying
 disk (I/O), opening many browser tabs on a RAM-starved VM (hard faults), and on real hardware simply
 running with RGB/monitoring utilities open (DPC latency).
 
+## Code signing (maintainers)
+
+Releases are signed through [SignPath Foundation](https://signpath.org/apply), which signs open-source
+projects for free. The release workflow already contains the signing steps; they switch on by
+themselves once these exist in the repository settings (Settings > Secrets and variables > Actions):
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Variable | `SIGNPATH_ORGANIZATION_ID` | the organization ID SignPath shows after approval |
+| Secret | `SIGNPATH_API_TOKEN` | an API token of a SignPath user allowed to submit signing requests |
+| Variable (optional) | `SIGNPATH_PROJECT_SLUG` | defaults to `WTFIsStalling` |
+| Variable (optional) | `SIGNPATH_SIGNING_POLICY_SLUG` | defaults to `release-signing` |
+
+In SignPath, link the project to this GitHub repository as a trusted build system, and use an artifact
+configuration that signs both `WTFIsStalling.exe` and `wtfis-cli.exe` inside the uploaded zip. The
+workflow fails the release if a signature does not verify, so an unsigned file can never be published
+by accident once signing is on. Build provenance attestation works without any of this.
+
 ## Layout
 
 | File | Role |

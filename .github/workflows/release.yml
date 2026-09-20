@@ -1,32 +1,93 @@
 name: Release
 
 # Push a tag like v0.1.0 to build the executables and attach them to a GitHub release.
+#
+# Trust chain:
+#  * Build provenance (always): GitHub attests that these exact files were built by this workflow
+#    from the tagged commit. Verify with:
+#      gh attestation verify WTFIsStalling.exe --repo Tyberious/WTFIsStalling
+#  * Authenticode signature (once configured): SignPath Foundation signs open-source projects for
+#    free. It is active when the repository variable SIGNPATH_ORGANIZATION_ID and the secret
+#    SIGNPATH_API_TOKEN exist; until then the executables are released unsigned. See
+#    CONTRIBUTING.md, "Code signing".
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      SIGNING: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cargo build --release
+
+      - name: Collect executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/WTFIsStalling.exe, target/release/wtfis-cli.exe dist/
+
+      # SignPath fetches the artifact from GitHub itself, which is how it knows the files really
+      # came from this workflow run.
+      - name: Upload unsigned executables for signing
+        if: env.SIGNING == 'true'
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-executables
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: env.SIGNING == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'WTFIsStalling' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist
+
+      - name: Verify signatures
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem dist/*.exe) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            "$($f.Name): $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$($f.Name) is not validly signed" }
+          }
+
       - name: Checksums
         shell: pwsh
         run: |
-          cd target/release
+          cd dist
           Get-FileHash WTFIsStalling.exe, wtfis-cli.exe -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
             Set-Content SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/WTFIsStalling.exe
+            dist/wtfis-cli.exe
+
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            target/release/WTFIsStalling.exe
-            target/release/wtfis-cli.exe
-            target/release/SHA256SUMS.txt
+            dist/WTFIsStalling.exe
+            dist/wtfis-cli.exe
+            dist/SHA256SUMS.txt

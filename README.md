@@ -199,6 +199,30 @@ Working on the window without admin rights:
 | `WTFIS_THEME=dark\|light` | Override the system theme |
 | `WTFIS_SKIP_ELEVATION=1` | Don't elevate; real monitoring then fails with "access denied" (tests that path) |
 
+## Verifying a download
+
+Every release is built by GitHub Actions from the tagged commit, never on someone's PC.
+
+* **Build provenance.** GitHub attests which workflow run and commit produced each file. With the
+  [GitHub CLI](https://cli.github.com): `gh attestation verify WTFIsStalling.exe --repo Tyberious/WTFIsStalling`
+* **Checksums.** `SHA256SUMS.txt` is attached to every release; compare with `Get-FileHash WTFIsStalling.exe`.
+* **Code signature.** Applied for; see the policy below. Until it is in place the executables are
+  unsigned, which is why SmartScreen and some antivirus products are wary of them.
+
+### Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org). *(Pending approval of this project; this section is the
+policy the project commits to.)*
+
+* **What gets signed:** only the executables built by the [release workflow](.github/workflows/release.yml)
+  from a tagged commit of this repository. Nothing built locally is ever signed.
+* **Roles:** committers and reviewers: [repository contributors](https://github.com/Tyberious/WTFIsStalling/graphs/contributors)
+  via reviewed pull requests; approver of releases and signing requests: [@Tyberious](https://github.com/Tyberious).
+* **Privacy:** this program will not transfer any information to other networked systems. It has no
+  network code at all: reports are written to a local text file and the clipboard, and only you decide
+  whom to show them to. Reports contain hardware and driver names but no drive serial numbers.
+
 ## Contributing
 
 Yes please. The most valuable contributions need no kernel knowledge at all: **teach the tool about
