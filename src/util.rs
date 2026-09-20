@@ -11,6 +11,21 @@ type Sink = Box<dyn Fn(&str) + Send>;
 static LINE_SINK: Mutex<Option<Sink>> = Mutex::new(None);
 static STATUS_SINK: Mutex<Option<Sink>> = Mutex::new(None);
 
+/// While set, every emitted line is also kept so the final report can be recomposed.
+static CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+pub fn start_capture() {
+    *CAPTURE.lock().unwrap() = Some(Vec::new());
+}
+
+pub fn capture_len() -> usize {
+    CAPTURE.lock().unwrap().as_ref().map_or(0, Vec::len)
+}
+
+pub fn take_capture() -> Vec<String> {
+    CAPTURE.lock().unwrap().take().unwrap_or_default()
+}
+
 pub fn set_log(f: Option<File>) {
     *LOG.lock().unwrap() = f;
 }
@@ -33,6 +48,9 @@ pub fn emit(s: &str) {
     }
     if let Some(f) = LOG.lock().unwrap().as_mut() {
         let _ = writeln!(f, "{s}");
+    }
+    if let Some(lines) = CAPTURE.lock().unwrap().as_mut() {
+        lines.push(s.to_string());
     }
 }
 

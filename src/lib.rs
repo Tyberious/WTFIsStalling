@@ -10,4 +10,5 @@ pub mod modules;
 pub mod probe;
 pub mod procs;
 pub mod state;
+pub mod summary;
 pub mod util;

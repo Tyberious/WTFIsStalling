@@ -27,7 +27,15 @@ nothing on the system.
 3. Use the PC until the hitch happens, ideally a few times. Run the game or app that has the problem.
 4. Click **Stop**. Read the summary, or click **Copy report** and paste it to whoever is helping you.
 
-A report is also saved next to the exe as `WTFIsStalling-<date>.txt`.
+The coloured bar gives the verdict; the report underneath starts with the ranked findings and what to
+try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as
+`WTFIsStalling-<date>.txt`. The window follows the system light / dark theme.
+
+| | |
+| --- | --- |
+| ![Cause found (dark theme)](docs/result-dark.png) | ![Suspect found (light theme)](docs/result-light.png) |
+
+*(Screenshots show built-in demo data.)*
 
 ## What it can pin down
 
@@ -42,32 +50,41 @@ A report is also saved next to the exe as `WTFIsStalling-<date>.txt`.
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
 overflow, frame pacing). If a hitch happened and the report is clean, that's where to look next.
 
-## Example (illustrative)
+## Example report (illustrative)
 
 ```
+====================================================================================================
+RESULT
+
+  >>> PROBLEM FOUND: rtwlane.sys  -  Wi-Fi adapter driver
+      Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).  (+1 more finding below)
+
+  Monitored 05:12  |  14 kernel-level stall(s), 0 CPU-starvation stall(s)  |  worst wake-up delay 11.80 ms ...
+
+  1. [HIGH] rtwlane.sys  -  Wi-Fi adapter driver
+       - Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).
+       - Its interrupt handling ran for up to 10.97 ms at a time (14 times over 1.00 ms). Healthy
+         drivers stay under 0.5 ms; longer runs block everything else on that CPU core ...
+     What to try:
+       Update the Wi-Fi driver from the chip vendor (Intel/Realtek/MediaTek/Qualcomm), disable adapter
+       power saving and background scanning/roaming aggressiveness; test with Wi-Fi off and Ethernet in.
+
+  2. [MEDIUM] Disk 1  -  responding slowly
+       - 3 requests took longer than 200 ms (worst 840 ms).
+     What to try: ...
+====================================================================================================
+DETAILS
+  (who caused the stalls, per-driver DPC/ISR table, hard page faults per process, disk latency)
+
+EVENT LOG (chronological)
 [21:14:07.412] STALL #3  kernel-level (DPC/ISR/firmware)  11.80 ms  on CPU 4
     VERDICT: rtwlane.sys [Wi-Fi adapter driver] kept the CPU in DPC/ISR code for 93% of the stall
-    DPC/ISR activity on the stalled CPU(s):
-      rtwlane.sys+0x2c1f40                       DPC          x1    in-stall  10.97 ms   longest  10.97 ms
-      ndis.sys+0x8a30                            DPC          x3    in-stall    212 µs   longest     96 µs
-
-...
-
-WHO CAUSED THE STALLS
-  culprit                                                    stalls       total       worst
-  driver rtwlane.sys                                             14      121 ms    11.80 ms
-
-DRIVERS BY WORST DPC/ISR EXECUTION TIME  (healthy: DPC < 0.5 ms, ISR < 0.1 ms)
-  driver                        DPCs  worst DPC      ISRs  worst ISR  total time    slow
-  rtwlane.sys                   9120   10.97 ms      9120      41 µs      389 ms      14
-  nvlddmkm.sys                 27875     686 µs     31002      38 µs      508 ms       0
-  ...
-
-WHAT TO DO
-  * rtwlane.sys: Wi-Fi adapter driver
-      Update the Wi-Fi driver from the chip vendor (Intel/Realtek/MediaTek/Qualcomm), disable adapter power
-      saving and background scanning/roaming aggressiveness; test with Wi-Fi off and Ethernet in.
+    ...
 ```
+
+Findings come from stalls (who was blamed), drivers whose DPC/ISR routines run too long even without a
+full stall, programs frozen by paging, and disks answering slowly. **HIGH** means it repeatedly or
+badly stalled the machine, **MEDIUM** is a suspect that can cause crackle and micro-stutter.
 
 ## How it works
 
@@ -124,8 +141,13 @@ RustRover / IntelliJ users get ready-made run targets from the `.run/` folder: t
 elevated-and-debuggable, or UI-only), 30-second CLI captures, and the same test / clippy / fmt checks
 CI runs.
 
-Working on the window without elevation: set `WTFIS_SKIP_ELEVATION=1` (monitoring itself will fail
-with "access denied", which is also how to test that path).
+Working on the window without admin rights:
+
+| Variable | Effect |
+| --- | --- |
+| `WTFIS_DEMO=problem\|warning\|ok` | Start/Stop shows a canned result instead of monitoring |
+| `WTFIS_THEME=dark\|light` | Override the system theme |
+| `WTFIS_SKIP_ELEVATION=1` | Don't elevate; real monitoring then fails with "access denied" (tests that path) |
 
 ## Contributing
 

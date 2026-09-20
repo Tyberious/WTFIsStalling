@@ -19,6 +19,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::summary::Summary;
 use crate::util::{self, from_wide, ms_to_ticks, wide};
 use crate::{analyze, etw, modules, probe, say, state};
 
@@ -163,9 +164,17 @@ fn open_log(target: &LogTarget) -> Option<String> {
     None
 }
 
+pub struct RunOutput {
+    /// Where the report was saved, if anywhere.
+    pub log_path: Option<String>,
+    /// The full report with the result first: system info, RESULT, DETAILS, event log.
+    pub report: String,
+    pub summary: Summary,
+}
+
 /// Monitors until `stop` is set (or `cfg.duration` elapses), then prints the summary.
 /// Returns the path of the report file, if one was written. Must be elevated.
-pub fn run(cfg: &Config, stop: &AtomicBool) -> Result<Option<String>, String> {
+pub fn run(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     // Starting a second trace would take over (and so kill) the first one's session.
     let guard = unsafe { CreateMutexW(null_mut(), 0, wide(r"Global\WTFIsStalling.Monitor").as_ptr()) };
     if guard.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -181,18 +190,44 @@ pub fn run(cfg: &Config, stop: &AtomicBool) -> Result<Option<String>, String> {
     result
 }
 
-fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<Option<String>, String> {
+fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     util::clock();
     let log_path = open_log(&cfg.log);
+    util::start_capture();
     let result = run_inner(cfg, stop);
     if let Err(e) = &result {
         say!("ERROR: {e}");
     }
     util::set_log(None);
-    result.map(|()| log_path)
+    let lines = util::take_capture();
+    let (summary, header_len) = result?;
+
+    // The file was streamed chronologically (so a crash still leaves a log). Now that the
+    // answer is known, rewrite it answer-first.
+    let streamed = lines.len() - summary.detail_lines().len() - summary.result_lines().len();
+    let (header, events) = lines[..streamed].split_at(header_len.min(streamed));
+    let mut report: Vec<String> = header.to_vec();
+    report.extend(summary.result_lines());
+    report.extend(summary.detail_lines());
+    report.push(String::new());
+    report.push("EVENT LOG (chronological)".into());
+    if events.iter().all(|l| l.trim().is_empty()) {
+        report.push("  (nothing noteworthy happened)".into());
+    }
+    report.extend(events.iter().cloned());
+    let report = report.join(
+        "
+",
+    ) + "
+";
+    if let Some(path) = &log_path {
+        let _ = std::fs::write(path, &report);
+    }
+    Ok(RunOutput { log_path, report, summary })
 }
 
-fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(), String> {
+/// Returns the summary and how many captured lines make up the system-info header.
+fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String> {
     let ncpu = unsafe { GetActiveProcessorCount(0) };
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
     print_system_info(ncpu);
@@ -244,6 +279,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(), String> {
         cfg.stall_ms,
         cfg.sched_stall_ms
     );
+    let header_len = util::capture_len();
     say!("");
 
     let started = Instant::now();
@@ -292,6 +328,11 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(), String> {
         Ok(Ok(())) => {}
     }
     analyzer.tick(true);
-    analyzer.summary(started.elapsed().as_secs_f64(), lost, &probe_stats, shared.exec_warn);
-    Ok(())
+    let summary = analyzer.summarize(started.elapsed().as_secs_f64(), lost, &probe_stats, shared.exec_warn, shared.io_warn);
+    // Streamed order ends with the result, because on a console the bottom is what you see.
+    say!("");
+    for line in summary.detail_lines().iter().chain(summary.result_lines().iter()) {
+        say!("{line}");
+    }
+    Ok((summary, header_len))
 }

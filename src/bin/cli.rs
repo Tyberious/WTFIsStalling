@@ -103,8 +103,8 @@ fn main() {
     println!("Press Ctrl+C to stop and see the summary.");
     let result = engine::run(&cfg, &STOP);
     DONE.store(true, Ordering::SeqCst);
-    if let Ok(Some(path)) = &result {
-        println!("\nReport saved to {path}");
+    if let Some(path) = result.as_ref().ok().and_then(|out| out.log_path.as_ref()) {
+        println!("\nReport saved to {path} (result first, then details and the event log)");
     }
     if args.pause_on_exit {
         println!("\nPress Enter to close...");

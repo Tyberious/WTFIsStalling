@@ -2,35 +2,34 @@
 //! reports as they happen and the final summary.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use crate::modules::{knowledge, ModuleMap, KERNEL_SPACE};
-use crate::probe::{ProbeStats, Stall, StallKind};
+use crate::modules::{ModuleMap, KERNEL_SPACE};
+use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
 use crate::say;
 use crate::state::*;
 use crate::util::{clock, fmt_dur, ms_to_ticks, qpc, ticks_to_ms};
 
-struct IncidentSummary {
-    kind: StallKind,
-    dur: i64,
-    culprit: String,
+pub(crate) struct IncidentSummary {
+    pub(crate) kind: StallKind,
+    pub(crate) dur: i64,
+    pub(crate) culprit: String,
 }
 
 pub struct Analyzer {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     rx: Receiver<Stall>,
     pending: Vec<Stall>,
     pub modules: ModuleMap,
     pub procs: ProcNames,
     profile: bool,
-    incidents: Vec<IncidentSummary>,
+    pub(crate) incidents: Vec<IncidentSummary>,
     notable_window_start: i64,
     notable_in_window: u32,
-    notable_suppressed: u64,
-    notable_total: u64,
+    pub(crate) notable_suppressed: u64,
+    pub(crate) notable_total: u64,
 }
 
 /// Everything ETW recorded around one incident, copied out so the lock is held briefly.
@@ -393,203 +392,6 @@ impl Analyzer {
             None => "no DPC/ISR seen yet".into(),
         };
         format!("{:02}:{:02} monitored  |  {} stall(s)  |  {worst_txt}", elapsed_s / 60, elapsed_s % 60, self.incidents.len())
-    }
-
-    pub fn summary(&mut self, elapsed_s: f64, events_lost: u32, stats: &ProbeStats, exec_warn: i64) {
-        let inner = self.shared.inner.lock().unwrap();
-        let routines = inner.routines.clone();
-        let faults = inner.faults_by_pid.clone();
-        let disks = inner.disks.clone();
-        let events = inner.events;
-        let mut debug_counts: Vec<_> = inner.debug_counts.iter().map(|(k, v)| (*k, *v)).collect();
-        let debug_rejected = inner.debug_rejected.clone();
-        drop(inner);
-
-        say!("");
-        say!("==================================== SUMMARY ====================================");
-        say!("Monitored {elapsed_s:.0} s, {events} kernel events processed, {events_lost} lost.");
-        if events == 0 {
-            say!("!! No kernel events were received, so nothing below is meaningful. Another tool may be");
-            say!("!! holding the kernel trace, or security software blocked it.");
-        }
-        say!(
-            "Worst wake-up latency: time-critical thread {}, normal-priority thread {}",
-            fmt_dur(stats.max_kernel.load(Ordering::Relaxed)),
-            fmt_dur(stats.max_sched.load(Ordering::Relaxed))
-        );
-
-        let kernel = self.incidents.iter().filter(|i| i.kind == StallKind::Kernel).count();
-        say!("Stalls detected: {} kernel-level, {} CPU-starvation", kernel, self.incidents.len() - kernel);
-        if self.notable_suppressed > 0 {
-            say!(
-                "({} of {} individual slow-event lines were suppressed to keep the log readable)",
-                self.notable_suppressed,
-                self.notable_total
-            );
-        }
-
-        if !self.incidents.is_empty() {
-            let mut tally: HashMap<&str, (u32, i64, i64)> = HashMap::new();
-            for i in &self.incidents {
-                let t = tally.entry(i.culprit.as_str()).or_default();
-                t.0 += 1;
-                t.1 += i.dur;
-                t.2 = t.2.max(i.dur);
-            }
-            let mut v: Vec<_> = tally.into_iter().collect();
-            v.sort_by_key(|(_, t)| std::cmp::Reverse(t.1));
-            say!("");
-            say!("WHO CAUSED THE STALLS");
-            say!("  {:<58} {:>6} {:>11} {:>11}", "culprit", "stalls", "total", "worst");
-            for (name, (n, total, worst)) in v {
-                say!("  {:<58} {:>6} {:>11} {:>11}", name, n, fmt_dur(total), fmt_dur(worst));
-            }
-        }
-
-        // Per-driver DPC/ISR statistics.
-        #[derive(Default)]
-        struct Agg {
-            dpc_n: u64,
-            dpc_max: i64,
-            isr_n: u64,
-            isr_max: i64,
-            total: i64,
-            over: u64,
-        }
-        let mut mods: HashMap<String, Agg> = HashMap::new();
-        for ((routine, kind), st) in &routines {
-            let a = mods.entry(self.modules.name(*routine)).or_default();
-            if *kind == KIND_ISR {
-                a.isr_n += st.count;
-                a.isr_max = a.isr_max.max(st.max);
-            } else {
-                a.dpc_n += st.count;
-                a.dpc_max = a.dpc_max.max(st.max);
-            }
-            a.total += st.total;
-            a.over += st.over_warn;
-        }
-        let mut v: Vec<_> = mods.into_iter().collect();
-        v.sort_by_key(|(_, a)| std::cmp::Reverse(a.dpc_max.max(a.isr_max)));
-        if !v.is_empty() {
-            say!("");
-            say!("DRIVERS BY WORST DPC/ISR EXECUTION TIME  (healthy: DPC < 0.5 ms, ISR < 0.1 ms)");
-            say!(
-                "  {:<24} {:>9} {:>10} {:>9} {:>10} {:>11} {:>7}",
-                "driver",
-                "DPCs",
-                "worst DPC",
-                "ISRs",
-                "worst ISR",
-                "total time",
-                "slow"
-            );
-            for (name, a) in v.iter().take(12) {
-                say!(
-                    "  {:<24} {:>9} {:>10} {:>9} {:>10} {:>11} {:>7}",
-                    name,
-                    a.dpc_n,
-                    fmt_dur(a.dpc_max),
-                    a.isr_n,
-                    fmt_dur(a.isr_max),
-                    fmt_dur(a.total),
-                    a.over
-                );
-            }
-        }
-
-        if !faults.is_empty() {
-            let mut by_name: HashMap<String, LatStat> = HashMap::new();
-            for (pid, st) in faults {
-                let e = by_name.entry(self.procs.label(pid, 0)).or_default();
-                e.count += st.count;
-                e.total += st.total;
-                e.max = e.max.max(st.max);
-            }
-            let mut f: Vec<_> = by_name.into_iter().collect();
-            f.sort_by_key(|(_, s)| std::cmp::Reverse(s.total));
-            say!("");
-            say!("HARD PAGE FAULTS  (process frozen while memory is read back from disk)");
-            say!("  {:<40} {:>8} {:>12} {:>10}", "process", "faults", "total wait", "worst");
-            for (name, s) in f.iter().take(6) {
-                say!("  {:<40} {:>8} {:>12} {:>10}", name, s.count, fmt_dur(s.total), fmt_dur(s.max));
-            }
-        }
-
-        if !disks.is_empty() {
-            let mut d: Vec<_> = disks.into_iter().collect();
-            d.sort_by_key(|(n, _)| *n);
-            say!("");
-            say!("DISK LATENCY");
-            say!("  {:<8} {:>10} {:>10} {:>10} {:>7}", "disk", "requests", "average", "worst", "slow");
-            for (n, s) in d {
-                say!("  {:<8} {:>10} {:>10} {:>10} {:>7}", n, s.count, fmt_dur(s.total / s.count.max(1) as i64), fmt_dur(s.max), s.slow);
-            }
-        }
-
-        // Plain-language conclusion.
-        say!("");
-        say!("WHAT TO DO");
-        let mut advised = 0;
-        let mut suspects: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for i in &self.incidents {
-            if let Some(m) = i.culprit.strip_prefix("driver ") {
-                if seen.insert(m.to_string()) {
-                    suspects.push(m.to_string());
-                }
-            }
-        }
-        for (name, a) in v.iter().take(12) {
-            if a.dpc_max.max(a.isr_max) >= exec_warn && seen.insert(name.clone()) {
-                suspects.push(name.clone());
-            }
-        }
-        for m in suspects.iter().take(5) {
-            let what = self.modules.describe(m);
-            say!("  * {m}: {what}");
-            if let Some(k) = knowledge(m) {
-                say!("      {}", k.advice);
-            } else {
-                say!("      Update, roll back or temporarily disable the device/software this driver belongs to and retest.");
-            }
-            advised += 1;
-        }
-        if self.incidents.iter().any(|i| i.culprit.starts_with("CPU went dark")) {
-            say!("  * CPU went dark: update the BIOS/UEFI, disable 'Legacy USB support' and unused onboard devices as a test,");
-            say!("      check temperatures/throttling, and if Hyper-V/VBS (Core Isolation) is on, test with it off.");
-            advised += 1;
-        }
-        let mut procs_blamed: Vec<&str> = self.incidents.iter().filter_map(|i| i.culprit.strip_prefix("process ")).collect();
-        procs_blamed.sort_unstable();
-        procs_blamed.dedup();
-        for p in procs_blamed.iter().take(4) {
-            say!("  * {p}: was on the CPU during stalls. Close it and retest; if the stalls vanish, the app or a driver it leans on is at fault.");
-            advised += 1;
-        }
-        if advised == 0 {
-            if self.incidents.is_empty() {
-                say!("  Nothing stalled while this was running and no driver misbehaved. Reproduce the hitch while");
-                say!("  monitoring (run it during the game/app that hitches), and let it run longer.");
-                say!("  If the hitch happened and nothing was flagged, the cause is likely inside the app or on the GPU");
-                say!("  (shader compilation, VRAM overflow, frame pacing), which a CPU-side trace can't see.");
-            } else {
-                say!("  Stalls happened but no single culprit stood out. Run longer to gather more incidents, and check the");
-                say!("  per-incident details above for a pattern.");
-            }
-        }
-        say!("=================================================================================");
-
-        if !debug_counts.is_empty() {
-            debug_counts.sort();
-            say!("debug: events by (provider, opcode):");
-            for ((guid, op), n) in debug_counts {
-                say!("  {guid:08x} op {op:>3}: {n}");
-            }
-            for (ts, initial) in debug_rejected {
-                say!("  rejected DPC/ISR: event ts {ts}, InitialTime {initial}, now {}", qpc());
-            }
-        }
     }
 }
 
