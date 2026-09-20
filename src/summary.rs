@@ -20,6 +20,7 @@ use crate::pci::{self, PciDevice};
 use crate::period;
 use crate::probe::{ProbeStats, StallKind};
 use crate::state::*;
+use crate::topology::Topology;
 use crate::util::{fmt_dur, ms_to_ticks, qpc, qpc_freq};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -754,6 +755,50 @@ const FATAL_ERROR_ADVICE: &str = "The PC crashed, froze or restarted because of 
     temperatures and that all power cables are firmly seated. If it still happens at default settings, test the memory (MemTest86) \
     and suspect the power supply, CPU or motherboard.";
 
+/// Fewest stalls worth reading a pattern into, and the share of them that has to be on
+/// efficiency cores before it is one.
+const ECORE_MIN_STALLS: usize = 3;
+const ECORE_SHARE: f64 = 0.8;
+
+/// Were the stalls concentrated on the slow (efficiency) cores of a hybrid CPU?
+///
+/// `hit` is the CPUs each stall or flagged moment held up. It counts as an E-core stall only
+/// when every CPU it hit was an efficiency core. The rule deliberately stays narrow: at least
+/// 3 stalls, at least 80% of them on E-cores, and only where the E-cores are at most half of
+/// the logical CPUs -- otherwise most stalls land on an E-core on any machine, simply because
+/// most cores are E-cores, and that says nothing.
+///
+/// Returns (stalls on E-cores, stalls that named a CPU, the cores involved).
+fn e_core_concentration(topo: &Topology, hit: &[Vec<u16>]) -> Option<(usize, usize, Vec<u16>)> {
+    if !topo.hybrid() || topo.efficiency_cpus() * 2 > topo.total() {
+        return None;
+    }
+    let named: Vec<&Vec<u16>> = hit.iter().filter(|c| !c.is_empty()).collect();
+    let on_e: Vec<&&Vec<u16>> = named.iter().filter(|c| c.iter().all(|cpu| topo.is_efficiency(*cpu))).collect();
+    if named.len() < ECORE_MIN_STALLS || (on_e.len() as f64) < named.len() as f64 * ECORE_SHARE {
+        return None;
+    }
+    let mut cores: Vec<u16> = on_e.iter().flat_map(|c| c.iter().copied()).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    Some((on_e.len(), named.len(), cores))
+}
+
+/// What this finding may claim is limited to what the probes measure and what Microsoft documents.
+/// The probes are pinned one per core, so a stall on an E-core means a driver or interrupt held
+/// THAT core; it does not show what program was running there. Microsoft's Quality of Service page
+/// (<https://learn.microsoft.com/windows/win32/procthread/quality-of-service>) documents which work
+/// is sent to efficient cores: Eco QoS (Task Manager's "Efficiency mode") "always ... schedules to
+/// efficient cores", and on battery so do windows that are not visible (Low) and background
+/// services (Utility). It does not say that foreground work stays off E-cores, so that is not
+/// claimed. Efficiency mode is toggled per process by right-clicking it on Task Manager's
+/// Processes tab; a green leaf marks it.
+const ECORE_ADVICE: &str = "This is a lead, not a verdict: it tells you where the stalls were, not who was waiting there. Two things \
+    Windows documents as sending a program to the efficiency cores are worth ruling out. Open Task Manager, and on the Processes tab \
+    check that the game or app you care about does not have 'Efficiency mode' switched on (a small green leaf next to its name): \
+    right-click it to turn that off. On a laptop, plug in the charger: on battery, Windows moves background work and windows that \
+    are not in view to the efficiency cores. The findings above say what caused the stalls themselves.";
+
 /// (bus, device, function)
 type PciAddress = (u32, u32, u32);
 
@@ -1127,6 +1172,23 @@ impl Analyzer {
                  compilation, VRAM running out (lower texture quality), frame pacing / V-Sync settings, overlays, or the game's own \
                  asset streaming."
                     .into(),
+                0,
+            );
+        }
+
+        // ---- Hybrid CPUs: work that kept landing on the efficiency cores -------------------
+        let hit: Vec<Vec<u16>> = self.incidents.iter().map(|i| i.cpus.clone()).collect();
+        if let Some((on_e, named, cores)) = e_core_concentration(&self.topo, &hit) {
+            let list = cores.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ");
+            found.add(
+                "e-core stalls",
+                Severity::Low,
+                "Most stalls were on the processor's efficiency cores (E-cores)".into(),
+                format!(
+                    "{on_e} of the {named} stalls held up an efficiency core (CPU {list}). This processor pairs those with faster \
+                     performance cores (P-cores). Only programs running on the stalled cores were held up by these."
+                ),
+                ECORE_ADVICE.into(),
                 0,
             );
         }
@@ -1922,6 +1984,49 @@ mod tests {
         assert!(gpu_findings(&gpu_log(12 * GB, &busy), &[], &mut |_| String::new()).findings.is_empty());
     }
 
+    // --- hybrid CPUs: stalls landing on the efficiency cores --------------------------------
+
+    /// `p` performance cores then `e` efficiency cores, one group, no SMT.
+    fn hybrid_topo(p: u8, e: u8) -> Topology {
+        let sets: Vec<crate::topology::CpuSet> =
+            (0..p + e).map(|i| crate::topology::CpuSet { group: 0, index: i, class: u8::from(i < p), core: i }).collect();
+        Topology::build(&[(p + e) as u32], &sets)
+    }
+
+    #[test]
+    fn stalls_concentrated_on_efficiency_cores_are_reported() {
+        let topo = hybrid_topo(4, 4);
+        let hit = vec![vec![5u16], vec![6], vec![7]];
+        assert_eq!(e_core_concentration(&topo, &hit), Some((3, 3, vec![5, 6, 7])));
+        // One in four on a P-core is 75%: under the 80% rule.
+        let mixed = vec![vec![5u16], vec![6], vec![7], vec![1]];
+        assert_eq!(e_core_concentration(&topo, &mixed), None);
+        // A stall that hit a P-core as well as an E-core does not count as an E-core stall.
+        assert_eq!(e_core_concentration(&topo, &[vec![5, 1], vec![6], vec![7]]), None);
+    }
+
+    #[test]
+    fn too_few_stalls_or_no_cpu_is_not_a_pattern() {
+        let topo = hybrid_topo(4, 4);
+        assert_eq!(e_core_concentration(&topo, &[vec![5u16], vec![6]]), None);
+        // CPU-starvation stalls name no CPU at all.
+        assert_eq!(e_core_concentration(&topo, &[vec![], vec![], vec![]]), None);
+    }
+
+    #[test]
+    fn nothing_is_said_about_cores_on_a_uniform_cpu() {
+        let topo = Topology::build(&[8], &[]);
+        assert_eq!(e_core_concentration(&topo, &[vec![5u16], vec![6], vec![7]]), None);
+        assert_eq!(e_core_concentration(&Topology::default(), &[vec![0u16], vec![0], vec![0]]), None);
+    }
+
+    /// With 2 P-cores and 6 E-cores, stalls land on an E-core simply because most cores are.
+    #[test]
+    fn e_cores_in_the_majority_prove_nothing() {
+        let topo = hybrid_topo(2, 6);
+        assert_eq!(e_core_concentration(&topo, &[vec![3u16], vec![4], vec![5], vec![6]]), None);
+    }
+
     #[test]
     fn every_flagged_moment_shows_up_in_the_result_whatever_the_verdict() {
         use crate::analyze::IncidentSummary;
@@ -1937,6 +2042,7 @@ mod tests {
             dur: ms_to_ticks(6.0),
             culprit: culprit.to_string(),
             marked: true,
+            cpus: vec![0],
         };
         az.incidents.push(flagged("CPU went dark (firmware SMI / hypervisor / interrupts off)"));
         az.incidents.push(flagged("unexplained"));

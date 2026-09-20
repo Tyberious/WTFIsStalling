@@ -61,6 +61,7 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide; backed up by the "firmware limited the processor's speed" event when Windows logged one |
+| **Stalls concentrated on the efficiency cores** of a hybrid processor (P-cores / E-cores) | Each stall says which kind of core it hit. When they pile up on the E-cores, a low-severity finding says so and lists what Windows documents as sending a program there (Task Manager's "Efficiency mode"; on battery, background and out-of-view work) |
 | Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware) |
@@ -132,6 +133,9 @@ Two independent sources, correlated on one clock (QPC):
   priority 31, pinned, waking every millisecond and measuring how late each wake-up was. Nothing but
   DPCs, ISRs, code at raised IRQL, firmware (SMI) or a hypervisor can delay those threads, so a late
   wake-up *is* a kernel-level stall. A second, normal-priority probe detects plain CPU starvation.
+  Every logical CPU is covered, including machines past 64 of them, where Windows splits the CPUs into
+  *processor groups*: each probe is pinned by (group, index) and reports the system-wide CPU number the
+  kernel trace uses, so the two always line up.
 
 When a probe reports a stall, the analyzer waits for the trace to catch up, looks at exactly what ran
 on that CPU during that window and issues a verdict:
@@ -144,6 +148,12 @@ on that CPU during that window and issues a verdict:
 **Flagged moments.** Wake-up delays from 1 ms up are kept for 30 seconds even though they are far below
 the stall threshold. When you press "I felt it", the worst one in the 3 seconds before the press goes
 through the same verdict logic as a full stall; if there is none, the CPU side is cleared for that hitch.
+
+**P-cores and E-cores.** On hybrid processors (Intel 12th gen and later) Windows reports an efficiency
+class per logical CPU. Stalls are then labeled with the kind of core they hit ("on CPU 17 (E-core)"), and
+when they pile up on the efficiency cores the report says so. It claims no more than that: the probes
+show which core was held up, not which program was waiting on it. On an ordinary
+processor, where every core is the same, nothing about core types is printed.
 
 **CPU clock.** Once a second the "Processor Information" counters are read per core. Only cores that are
 busy are judged: an idle core clocking down is normal, a busy core at half speed is throttling.

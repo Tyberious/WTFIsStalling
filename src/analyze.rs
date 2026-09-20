@@ -13,6 +13,7 @@ use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
 use crate::say;
 use crate::state::*;
+use crate::topology::{topology, Topology};
 use crate::util::{clock, fmt_dur, ms_to_ticks, qpc, ticks_to_ms};
 
 pub(crate) struct IncidentSummary {
@@ -22,6 +23,8 @@ pub(crate) struct IncidentSummary {
     pub(crate) culprit: String,
     /// Below the stall threshold; only examined because the user flagged that moment.
     pub(crate) marked: bool,
+    /// The CPUs whose probes were held up (system-wide indexes); empty for CPU starvation.
+    pub(crate) cpus: Vec<u16>,
 }
 
 /// Moments the user flagged with "I felt it" (QPC), waiting for the analyzer to pick them up.
@@ -49,6 +52,8 @@ pub struct Analyzer {
     pub modules: ModuleMap,
     pub procs: ProcNames,
     pub disks: DiskMap,
+    /// What this PC's CPUs are: processor groups, and P-cores vs E-cores on a hybrid chip.
+    pub(crate) topo: Topology,
     /// Why each disk's slow requests were slow, as far as the traffic around them can tell.
     pub(crate) disk_why: HashMap<u32, DiskWhy>,
     /// Each drive's own health counters when monitoring began; the summary compares against them.
@@ -101,6 +106,7 @@ impl Analyzer {
             modules,
             procs: ProcNames::new(),
             disks,
+            topo: topology().clone(),
             disk_why: HashMap::new(),
             health_at_start,
             started: qpc(),
@@ -140,6 +146,7 @@ impl Analyzer {
             modules,
             procs,
             disks: DiskMap::new(),
+            topo: Topology::default(),
             disk_why: HashMap::new(),
             health_at_start: HashMap::new(),
             started: qpc(),
@@ -240,7 +247,9 @@ impl Analyzer {
         let mut cpus: Vec<u16> = stalls.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
-        let cpu_list = cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+        // "4,5" as always; on a hybrid CPU "4 (P-core), 5 (E-core)", which needs the wider gap.
+        let sep = if self.topo.hybrid() { ", " } else { "," };
+        let cpu_list = cpus.iter().map(|c| self.cpu_label(*c)).collect::<Vec<_>>().join(sep);
 
         say!("");
         match kind {
@@ -262,7 +271,16 @@ impl Analyzer {
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
-        self.incidents.push(IncidentSummary { kind, start, dur: worst, culprit, marked: false });
+        self.incidents.push(IncidentSummary { kind, start, dur: worst, culprit, marked: false, cpus });
+    }
+
+    /// "4" on an ordinary PC; "4 (E-core)" where the cores are not all the same. Nothing is
+    /// added on a uniform CPU, where a core number says all there is to say.
+    fn cpu_label(&self, cpu: u16) -> String {
+        match self.topo.core_type(cpu) {
+            Some(what) => format!("{cpu} ({what})"),
+            None => cpu.to_string(),
+        }
     }
 
     /// Marks wait for the trace to catch up just like stalls do.
@@ -338,7 +356,7 @@ impl Analyzer {
         say!(
             "    {} CPU interruption(s) in that window; the worst held CPU {} for {} at {} ({:.1} s {} your mark)",
             in_window.len(),
-            worst.cpu.unwrap_or(0),
+            self.cpu_label(worst.cpu.unwrap_or(0)),
             fmt_dur(dur),
             clock().fmt(worst.start),
             offset_s.abs(),
@@ -347,7 +365,10 @@ impl Analyzer {
         let ev = self.gather(start - ms_to_ticks(0.5), end, from, caught_up);
         let culprit = self.verdict_kernel(&cluster, &ev);
         self.print_io_context(&ev);
-        self.incidents.push(IncidentSummary { kind: StallKind::Kernel, start, dur, culprit, marked: true });
+        let mut cpus: Vec<u16> = cluster.iter().filter_map(|s| s.cpu).collect();
+        cpus.sort_unstable();
+        cpus.dedup();
+        self.incidents.push(IncidentSummary { kind: StallKind::Kernel, start, dur, culprit, marked: true, cpus });
     }
 
     fn print_longest_execs(&mut self, ev: &Evidence) {
@@ -573,7 +594,7 @@ impl Analyzer {
                     kind_name(e.kind),
                     fmt_dur(e.end - e.start),
                     self.modules.symbolish(e.routine),
-                    e.cpu
+                    self.cpu_label(e.cpu)
                 ),
                 Notable::SlowFault(f) => say!(
                     "[{}] slow hard page fault {:>9}  {} waited on disk for paged-out memory ({} KB)",
@@ -676,6 +697,21 @@ mod tests {
         let mut spans = vec![(0, 100), (10, 20), (50, 60), (90, 130), (200, 250)];
         assert_eq!(union_len(&mut spans), 130 + 50);
         assert_eq!(union_len(&mut []), 0);
+    }
+
+    /// The CPU number in a stall line is bare on an ordinary PC, and labeled only where the
+    /// cores differ. Nothing about core types may appear on a uniform machine.
+    #[test]
+    fn cpu_numbers_are_only_labeled_on_a_hybrid_cpu() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        assert_eq!(az.cpu_label(5), "5");
+
+        let sets: Vec<crate::topology::CpuSet> =
+            (0..8u8).map(|i| crate::topology::CpuSet { group: 0, index: i, class: u8::from(i < 4), core: i }).collect();
+        az.topo = crate::topology::Topology::build(&[8], &sets);
+        assert_eq!(az.cpu_label(1), "1 (P-core)");
+        assert_eq!(az.cpu_label(5), "5 (E-core)");
     }
 
     // --- verdict_kernel / verdict_sched, on synthetic evidence -----------------------------

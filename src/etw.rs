@@ -17,9 +17,9 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_FLAG_DISK_IO,
-    EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS, EVENT_TRACE_FLAG_PROCESS,
-    EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD,
+    EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS,
+    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -203,13 +203,35 @@ fn rd_u64(d: &[u8], off: usize) -> Option<u64> {
     d.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+/// Which CPU an event was logged on. `ETW_BUFFER_CONTEXT` holds a u16 `ProcessorIndex` in a
+/// union with an older `{ u8 ProcessorNumber; u8 Alignment; }`, and the flag says which one is
+/// filled in. This is exactly what the SDK's own inline `GetEventProcessorIndex` does
+/// (evntcons.h, Windows Kits 10.0.26100.0):
+///     if (Flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) return BufferContext.ProcessorIndex;
+///     else return BufferContext.ProcessorNumber;
+/// Reading the u16 unconditionally (what this used to do) would return
+/// `ProcessorNumber + 256 * Alignment` on a buffer written the old way.
+///
+/// `ProcessorIndex` is the system-wide index, the numbering `topology` maps probe threads onto.
+/// `ProcessorNumber` is only a group-relative number, so on a machine with several processor
+/// groups an old-style buffer cannot be placed at all; taking it as-is is right for every
+/// machine of 64 CPUs or fewer, which is every machine with a single group.
+fn processor_index(flags: u16, index: u16, number: u8) -> u16 {
+    if flags as u32 & EVENT_HEADER_FLAG_PROCESSOR_INDEX != 0 {
+        index
+    } else {
+        number as u16
+    }
+}
+
 unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let rec = &*rec;
     let shared = &*(rec.UserContext as *const Shared);
     let hdr = &rec.EventHeader;
     let data: &[u8] =
         if rec.UserData.is_null() { &[] } else { std::slice::from_raw_parts(rec.UserData as *const u8, rec.UserDataLength as usize) };
-    let cpu = rec.BufferContext.Anonymous.ProcessorIndex;
+    let ctx = rec.BufferContext.Anonymous;
+    let cpu = processor_index(hdr.Flags, ctx.ProcessorIndex, ctx.Anonymous.ProcessorNumber);
     // This runs on ETW's thread behind a foreign frame: a panic must not unwind out of it (that
     // aborts the process, which would leave the kernel session running and lose the report).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -398,6 +420,17 @@ mod tests {
         let f = inner.faults.back().expect("fault recorded");
         assert_eq!((f.pid, f.end - f.start), (4242, 60_000));
         assert_eq!(inner.faults_by_pid[&4242].slow, 1);
+    }
+
+    /// The flag decides which half of the union is real; without it the u16 is
+    /// ProcessorNumber + 256 * Alignment and must not be used.
+    #[test]
+    fn processor_index_follows_the_event_header_flag() {
+        let flag = EVENT_HEADER_FLAG_PROCESSOR_INDEX as u16;
+        assert_eq!(processor_index(flag, 300, 44), 300, "past 255 CPUs only the u16 is right");
+        assert_eq!(processor_index(flag | 0x40, 7, 7), 7);
+        // Old-style buffer: Alignment 8 makes the u16 read 2051, the real CPU is 3.
+        assert_eq!(processor_index(0x40, 3 + 8 * 256, 3), 3);
     }
 
     #[test]

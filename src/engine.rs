@@ -13,13 +13,13 @@ use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_EL
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetActiveProcessorCount, GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority,
-    THREAD_PRIORITY_HIGHEST,
+    CreateMutexW, GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::summary::{RunData, Summary};
+use crate::topology::topology;
 use crate::util::{self, from_wide, ms_to_ticks, wide};
 use crate::{analyze, cpuclock, etw, gpu, modules, probe, say, state};
 
@@ -146,6 +146,11 @@ fn print_system_info(ncpu: u32) {
         u(reg_str(bios_key, "BIOSVersion")),
         u(reg_str(bios_key, "BIOSReleaseDate"))
     );
+    // Only worth a line when there is something unusual about the layout: a hybrid chip
+    // (P-cores and E-cores) or more than one processor group.
+    if let Some(note) = topology().note() {
+        say!("CPUs   : {note}");
+    }
     say!("Windows: build {} ({})", u(reg_str(cv, "CurrentBuild")), u(reg_str(cv, "DisplayVersion")));
 }
 
@@ -277,7 +282,8 @@ impl Drop for TimerResolution {
 }
 
 fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String> {
-    let ncpu = unsafe { GetActiveProcessorCount(0) };
+    // Every group, not just group 0: past 64 logical CPUs Windows splits the machine up.
+    let ncpu = topology().total() as u32;
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
     print_system_info(ncpu);
 

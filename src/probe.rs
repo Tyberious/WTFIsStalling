@@ -23,11 +23,12 @@ use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    CreateWaitableTimerExW, CreateWaitableTimerW, GetActiveProcessorCount, GetCurrentProcess, GetCurrentThread, GetPriorityClass,
-    SetPriorityClass, SetThreadGroupAffinity, SetThreadPriority, SetWaitableTimer, WaitForSingleObject, REALTIME_PRIORITY_CLASS,
-    THREAD_PRIORITY_IDLE, THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+    CreateWaitableTimerExW, CreateWaitableTimerW, GetCurrentProcess, GetCurrentThread, GetPriorityClass, SetPriorityClass,
+    SetThreadGroupAffinity, SetThreadPriority, SetWaitableTimer, WaitForSingleObject, REALTIME_PRIORITY_CLASS, THREAD_PRIORITY_IDLE,
+    THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
+use crate::topology::{self, Slot};
 use crate::util::{ms_to_ticks, qpc};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,6 +40,7 @@ pub enum StallKind {
 #[derive(Clone, Copy, Debug)]
 pub struct Stall {
     pub kind: StallKind,
+    /// System-wide processor index, the same numbering ETW uses (see `topology`).
     pub cpu: Option<u16>,
     /// When the thread should have run.
     pub start: i64,
@@ -72,17 +74,24 @@ const WAIT_OBJECT_0: u32 = 0;
 
 fn run(
     kind: StallKind,
-    cpu: Option<u16>,
+    pin: Option<Slot>,
     interval_ms: f64,
     threshold_ms: f64,
     tx: Sender<Stall>,
     stop: Arc<AtomicBool>,
     max_slot: Arc<AtomicI64>,
 ) {
+    let cpu = pin.map(|s| s.cpu);
     unsafe {
         let me = GetCurrentThread();
-        if let Some(cpu) = cpu {
-            let ga = GROUP_AFFINITY { Mask: 1usize << cpu, Group: 0, Reserved: [0; 3] };
+        if let Some(slot) = pin {
+            // The mask is group-relative: index is always < 64, however many CPUs the PC has.
+            // Pinning outside our own group is allowed on every supported Windows: since
+            // Windows 11 threads span all groups by default, and before that "if a thread is
+            // assigned to a different group than the process, the process's affinity is updated
+            // to include the thread's affinity and the process becomes a multi-group process"
+            // (learn.microsoft.com/windows/win32/procthread/processor-groups).
+            let ga = GROUP_AFFINITY { Mask: 1usize << slot.index, Group: slot.group, Reserved: [0; 3] };
             SetThreadGroupAffinity(me, &ga, null_mut());
         }
         SetThreadPriority(me, if kind == StallKind::Kernel { THREAD_PRIORITY_TIME_CRITICAL } else { THREAD_PRIORITY_NORMAL });
@@ -177,14 +186,20 @@ pub fn spawn_kernel_probes(threshold_ms: f64, tx: Sender<Stall>, stats: Arc<Prob
 }
 
 /// Child side. Exits when the parent closes our stdin (or dies).
+///
+/// Protocol on stdout, one line each: `C <priority class>` once at the start, `S`/`L <cpu>
+/// <start> <end>` for a stall / a sub-threshold blip, `M <max>` as a keep-alive. `<cpu>` is the
+/// system-wide processor index, the same numbering ETW reports.
 pub fn child_main(threshold_ms: f64) -> ! {
     crate::etw::enable_privilege("SeIncreaseBasePriorityPrivilege");
-    let ncpu = unsafe {
+    unsafe {
         SetConsoleCtrlHandler(None, 1); // Ctrl+C is the parent's business
         SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
         timeBeginPeriod(1);
-        GetActiveProcessorCount(0).min(64) as u16
-    };
+    }
+    // One probe per logical CPU, across every processor group: past 64 CPUs Windows splits the
+    // machine into groups and a thread pinned in group 0 would never see the rest.
+    let slots = topology::processor_slots(&topology::active_groups());
 
     std::thread::spawn(|| {
         let mut sink = Vec::new();
@@ -195,9 +210,9 @@ pub fn child_main(threshold_ms: f64) -> ! {
     let (tx, rx) = mpsc::channel::<Stall>();
     let stop = Arc::new(AtomicBool::new(false));
     let max = Arc::new(AtomicI64::new(0));
-    for cpu in 0..ncpu {
+    for slot in slots {
         let (tx, stop, max) = (tx.clone(), stop.clone(), max.clone());
-        std::thread::spawn(move || run(StallKind::Kernel, Some(cpu), 1.0, threshold_ms, tx, stop, max));
+        std::thread::spawn(move || run(StallKind::Kernel, Some(slot), 1.0, threshold_ms, tx, stop, max));
     }
 
     // Reporting is the only non-probe work in this process; keep it at the bottom of the
