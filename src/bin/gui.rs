@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_F9,
 };
@@ -90,10 +90,24 @@ struct Palette {
     text: u32,
     subtext: u32,
     field: u32,
+    /// Scroll bar track, for the square where the report's two scroll bars meet.
+    track: u32,
 }
 
-const LIGHT: Palette = Palette { window: rgb(243, 243, 243), text: rgb(26, 26, 26), subtext: rgb(70, 70, 70), field: rgb(255, 255, 255) };
-const DARK: Palette = Palette { window: rgb(32, 32, 32), text: rgb(236, 236, 236), subtext: rgb(190, 190, 190), field: rgb(24, 24, 24) };
+const LIGHT: Palette = Palette {
+    window: rgb(243, 243, 243),
+    text: rgb(26, 26, 26),
+    subtext: rgb(70, 70, 70),
+    field: rgb(255, 255, 255),
+    track: rgb(240, 240, 240),
+};
+const DARK: Palette = Palette {
+    window: rgb(32, 32, 32),
+    text: rgb(236, 236, 236),
+    subtext: rgb(190, 190, 190),
+    field: rgb(24, 24, 24),
+    track: rgb(23, 23, 23),
+};
 
 /// (banner background, accent) per tone.
 fn tone_colors(tone: Tone, dark: bool) -> (u32, u32) {
@@ -115,6 +129,7 @@ static DARK_MODE: AtomicBool = AtomicBool::new(false);
 /// Brushes handed back from WM_CTLCOLOR*; they must outlive the message.
 static WINDOW_BRUSH: AtomicIsize = AtomicIsize::new(0);
 static FIELD_BRUSH: AtomicIsize = AtomicIsize::new(0);
+static TRACK_BRUSH: AtomicIsize = AtomicIsize::new(0);
 
 fn palette() -> &'static Palette {
     if DARK_MODE.load(Ordering::Relaxed) {
@@ -171,7 +186,7 @@ unsafe fn apply_theme(hwnd: HWND) {
     let dark = system_wants_dark();
     DARK_MODE.store(dark, Ordering::Relaxed);
     let p = palette();
-    for (slot, color) in [(&WINDOW_BRUSH, p.window), (&FIELD_BRUSH, p.field)] {
+    for (slot, color) in [(&WINDOW_BRUSH, p.window), (&FIELD_BRUSH, p.field), (&TRACK_BRUSH, p.track)] {
         let old = slot.swap(CreateSolidBrush(color) as isize, Ordering::Relaxed);
         if old != 0 {
             DeleteObject(old as _);
@@ -199,6 +214,8 @@ struct Ui {
     mark: usize,
     status: usize,
     log: usize,
+    /// Covers the square between the report's scroll bars, which Windows leaves light in dark mode.
+    corner: usize,
     headline_font: isize,
     sub_font: isize,
 }
@@ -438,15 +455,17 @@ unsafe fn create_controls(hwnd: HWND) {
         log: child(
             "EDIT",
             INTRO,
-            WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
+            WS_TABSTOP | WS_CLIPSIBLINGS | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
             0,
             0,
             mono_font,
         ),
+        corner: child("STATIC", "", WS_CLIPSIBLINGS, 0, 0, ui_font),
         headline_font: make_font("Segoe UI", 15, 600, dpi),
         sub_font: make_font("Segoe UI", 10, 400, dpi),
     };
     SendMessageW(ui.log as HWND, EM_SETLIMITTEXT, 64 << 20, 0);
+    SetWindowPos(ui.corner as HWND, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SetFocus(ui.toggle as HWND);
     let _ = UI.set(ui);
     set_banner(hwnd, Tone::Neutral, "Ready", "Press Start monitoring, then reproduce the problem.");
@@ -482,6 +501,9 @@ unsafe fn layout(hwnd: HWND, ui: &Ui) {
     MoveWindow(ui.status as HWND, status_x, m + s(12), (copy_x - m - status_x).max(0), s(20), 1);
     let top = banner_rect(hwnd).bottom + m;
     MoveWindow(ui.log as HWND, m, top, (w - 2 * m).max(0), (h - top - m).max(0), 1);
+    let dpi = GetDpiForWindow(hwnd);
+    let (bar_w, bar_h) = (GetSystemMetricsForDpi(SM_CXVSCROLL, dpi), GetSystemMetricsForDpi(SM_CYHSCROLL, dpi));
+    MoveWindow(ui.corner as HWND, w - m - bar_w, h - m - bar_h, bar_w, bar_h, 1);
     InvalidateRect(hwnd, null(), 1);
 }
 
@@ -549,6 +571,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         (WM_PAINT, Some(ui)) => paint(hwnd, ui),
         // The read-only report box and the status label.
         (WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT, Some(ui)) => {
+            if lp as usize == ui.corner {
+                return TRACK_BRUSH.load(Ordering::Relaxed) as HBRUSH as LRESULT;
+            }
             let p = palette();
             let is_log = lp as usize == ui.log;
             SetTextColor(wp as HDC, if is_log { p.text } else { p.subtext });
