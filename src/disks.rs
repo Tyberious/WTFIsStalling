@@ -151,15 +151,11 @@ pub fn fmt_size(bytes: u64) -> String {
 pub(crate) struct Handle(HANDLE);
 
 impl Handle {
-    /// Zero desired access: enough for the property and geometry ioctls, never reads user data.
+    /// Zero desired access: enough for every property, geometry and health query this tool makes.
+    /// A raw disk is never opened for reading, let alone writing.
     pub(crate) fn open(path: &str) -> Option<Handle> {
-        Handle::open_with(path, 0)
-    }
-
-    /// SMART and some protocol commands insist on a read/write handle (they still read no user data).
-    pub(crate) fn open_with(path: &str, access: u32) -> Option<Handle> {
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-        let h = unsafe { CreateFileW(wide(path).as_ptr(), access, share, null(), OPEN_EXISTING, 0, null_mut()) };
+        let h = unsafe { CreateFileW(wide(path).as_ptr(), 0, share, null(), OPEN_EXISTING, 0, null_mut()) };
         (h != INVALID_HANDLE_VALUE && !h.is_null()).then_some(Handle(h))
     }
 

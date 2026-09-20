@@ -33,6 +33,13 @@ nothing on the system.
 > people have downloaded yet, not a virus detection. Click **More info**, then **Run anyway**. If you
 > would rather verify first, compare the file against `SHA256SUMS.txt` from the same release
 > (`Get-FileHash WTFIsStalling.exe` in PowerShell), or build it yourself from this source.
+>
+> **Antivirus blocked the download?** Detections whose name ends in `!ml` (for example
+> `Trojan:Win32/Wacatac.B!ml`) are a machine-learning guess, not a match against known malware. New,
+> unsigned tools that ask for administrator rights and read low-level system data get them often. The
+> source is all here, releases are built by GitHub Actions from the tagged commit, and the checksums
+> are published with each release. Please [open an issue](https://github.com/Tyberious/WTFIsStalling/issues)
+> with the detection name so it can be reported to the vendor as a false positive.
 
 The colored bar gives the verdict; the report underneath starts with the ranked findings and what to
 try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as

@@ -3,13 +3,15 @@
 //! when it ends, because a counter that moved *during* the run (thermal throttling, cable CRC
 //! errors) is evidence, while a lifetime total is only background.
 //!
+//! Drives are only ever opened with zero access rights: no read, and above all no write access to
+//! a raw disk, which a diagnostic tool has no business asking for.
+//!
 //! Every read is best effort: USB bridges, RAID drivers and virtual disks often refuse, and then
 //! there is simply nothing to report.
 
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::System::Ioctl::{
     NVMeDataTypeLogPage, ProtocolTypeNvme, StorageAdapterProtocolSpecificProperty, StorageDeviceProtocolSpecificProperty,
-    StorageDeviceTemperatureProperty, IOCTL_STORAGE_QUERY_PROPERTY, SMART_RCV_DRIVE_DATA,
+    StorageDeviceTemperatureProperty, IOCTL_STORAGE_PREDICT_FAILURE, IOCTL_STORAGE_QUERY_PROPERTY,
 };
 
 use crate::disks::Handle;
@@ -66,21 +68,12 @@ impl DriveHealth {
 pub fn read(number: u32, bus: &str) -> DriveHealth {
     let path = format!(r"\\.\PhysicalDrive{number}");
     let mut health = DriveHealth::default();
-    if let Some(h) = Handle::open(&path) {
-        health.temperature_c = query_temperature(&h);
-        // The NVMe health log is a plain property query, so the zero-access handle is enough.
-        if bus == "NVMe" {
-            health.nvme = query_nvme(&h);
-        }
-    }
-    // SMART (and NVMe on stricter drivers) wants a read/write handle, which needs admin; the monitor
-    // has it, unit tests may not.
-    let needs_rw = (bus == "NVMe" && health.nvme.is_none()) || matches!(bus, "SATA" | "ATA" | "RAID");
-    if let Some(h) = needs_rw.then(|| Handle::open_with(&path, GENERIC_READ | GENERIC_WRITE)).flatten() {
-        match bus {
-            "NVMe" => health.nvme = query_nvme(&h),
-            _ => health.sata = query_sata(&h, number),
-        }
+    let Some(h) = Handle::open(&path) else { return health };
+    health.temperature_c = query_temperature(&h);
+    match bus {
+        "NVMe" => health.nvme = query_nvme(&h),
+        "SATA" | "ATA" | "RAID" => health.sata = query_sata(&h),
+        _ => {}
     }
     health
 }
@@ -162,26 +155,16 @@ fn parse_nvme_health(d: &[u8]) -> Option<NvmeHealth> {
     })
 }
 
-fn query_sata(h: &Handle, number: u32) -> Option<SataSmart> {
-    // SENDCMDINPARAMS (packed): cBufferSize u32, IDEREGS { Features, SectorCount, SectorNumber,
-    // CylLow, CylHigh, DriveHead, Command, reserved }, bDriveNumber, ...; 32 bytes + buffer.
-    let mut input = [0u8; 33];
-    input[..4].copy_from_slice(&512u32.to_le_bytes());
-    input[4] = 0xD0; // SMART READ DATA
-    input[5] = 1;
-    input[6] = 1;
-    input[7] = 0x4F;
-    input[8] = 0xC2;
-    input[9] = 0xA0;
-    input[10] = 0xB0; // SMART
-    input[12] = number as u8;
-    // SENDCMDOUTPARAMS: cBufferSize u32, DRIVERSTATUS (12 bytes), then the 512-byte sector.
-    let mut out = [0u8; 16 + 512];
-    let n = h.ioctl(SMART_RCV_DRIVE_DATA, &input, &mut out)?;
-    if n < 16 + 362 {
+fn query_sata(h: &Handle) -> Option<SataSmart> {
+    // STORAGE_PREDICT_FAILURE { PredictFailure u32, VendorSpecific[512] }: for ATA drives the
+    // vendor block is the SMART READ DATA sector, and unlike SMART_RCV_DRIVE_DATA this query
+    // works on a handle without read or write access.
+    let mut out = [0u8; 4 + 512];
+    let n = h.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, &[], &mut out)?;
+    if n < 4 + 362 {
         return None;
     }
-    parse_smart_attributes(&out[16..])
+    parse_smart_attributes(&out[4..])
 }
 
 /// SMART data sector: 30 attribute slots of 12 bytes from offset 2: id, flags u16, current,

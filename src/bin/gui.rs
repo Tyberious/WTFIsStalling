@@ -662,6 +662,8 @@ fn main() {
         InitCommonControlsEx(&icc);
 
         let hinst = GetModuleHandleW(null());
+        // MAKEINTRESOURCE(1): an integer resource ID passed where a name pointer is expected.
+        const APP_ICON_RESOURCE: usize = 1;
         let class = wide("WTFIsStallingMain");
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -669,7 +671,11 @@ fn main() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
-            hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
+            // Resource 1 is the icon build.rs embeds; fall back to the stock one if it is missing.
+            hIcon: match LoadIconW(hinst, APP_ICON_RESOURCE as *const u16) {
+                icon if icon.is_null() => LoadIconW(null_mut(), IDI_APPLICATION),
+                icon => icon,
+            },
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
