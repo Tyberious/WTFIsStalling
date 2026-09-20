@@ -344,6 +344,7 @@ fn show_outcome(hwnd: HWND, ui: &Ui) {
     // Whatever is still queued belongs to the run that just ended.
     unsafe { SendMessageW(hwnd, WM_APP_LINES, 0, 0) };
     set_text(ui.toggle, "Start monitoring");
+    set_text(ui.status, ""); // the "felt a hitch?" hint only applies while monitoring
     unsafe {
         UnregisterHotKey(hwnd, HOTKEY_MARK);
         EnableWindow(ui.toggle as HWND, 1);

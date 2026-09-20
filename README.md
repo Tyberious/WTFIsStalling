@@ -1,14 +1,14 @@
 # WTFIsStalling
 
 [![CI](https://github.com/Tyberious/WTFIsStalling/actions/workflows/ci.yml/badge.svg)](https://github.com/Tyberious/WTFIsStalling/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/Tyberious/WTFIsStalling?sort=semver&label=release)](https://github.com/Tyberious/WTFIsStalling/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/Tyberious/WTFIsStalling/total?label=downloads)](https://github.com/Tyberious/WTFIsStalling/releases)
+[![Latest release](https://img.shields.io/github/v/release/Tyberious/WTFIsStalling?sort=semver&label=release&cacheSeconds=1800)](https://github.com/Tyberious/WTFIsStalling/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Tyberious/WTFIsStalling/total?label=downloads&cacheSeconds=1800)](https://github.com/Tyberious/WTFIsStalling/releases)
 [![License: MIT](https://img.shields.io/github/license/Tyberious/WTFIsStalling)](LICENSE)
 ![Platform: Windows 10 / 11 x64](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20x64-0078D4)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust)
-[![Open issues](https://img.shields.io/github/issues/Tyberious/WTFIsStalling)](https://github.com/Tyberious/WTFIsStalling/issues)
+[![Open issues](https://img.shields.io/github/issues/Tyberious/WTFIsStalling?cacheSeconds=1800)](https://github.com/Tyberious/WTFIsStalling/issues)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
-[![GitHub stars](https://img.shields.io/github/stars/Tyberious/WTFIsStalling?style=flat)](https://github.com/Tyberious/WTFIsStalling/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/Tyberious/WTFIsStalling?style=flat&cacheSeconds=1800)](https://github.com/Tyberious/WTFIsStalling/stargazers)
 
 **Finds the driver, program or hardware behind hitches, micro-stalls and audio crackle on Windows.**
 
