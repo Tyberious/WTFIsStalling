@@ -40,7 +40,7 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 
 | | |
 | --- | --- |
-| ![Cause found (dark theme)](docs/result-dark.png) | ![Suspect found (light theme)](docs/result-light.png) |
+| ![Cause found (dark theme)](docs/screenshot-result-dark.png) | ![Suspect found (light theme)](docs/screenshot-result-light.png) |
 
 *(Screenshots show built-in demo data.)*
 
