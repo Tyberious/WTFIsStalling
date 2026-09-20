@@ -49,6 +49,17 @@ const GUID_THREAD: u32 = 0x3d6f_a8d1;
 pub struct Session {
     handle: CONTROLTRACE_HANDLE,
     pub profile: bool,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// A kernel logger session outlives the process that started it. Whatever goes wrong after the
+/// trace starts (a panic while summarizing included), unwinding must still take the session down.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            self.stop();
+        }
+    }
 }
 
 /// EVENT_TRACE_PROPERTIES followed by room for the session name, 8-byte aligned.
@@ -131,7 +142,7 @@ impl Session {
                 r = try_start(flags);
             }
             match r {
-                Ok(handle) => return Ok(Session { handle, profile: with_profile }),
+                Ok(handle) => return Ok(Session { handle, profile: with_profile, stopped: std::sync::atomic::AtomicBool::new(false) }),
                 Err(rc) => last = rc,
             }
         }
@@ -146,6 +157,7 @@ impl Session {
 
     /// Stops the session (which also makes ProcessTrace return). Returns events lost.
     pub fn stop(&self) -> u32 {
+        self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
         let (mut buf, total) = props_buffer();
         let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         unsafe {
@@ -198,8 +210,13 @@ unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let data: &[u8] =
         if rec.UserData.is_null() { &[] } else { std::slice::from_raw_parts(rec.UserData as *const u8, rec.UserDataLength as usize) };
     let cpu = rec.BufferContext.Anonymous.ProcessorIndex;
-    let mut inner = shared.inner.lock().unwrap();
-    handle_event(shared, &mut inner, hdr.ProviderId.data1, hdr.EventDescriptor.Opcode, hdr.TimeStamp, cpu, data);
+    // This runs on ETW's thread behind a foreign frame: a panic must not unwind out of it (that
+    // aborts the process, which would leave the kernel session running and lose the report).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // A poisoned lock only means some other thread panicked; the event data is still sound.
+        let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        handle_event(shared, &mut inner, hdr.ProviderId.data1, hdr.EventDescriptor.Opcode, hdr.TimeStamp, cpu, data);
+    }));
 }
 
 /// Layouts below are the 64-bit MOF layouts of the classic NT kernel logger events.
@@ -229,7 +246,7 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
         (GUID_PERFINFO, 50 | 66..=69) => {
             let start = rd_u64(d, 0)? as i64;
             let routine = rd_u64(d, 8)?;
-            let dur = ts - start;
+            let dur = ts.wrapping_sub(start);
             if start <= 0 || !(0..max_exec).contains(&dur) {
                 if shared.debug && inner.debug_rejected.len() < 5 {
                     inner.debug_rejected.push((ts, start));
@@ -258,7 +275,7 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
             let start = rd_u64(d, 0)? as i64;
             let tid = rd_u32(d, 32)?;
             let bytes = rd_u32(d, 36).unwrap_or(0);
-            let dur = ts - start;
+            let dur = ts.wrapping_sub(start);
             if !(0..MAX_SANE).contains(&dur) {
                 return None;
             }

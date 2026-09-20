@@ -113,9 +113,9 @@ impl DiskWhy {
 
     /// The cause behind most slow requests, if any were explained.
     pub fn main_cause(&self) -> Option<Cause> {
-        // Fixed order so ties resolve the same way every run; the drive-side causes win ties
-        // because they are the ones worth acting on.
-        [Cause::IdleSlow, Cause::WokeUp, Cause::Busy, Cause::Flush]
+        // Fixed order so ties resolve the same way every run. `max_by_key` keeps the LAST of equal
+        // maxima, so the drive-side causes go last: they are the ones worth acting on.
+        [Cause::Flush, Cause::Busy, Cause::WokeUp, Cause::IdleSlow]
             .into_iter()
             .filter(|c| self.count(*c) > 0)
             .max_by_key(|c| self.count(*c))
@@ -186,6 +186,32 @@ pub fn known_worker(process: &str) -> Option<Worker> {
         ),
         ("memcompression", w("Windows paging memory out", "The PC is short of memory: close memory-hungry programs or add RAM.", true)),
         ("system", w("Windows itself (file cache, paging or a driver)", IDLE_TIP, true)),
+        (
+            "dwm",
+            w(
+                "the desktop compositor that draws every window",
+                "It is driven by the graphics driver: update or clean-reinstall that, and close overlays and screen recorders.",
+                true,
+            ),
+        ),
+        (
+            "audiodg",
+            w(
+                "the Windows audio engine",
+                "Update the audio driver and turn off audio enhancements (Sound settings > device > Enhancements).",
+                true,
+            ),
+        ),
+        (
+            "wmiprvse",
+            w(
+                "a hardware-information service that monitoring tools query",
+                "Something is polling it hard: fully exit RGB, fan-control and hardware-monitoring utilities one at a time.",
+                true,
+            ),
+        ),
+        ("csrss", w("a core Windows process", IDLE_TIP, true)),
+        ("registry", w("a core Windows process", IDLE_TIP, true)),
         ("svchost", w("a Windows service", IDLE_TIP, true)),
         ("onedrive", w("OneDrive syncing", "Pause syncing from the OneDrive tray icon while you play.", false)),
         (
@@ -284,6 +310,16 @@ mod tests {
         w.movers.insert("steam.exe (1234)".into(), 3_000_000_000);
         w.movers.insert("chrome.exe (99)".into(), 1_000_000_000);
         assert_eq!(w.main_cause(), Some(Cause::Busy));
+        // A tie goes to the drive-side cause: it is the one worth acting on.
+        let mut tie = DiskWhy::default();
+        tie.causes.insert(Cause::Busy, 3);
+        tie.causes.insert(Cause::IdleSlow, 3);
+        assert_eq!(tie.main_cause(), Some(Cause::IdleSlow));
+        tie.causes.insert(Cause::Flush, 3);
+        tie.causes.insert(Cause::WokeUp, 3);
+        assert_eq!(tie.main_cause(), Some(Cause::IdleSlow));
+        tie.causes.remove(&Cause::IdleSlow);
+        assert_eq!(tie.main_cause(), Some(Cause::WokeUp));
         let top = w.top_movers(1);
         assert_eq!(top[0].0, "steam.exe (1234)");
         assert!((top[0].2 - 0.75).abs() < 1e-9);

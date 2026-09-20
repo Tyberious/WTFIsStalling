@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
-use windows_sys::Win32::Media::timeBeginPeriod;
+use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -258,6 +258,24 @@ fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
 }
 
 /// Returns the summary and how many captured lines make up the system-info header.
+/// 1 ms system timer resolution for as long as a run lasts, and not a moment longer: the request is
+/// system-wide, and "changes nothing on the system" has to stay true once monitoring stops. Released
+/// on every way out of the run, early returns and panics included.
+struct TimerResolution;
+
+impl TimerResolution {
+    fn raise() -> TimerResolution {
+        unsafe { timeBeginPeriod(1) };
+        TimerResolution
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        unsafe { timeEndPeriod(1) };
+    }
+}
+
 fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String> {
     let ncpu = unsafe { GetActiveProcessorCount(0) };
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
@@ -275,7 +293,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     if !session.profile && cfg.profile {
         say!("warning: CPU sampling could not be enabled; process attribution and firmware/SMI detection are off.");
     }
-    unsafe { timeBeginPeriod(1) };
+    let _timer_resolution = TimerResolution::raise();
 
     let shared = Arc::new(state::Shared {
         inner: Mutex::new(state::Inner::default()),

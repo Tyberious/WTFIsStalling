@@ -696,6 +696,43 @@ fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> Str
     GpuReport { findings, lines, vram_clear }
 }
 
+/// Title for a process blamed for CPU time. Parts of Windows are named as such: nobody can close
+/// "System", and calling it a program sends people looking for something that does not exist.
+fn process_title(label: &str) -> String {
+    let name = process_name_only(label);
+    if name.starts_with("System") {
+        return "Windows kernel (the System process)  -  a driver, or Windows itself".to_string();
+    }
+    match known_worker(&name) {
+        Some(w) if w.windows => format!("{name}  -  part of Windows: {}", w.what),
+        Some(w) => format!("{name}  -  {}", w.what),
+        None => format!("{name}  -  program"),
+    }
+}
+
+/// What to try for a process blamed for CPU time; never "close it" for something that is Windows.
+fn process_advice(label: &str) -> String {
+    let name = process_name_only(label);
+    if name.starts_with("System") {
+        return "This is not a program you can close: it is where Windows runs the work of drivers and of the kernel itself. The \
+                driver behind it is usually named under 'Kernel-mode time by module' for that stall in the event log below: update \
+                or roll back that driver. If only ntoskrnl.exe appears there, suspect storage, memory pressure or power management: \
+                check the disk and drive-health findings in this report, update the chipset driver and the BIOS."
+            .to_string();
+    }
+    match known_worker(&name) {
+        Some(w) if w.windows => format!(
+            "{name} is part of Windows ({}), not something you can close. {} If it keeps showing up, the driver it leans on is \
+             listed under 'Kernel-mode time by module' for that stall in the event log.",
+            w.what, w.tip
+        ),
+        Some(w) => format!("{} Then monitor again; if the stalls are gone, that was it.", w.tip),
+        None => "Close this program and monitor again. If the stalls disappear, update or replace it, or look at the driver it \
+                 leans on (listed under 'Kernel-mode time by module' in the event log)."
+            .to_string(),
+    }
+}
+
 const MEMORY_ERROR_ADVICE: &str = "The PC corrected these errors, but each one pauses everything briefly and they are a warning sign: \
     uncorrected ones crash programs and corrupt files. The usual cause is a memory overclock profile that is not quite stable: in the \
     BIOS turn XMP / EXPO / DOCP off (or lower the memory speed one step) and monitor again. Update the BIOS. If errors continue at \
@@ -982,16 +1019,7 @@ impl Analyzer {
                     *total,
                 );
             } else if let Some(p) = culprit.strip_prefix("process ") {
-                found.add(
-                    culprit,
-                    sev,
-                    format!("{p}  -  program"),
-                    format!("Was occupying the CPU during {stalls}."),
-                    "Close this program and monitor again. If the stalls disappear, update or replace it, or look at the driver it \
-                     leans on (listed under 'Kernel-mode time by module' in the event log)."
-                        .into(),
-                    *total,
-                );
+                found.add(culprit, sev, process_title(p), format!("Was occupying the CPU during {stalls}."), process_advice(p), *total);
             } else if culprit == "unexplained" {
                 let sev = if *n >= 3 { Severity::Medium } else { Severity::Low };
                 found.add(
@@ -1049,12 +1077,38 @@ impl Analyzer {
                 let advice = knowledge(m).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
                 found.add(culprit, sev, format!("{m}  -  {what}"), evidence, advice.into(), *worst * *n as i64);
             } else if let Some(p) = culprit.strip_prefix("process ") {
+                found.add(culprit, sev, process_title(p), evidence, process_advice(p), *worst * *n as i64);
+            } else if culprit.starts_with("CPU went dark") {
+                // Same key as the unmarked stalls of this kind, so both land in one finding.
                 found.add(
                     culprit,
                     sev,
-                    format!("{p}  -  program"),
-                    evidence,
-                    "Close this program and monitor again; if the hitches disappear, update or replace it.".into(),
+                    "Firmware / BIOS (SMI), a hypervisor, or a driver running with interrupts disabled".into(),
+                    format!(
+                        "At {n} of the {marks_total} moment{} you flagged, a CPU core vanished from Windows' view (for up to {}): no \
+                         DPC/ISR ran and profiler interrupts went missing.",
+                        if marks_total == 1 { "" } else { "s" },
+                        fmt_dur(*worst)
+                    ),
+                    DARK_ADVICE.into(),
+                    *worst * *n as i64,
+                );
+            } else {
+                // A core was held up, but the trace cannot say by what. Still owed to the user:
+                // every flagged moment has to show up somewhere in the result.
+                found.add(
+                    "unexplained",
+                    if *n >= 3 { Severity::Medium } else { Severity::Low },
+                    "Stalls without an identifiable cause".into(),
+                    format!(
+                        "At {n} of the {marks_total} moment{} you flagged, a CPU core was held up (for up to {}), but neither DPC/ISR \
+                         activity nor CPU samples pointed at anything.",
+                        if marks_total == 1 { "" } else { "s" },
+                        fmt_dur(*worst)
+                    ),
+                    "Monitor for longer while reproducing the problem so a pattern can emerge, and check the flagged entries in the \
+                     event log for a module or program that keeps appearing."
+                        .into(),
                     *worst * *n as i64,
                 );
             }
@@ -1866,6 +1920,72 @@ mod tests {
 
         // No flagged moments: load alone is never a finding. A busy GPU is what a game should look like.
         assert!(gpu_findings(&gpu_log(12 * GB, &busy), &[], &mut |_| String::new()).findings.is_empty());
+    }
+
+    #[test]
+    fn every_flagged_moment_shows_up_in_the_result_whatever_the_verdict() {
+        use crate::analyze::IncidentSummary;
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        let flagged = |culprit: &str| IncidentSummary {
+            kind: StallKind::Kernel,
+            start: qpc(),
+            dur: ms_to_ticks(6.0),
+            culprit: culprit.to_string(),
+            marked: true,
+        };
+        az.incidents.push(flagged("CPU went dark (firmware SMI / hypervisor / interrupts off)"));
+        az.incidents.push(flagged("unexplained"));
+        az.incidents.push(flagged("driver nvlddmkm.sys"));
+        az.marks_total = 3;
+        let stats =
+            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let summary = az.summarize(RunData {
+            elapsed_s: 60.0,
+            events_lost: 0,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+        });
+        let flagged_findings: Vec<&Finding> =
+            summary.findings.iter().filter(|f| f.evidence.iter().any(|e| e.contains("of the 3 moments you flagged"))).collect();
+        let titles: Vec<&str> = flagged_findings.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(flagged_findings.len(), 3, "one finding per verdict, none dropped: {titles:?}");
+        assert!(titles.iter().any(|t| t.starts_with("Firmware / BIOS (SMI)")), "{titles:?}");
+        assert!(titles.contains(&"Stalls without an identifiable cause"), "{titles:?}");
+        assert!(titles.iter().any(|t| t.starts_with("nvlddmkm.sys")), "{titles:?}");
+    }
+
+    #[test]
+    fn windows_processes_are_never_called_programs_you_can_close() {
+        for label in [
+            "System (kernel threads)",
+            "System (4)",
+            "svchost.exe (1234)",
+            "MsMpEng.exe (99)",
+            "dwm.exe (1500)",
+            "backgroundTaskHost.exe (7)",
+        ] {
+            let (title, advice) = (process_title(label), process_advice(label));
+            assert!(!title.ends_with("-  program"), "{label}: {title}");
+            assert!(!advice.starts_with("Close this program") && !advice.contains("pause it"), "{label}: {advice}");
+            assert!(
+                advice.contains("not") && (advice.contains("you can close") || advice.contains("something you can close")),
+                "{label}: {advice}"
+            );
+        }
+        assert!(process_title("System (kernel threads)").starts_with("Windows kernel"));
+        assert!(process_advice("System (kernel threads)").contains("Kernel-mode time by module"));
+        // A real program still gets the plain advice, and a known app its own tip.
+        assert_eq!(process_title("game.exe (4242)"), "game.exe  -  program");
+        assert!(process_advice("game.exe (4242)").starts_with("Close this program"));
+        assert!(process_advice("steam.exe (77)").contains("Pause the download"));
     }
 
     #[test]
