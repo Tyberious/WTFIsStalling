@@ -67,11 +67,12 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 | **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
+| **The graphics card running out of video memory, or simply being the limit** | Once a second, per GPU: load, video memory in use, and the program responsible. Full video memory is reported with the program holding it and how much was pushed out to system RAM. At the moments you flag, the report says whether the GPU was working flat out (lower GPU settings) or had spare capacity (the hitch is on the CPU side or in the game) |
 | **Failing or unstable hardware** | WHEA errors from the System event log, last 7 days: corrected memory errors (unstable XMP/EXPO, bad DIMM), corrected processor errors (undervolt, PBO, overclock), PCI Express link errors with the device named (riser cables, GPU, NVMe), and fatal hardware errors that crashed the PC. A stall within 2 seconds of such an error is tied to it |
 | **Crashes and sudden power loss** | Unexpected shutdowns from the System event log, last 7 days: blue screens with their stop code, and silent restarts or power loss (power supply, heat, unstable overclock) |
 
-What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
-overflow, frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was
+What it cannot see yet: what happens inside an application or inside a frame (shader compilation,
+frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was
 interrupted for even a millisecond around it, the report says so, and that's where to look next.
 
 ## Example report (illustrative)

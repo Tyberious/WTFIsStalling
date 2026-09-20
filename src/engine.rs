@@ -19,9 +19,9 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::summary::Summary;
+use crate::summary::{RunData, Summary};
 use crate::util::{self, from_wide, ms_to_ticks, wide};
-use crate::{analyze, cpuclock, etw, modules, probe, say, state};
+use crate::{analyze, cpuclock, etw, gpu, modules, probe, say, state};
 
 pub use crate::analyze::mark_now;
 
@@ -292,6 +292,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     let probe_stats = Arc::new(probe::ProbeStats::default());
     probe::spawn_scheduler_probe(cfg.sched_stall_ms, tx.clone(), probe_stop.clone(), probe_stats.clone());
     let cpu_clock = cpuclock::spawn(probe_stop.clone());
+    let gpu_log = gpu::spawn(probe_stop.clone());
     let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, tx, probe_stats.clone()) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -361,7 +362,16 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     }
     analyzer.tick(true);
     let clock_samples = cpu_clock.lock().unwrap().clone();
-    let summary = analyzer.summarize(started.elapsed().as_secs_f64(), lost, &probe_stats, shared.exec_warn, shared.io_warn, &clock_samples);
+    let gpu_log = gpu_log.lock().unwrap().clone();
+    let summary = analyzer.summarize(RunData {
+        elapsed_s: started.elapsed().as_secs_f64(),
+        events_lost: lost,
+        stats: &probe_stats,
+        exec_warn: shared.exec_warn,
+        io_warn: shared.io_warn,
+        clock: &clock_samples,
+        gpu: &gpu_log,
+    });
     // Streamed order ends with the result, because on a console the bottom is what you see.
     say!("");
     for line in summary.detail_lines().iter().chain(summary.result_lines().iter()) {

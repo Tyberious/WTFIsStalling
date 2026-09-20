@@ -60,6 +60,8 @@ pub struct Analyzer {
     minor: VecDeque<Stall>,
     marks_pending: Vec<i64>,
     pub(crate) marks_total: u32,
+    /// When each "I felt it" was pressed (QPC), for anything that wants to look at those moments.
+    pub(crate) mark_times: Vec<i64>,
     /// Marks where nothing at all disturbed the CPUs.
     pub(crate) marks_clean: u32,
     /// Start times of over-threshold DPC/ISR runs per driver, for periodicity detection.
@@ -107,6 +109,7 @@ impl Analyzer {
             minor: VecDeque::new(),
             marks_pending: Vec::new(),
             marks_total: 0,
+            mark_times: Vec::new(),
             marks_clean: 0,
             long_exec_times: HashMap::new(),
             notable_window_start: 0,
@@ -145,6 +148,7 @@ impl Analyzer {
             minor: VecDeque::new(),
             marks_pending: Vec::new(),
             marks_total: 0,
+            mark_times: Vec::new(),
             marks_clean: 0,
             long_exec_times: HashMap::new(),
             notable_window_start: 0,
@@ -283,6 +287,7 @@ impl Analyzer {
     /// The user felt something at `t`. Look at the seconds before it with no threshold at all.
     fn analyze_mark(&mut self, t: i64, caught_up: bool) {
         self.marks_total += 1;
+        self.mark_times.push(t);
         let (from, to) = (t - ms_to_ticks(MARK_BEFORE_MS), t + ms_to_ticks(MARK_AFTER_MS));
         say!("");
         say!(
