@@ -308,7 +308,10 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 let summary = Summary::demo(health);
-                let report = summary.result_lines().join("\r\n") + "\r\n";
+                // Same composer as a real run, so what is tested here is what users see.
+                let header = [format!("WTFIsStalling {} - demo data", env!("CARGO_PKG_VERSION"))];
+                let events = ["[21:14:07.412] STALL #1  kernel-level (DPC/ISR/firmware)  11.80 ms  on CPU 4".to_string()];
+                let report = engine::compose_report(&header, &summary, &events);
                 Ok(engine::RunOutput { log_path: None, report, summary })
             }
             None => engine::run(&Config::default(), &STOP),

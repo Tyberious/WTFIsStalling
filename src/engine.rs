@@ -192,6 +192,48 @@ pub fn run(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     result
 }
 
+/// Longest line the report may contain; longer event-log lines are wrapped so the GUI needs
+/// no horizontal scrolling at its default size.
+const REPORT_WIDTH: usize = 118;
+
+/// The answer-first report: system info, RESULT, DETAILS, then the chronological event log.
+/// Lines end in CRLF: the GUI's edit control only breaks on that, and so does classic Notepad.
+pub fn compose_report(header: &[String], summary: &Summary, events: &[String]) -> String {
+    let mut report: Vec<String> = header.to_vec();
+    report.extend(summary.result_lines());
+    report.extend(summary.detail_lines());
+    report.push(String::new());
+    report.push("EVENT LOG (chronological)".into());
+    let events: Vec<&String> = events.iter().skip_while(|l| l.trim().is_empty()).collect();
+    if events.is_empty() {
+        report.push("  (nothing noteworthy happened)".into());
+    }
+    for line in events {
+        wrap_line(line, &mut report);
+    }
+    report.join("\r\n") + "\r\n"
+}
+
+/// Wraps at spaces, continuing under the text with a hanging indent.
+fn wrap_line(line: &str, out: &mut Vec<String>) {
+    if line.chars().count() <= REPORT_WIDTH {
+        return out.push(line.to_string());
+    }
+    let indent = line.len() - line.trim_start().len();
+    let hang = " ".repeat(indent + 8);
+    let mut current = " ".repeat(indent);
+    for word in line.split_whitespace() {
+        let fresh = current.trim().is_empty();
+        if !fresh && current.chars().count() + 1 + word.chars().count() > REPORT_WIDTH {
+            out.push(std::mem::replace(&mut current, hang.clone()));
+        } else if !fresh {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    out.push(current);
+}
+
 fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     util::clock();
     let log_path = open_log(&cfg.log);
@@ -208,20 +250,7 @@ fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     // answer is known, rewrite it answer-first.
     let streamed = lines.len() - summary.detail_lines().len() - summary.result_lines().len();
     let (header, events) = lines[..streamed].split_at(header_len.min(streamed));
-    let mut report: Vec<String> = header.to_vec();
-    report.extend(summary.result_lines());
-    report.extend(summary.detail_lines());
-    report.push(String::new());
-    report.push("EVENT LOG (chronological)".into());
-    if events.iter().all(|l| l.trim().is_empty()) {
-        report.push("  (nothing noteworthy happened)".into());
-    }
-    report.extend(events.iter().cloned());
-    let report = report.join(
-        "
-",
-    ) + "
-";
+    let report = compose_report(header, &summary, events);
     if let Some(path) = &log_path {
         let _ = std::fs::write(path, &report);
     }
@@ -339,4 +368,26 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
         say!("{line}");
     }
     Ok((summary, header_len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::summary::Health;
+
+    #[test]
+    fn report_is_crlf_answer_first_and_needs_no_horizontal_scrolling() {
+        let header = vec!["WTFIsStalling test".to_string()];
+        let long = format!("    VERDICT: {}", "word ".repeat(60));
+        let events = vec![String::new(), "[12:00:00.000] STALL #1".to_string(), long];
+        let report = compose_report(&header, &Summary::demo(Health::Problem), &events);
+
+        assert!(!report.replace("\r\n", "").contains('\n'), "every line break must be CRLF or the GUI shows one endless line");
+        let lines: Vec<&str> = report.split("\r\n").collect();
+        assert!(lines.iter().all(|l| l.chars().count() <= REPORT_WIDTH), "long lines must be wrapped");
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at("WTFIsStalling test") < at("RESULT") && at("RESULT") < at("DETAILS") && at("DETAILS") < at("EVENT LOG"));
+        assert!(at("EVENT LOG") < at("STALL #1"));
+        assert!(lines[at("VERDICT:") + 1].starts_with("            word"), "continuation lines hang under the text");
+    }
 }
