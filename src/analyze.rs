@@ -116,6 +116,44 @@ impl Analyzer {
         }
     }
 
+    /// Builds an `Analyzer` from synthetic data only: no live disk health, process
+    /// snapshot or module list. For tests of `verdict_kernel`/`verdict_sched`, which only
+    /// need `self.modules`/`self.procs` and hand-built `Evidence` values.
+    #[cfg(test)]
+    pub fn for_test(modules: ModuleMap, procs: ProcNames, profile: bool) -> Analyzer {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner::default()),
+            exec_warn: ms_to_ticks(1.0),
+            fault_warn: ms_to_ticks(50.0),
+            io_warn: ms_to_ticks(200.0),
+            keep: ms_to_ticks(20_000.0),
+            debug: false,
+        });
+        Analyzer {
+            shared,
+            rx,
+            pending: Vec::new(),
+            modules,
+            procs,
+            disks: DiskMap::new(),
+            disk_why: HashMap::new(),
+            health_at_start: HashMap::new(),
+            started: qpc(),
+            profile,
+            incidents: Vec::new(),
+            minor: VecDeque::new(),
+            marks_pending: Vec::new(),
+            marks_total: 0,
+            marks_clean: 0,
+            long_exec_times: HashMap::new(),
+            notable_window_start: 0,
+            notable_in_window: 0,
+            notable_suppressed: 0,
+            notable_total: 0,
+        }
+    }
+
     /// Called ~10x per second. `force` analyzes everything pending (shutdown).
     pub fn tick(&mut self, force: bool) {
         self.procs.refresh_if_older_than(2);
@@ -633,5 +671,201 @@ mod tests {
         let mut spans = vec![(0, 100), (10, 20), (50, 60), (90, 130), (200, 250)];
         assert_eq!(union_len(&mut spans), 130 + 50);
         assert_eq!(union_len(&mut []), 0);
+    }
+
+    // --- verdict_kernel / verdict_sched, on synthetic evidence -----------------------------
+
+    fn ms(v: f64) -> i64 {
+        ms_to_ticks(v)
+    }
+
+    fn stall(cpu: u16, start_ms: f64, dur_ms: f64) -> Stall {
+        Stall { kind: StallKind::Kernel, cpu: Some(cpu), start: ms(start_ms), end: ms(start_ms + dur_ms), minor: false }
+    }
+
+    fn exec_rec(cpu: u16, kind: u8, start_ms: f64, dur_ms: f64, routine: u64) -> ExecRec {
+        ExecRec { cpu, kind, start: ms(start_ms), end: ms(start_ms + dur_ms), routine }
+    }
+
+    fn dpc(cpu: u16, start_ms: f64, dur_ms: f64, routine: u64) -> ExecRec {
+        exec_rec(cpu, KIND_DPC, start_ms, dur_ms, routine)
+    }
+
+    fn isr(cpu: u16, start_ms: f64, dur_ms: f64, routine: u64) -> ExecRec {
+        exec_rec(cpu, KIND_ISR, start_ms, dur_ms, routine)
+    }
+
+    /// `pid == 0` is Idle and gets `tid == 0` to match; any other pid gets a nonzero tid so
+    /// it counts toward kernel-mode module attribution when `ip` is in kernel space.
+    fn sample(cpu: u16, t_ms: f64, ip: u64, pid: u32) -> (SampleRec, u32) {
+        let tid = if pid == 0 { 0 } else { pid.max(1) };
+        (SampleRec { ts: ms(t_ms), cpu, tid, ip }, pid)
+    }
+
+    fn evidence(execs: Vec<ExecRec>, samples: Vec<(SampleRec, u32)>, baseline: HashMap<u16, u32>) -> Evidence {
+        Evidence { execs, faults: Vec::new(), ios: Vec::new(), samples, baseline, etw_caught_up: true }
+    }
+
+    const MOD_A: u64 = KERNEL_SPACE + 0x1_0000;
+    const MOD_B: u64 = KERNEL_SPACE + 0x5_0000;
+    const USER_IP: u64 = 0x0000_7ff6_0000_0000;
+
+    #[test]
+    fn dpc_coverage_over_threshold_blames_the_driver_on_the_stalled_cpu() {
+        let modules = ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
+        let s = stall(0, 0.0, 100.0);
+        let ev = evidence(vec![dpc(0, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "driver nvlddmkm.sys");
+    }
+
+    #[test]
+    fn dpc_on_a_different_cpu_is_not_blamed() {
+        let modules = ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
+        let s = stall(0, 0.0, 100.0);
+        // Same DPC, same size, but it ran on CPU 1 while the probe stalled on CPU 0.
+        let ev = evidence(vec![dpc(1, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn dpc_coverage_just_under_threshold_is_not_blamed() {
+        let modules = ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
+        let s = stall(0, 0.0, 100.0);
+        // 34% covered: just below the 35% rule-1 threshold.
+        let ev = evidence(vec![dpc(0, 0.0, 34.0, MOD_A + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn overlapping_dpc_and_isr_are_not_double_counted_toward_coverage() {
+        let modules = ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000), ("rtwlane.sys", MOD_B, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
+        let s = stall(0, 0.0, 100.0);
+        // A DPC and an ISR from two different drivers, both covering the exact same 0-20ms
+        // window. Naive summing would give 20+20=40ms => 40% of the 100ms stall, clearing the
+        // 35% rule-1 threshold; the real (unioned) coverage is only 20ms => 20%, which doesn't.
+        let ev = evidence(vec![dpc(0, 0.0, 20.0, MOD_A + 0x10), isr(0, 0.0, 20.0, MOD_B + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn cpu_going_dark_is_reported_only_when_profiling() {
+        let mut baseline = HashMap::new();
+        baseline.insert(0u16, 500u32); // 500 samples in the 500ms baseline window: ~1/ms
+        let s = stall(0, 0.0, 100.0);
+        let ev = evidence(vec![], vec![], baseline);
+
+        let mut profiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        let v = profiled.verdict_kernel(&[s], &ev);
+        assert!(v.starts_with("CPU went dark"), "expected 'CPU went dark...', got {v:?}");
+
+        // Same evidence, but sampling wasn't enabled: it must not claim the CPU went dark.
+        let mut unprofiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        assert_eq!(unprofiled.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn very_short_stalls_do_not_trigger_went_dark() {
+        let mut baseline = HashMap::new();
+        baseline.insert(0u16, 500u32); // ~1 sample/ms
+                                       // 2ms stall => ~2 expected samples, under the "expected >= 3" floor.
+        let s = stall(0, 0.0, 2.0);
+        let ev = evidence(vec![], vec![], baseline);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn kernel_module_holding_most_samples_is_blamed() {
+        let modules = ModuleMap::for_test(&[("rtwlane.sys", MOD_B, 0x1000)]);
+        let procs = ProcNames::for_test(&[(777, "driverhost.exe"), (300, "explorer.exe")]);
+        let mut az = Analyzer::for_test(modules, procs, false);
+        let s = stall(0, 0.0, 100.0);
+        let samples = vec![
+            sample(0, 10.0, MOD_B + 0x10, 777),
+            sample(0, 20.0, MOD_B + 0x10, 777),
+            sample(0, 30.0, MOD_B + 0x10, 777),
+            sample(0, 40.0, USER_IP, 300),
+            sample(0, 50.0, USER_IP, 300),
+        ];
+        let ev = evidence(vec![], samples, HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "driver rtwlane.sys");
+    }
+
+    #[test]
+    fn user_process_holding_most_samples_is_blamed() {
+        let procs = ProcNames::for_test(&[(200, "game.exe"), (300, "other.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, false);
+        let s = stall(0, 0.0, 100.0);
+        let samples = vec![
+            sample(0, 10.0, USER_IP, 200),
+            sample(0, 20.0, USER_IP, 200),
+            sample(0, 30.0, USER_IP, 200),
+            sample(0, 40.0, USER_IP, 300),
+            sample(0, 50.0, USER_IP, 300),
+        ];
+        let ev = evidence(vec![], samples, HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "process game.exe (200)");
+    }
+
+    #[test]
+    fn nothing_conclusive_is_unexplained() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        let s = stall(0, 0.0, 100.0);
+        let ev = evidence(vec![], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    #[test]
+    fn sample_breakdown_filters_out_the_tools_own_process() {
+        // sample_breakdown() excludes whatever process name starts with our own exe's file
+        // name; under `cargo test` that's the test binary itself, so we can mirror the same
+        // lookup here instead of touching a live process list.
+        let own = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().to_lowercase();
+        let procs = ProcNames::for_test(&[(999, &own), (111, "notme.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, false);
+        let samples = [sample(0, 1.0, USER_IP, 999), sample(0, 2.0, USER_IP, 111)];
+        let refs: Vec<&(SampleRec, u32)> = samples.iter().collect();
+        let (procs_shares, _mods) = az.sample_breakdown(&refs);
+        assert!(!procs_shares.iter().any(|(name, _)| name.to_lowercase().starts_with(&own)), "{procs_shares:?}");
+        assert!(procs_shares.iter().any(|(name, _)| name == "notme.exe (111)"), "{procs_shares:?}");
+    }
+
+    #[test]
+    fn sched_without_profiling_is_unattributed() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(500, "app.exe")]), false);
+        let ev = evidence(vec![], vec![sample(0, 1.0, USER_IP, 500)], HashMap::new());
+        assert_eq!(az.verdict_sched(&ev), "CPU starvation (unattributed)");
+    }
+
+    #[test]
+    fn sched_with_no_samples_is_unattributed() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        let ev = evidence(vec![], vec![], HashMap::new());
+        assert_eq!(az.verdict_sched(&ev), "CPU starvation (unattributed)");
+    }
+
+    #[test]
+    fn sched_blames_top_consumer_when_idle_is_low() {
+        let procs = ProcNames::for_test(&[(500, "app.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, true);
+        let mut samples: Vec<(SampleRec, u32)> = (0..8).map(|i| sample(0, i as f64, USER_IP, 500)).collect();
+        samples.extend((0..2).map(|i| sample(0, i as f64, USER_IP, 0))); // Idle: 2/10 = 20% < 25%
+        let ev = evidence(vec![], samples, HashMap::new());
+        assert_eq!(az.verdict_sched(&ev), "process app.exe (500)");
+    }
+
+    #[test]
+    fn sched_reports_idle_cpus_when_idle_share_is_high() {
+        let procs = ProcNames::for_test(&[(500, "app.exe"), (600, "other.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, true);
+        let mut samples: Vec<(SampleRec, u32)> = (0..3).map(|i| sample(0, i as f64, USER_IP, 0)).collect(); // Idle: 30%
+        samples.extend((0..4).map(|i| sample(0, i as f64, USER_IP, 500)));
+        samples.extend((0..3).map(|i| sample(0, i as f64, USER_IP, 600)));
+        let ev = evidence(vec![], samples, HashMap::new());
+        assert_eq!(az.verdict_sched(&ev), "scheduling delay with idle CPUs");
     }
 }

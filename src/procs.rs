@@ -32,6 +32,13 @@ impl ProcNames {
         p
     }
 
+    /// Synthetic pid -> name table for tests: no live process snapshot, ever. `label()`
+    /// only refreshes for a pid missing from the map, so tests must stick to pids listed here.
+    #[cfg(test)]
+    pub fn for_test(names: &[(u32, &str)]) -> ProcNames {
+        ProcNames { names: names.iter().map(|(pid, name)| (*pid, name.to_string())).collect(), last_refresh: Instant::now() }
+    }
+
     pub fn refresh(&mut self) {
         self.last_refresh = Instant::now();
         unsafe {

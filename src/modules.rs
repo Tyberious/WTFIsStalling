@@ -41,6 +41,19 @@ impl ModuleMap {
         m
     }
 
+    /// Synthetic module list for tests: no live system lookups, ever. `modules` is
+    /// (name, base address, size); pick names that resolve harmlessly, e.g. via the
+    /// knowledge base (`describe`/`describe_short` return without touching disk) or
+    /// names that plainly aren't real files (`describe` then falls back to "unidentified driver").
+    #[cfg(test)]
+    pub fn for_test(modules: &[(&str, u64, u64)]) -> ModuleMap {
+        let mods = modules
+            .iter()
+            .map(|(name, base, size)| KModule { base: *base, size: *size, name: name.to_string(), path: name.to_string() })
+            .collect();
+        ModuleMap { mods, last_refresh: Instant::now(), vendor_cache: HashMap::new() }
+    }
+
     pub fn len(&self) -> usize {
         self.mods.len()
     }
