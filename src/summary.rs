@@ -9,6 +9,7 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 use crate::analyze::Analyzer;
 use crate::cpuclock::ClockSample;
+use crate::disks::DiskInfo;
 use crate::modules::knowledge;
 use crate::period;
 use crate::probe::{ProbeStats, StallKind};
@@ -143,9 +144,9 @@ impl Summary {
                 ),
                 finding(
                     Severity::Medium,
-                    "Disk 1  -  responding slowly",
-                    "3 requests took longer than 200 ms (worst 840 ms).",
-                    "Check its health (SMART), make sure it isn't nearly full, update SSD firmware.",
+                    "Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly",
+                    "3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware 80.00A80. D: 93% full.",
+                    "Check its health (SMART), free up space on D:, and reseat or replace its cable.",
                 ),
             ],
             Health::Warning => vec![finding(
@@ -238,6 +239,30 @@ struct DriverAgg {
     isr_max: i64,
     total: i64,
     over: u64,
+}
+
+/// What to try for a slow disk, based on what kind of disk it turned out to be.
+fn disk_advice(disk: &DiskInfo) -> String {
+    let mut advice = String::from("Anything that touches this disk freezes while it answers. ");
+    let full = disk.nearly_full();
+    if !full.is_empty() {
+        let letters = full.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" and ");
+        advice.push_str(&format!("{letters} is nearly full, which by itself makes drives slow: free up space first. "));
+    }
+    advice.push_str("Check its health (SMART) with the maker's tool or CrystalDiskInfo");
+    advice.push_str(match (disk.bus, disk.spinning) {
+        ("USB", _) => ", and try another USB port or cable, plugged straight into the PC rather than a hub.",
+        (_, Some(true)) => {
+            ". A hard drive that takes this long is often failing or waking from sleep: back up what matters, reseat or replace its              cable, and move games and programs to an SSD."
+        }
+        ("NVMe", _) => ", update its firmware, and make sure it isn't overheating (a heatsink helps).",
+        ("SATA" | "ATA", _) => ", update its firmware, and reseat or replace its SATA cable.",
+        _ => ", update SSD firmware, and reseat or replace the cable on SATA drives.",
+    });
+    if disk.model.is_empty() && disk.volumes.is_empty() {
+        advice.push_str(&format!(" Disk {} is the number shown in Windows Disk Management.", disk.number));
+    }
+    advice
 }
 
 impl Analyzer {
@@ -475,22 +500,25 @@ impl Analyzer {
                 continue;
             }
             let sev = if s.max >= ms_to_ticks(1000.0) || s.slow >= 10 { Severity::High } else { Severity::Medium };
+            let disk = self.disks.get(*n).clone();
+            let mut evidence = format!(
+                "{} request{} took longer than {} (worst {}).",
+                s.slow,
+                if s.slow == 1 { "" } else { "s" },
+                fmt_dur(io_warn),
+                fmt_dur(s.max)
+            );
+            for extra in [disk.hardware(), disk.fullness()] {
+                if !extra.is_empty() {
+                    evidence.push_str(&format!(" {}{}.", extra[..1].to_uppercase(), &extra[1..]));
+                }
+            }
             found.add(
                 &format!("disk {n}"),
                 sev,
-                format!("Disk {n}  -  responding slowly"),
-                format!(
-                    "{} request{} took longer than {} (worst {}).",
-                    s.slow,
-                    if s.slow == 1 { "" } else { "s" },
-                    fmt_dur(io_warn),
-                    fmt_dur(s.max)
-                ),
-                format!(
-                    "Anything that touches this disk freezes while it answers. Check its health (SMART) with the maker's tool or \
-                     CrystalDiskInfo, make sure it isn't nearly full, update SSD firmware, and reseat or replace the cable on SATA \
-                     drives. Disk {n} is the number shown in Windows Disk Management."
-                ),
+                format!("{}  -  responding slowly", disk.title()),
+                evidence,
+                disk_advice(&disk),
                 s.max * s.slow as i64,
             );
         }
@@ -666,6 +694,14 @@ impl Analyzer {
             d!("  {:<8} {:>10} {:>10} {:>10} {:>7}", "disk", "requests", "average", "worst", "slow");
             for (n, s) in &disks {
                 d!("  {:<8} {:>10} {:>10} {:>10} {:>7}", n, s.count, fmt_dur(s.total / s.count.max(1) as i64), fmt_dur(s.max), s.slow);
+            }
+            for (n, _) in &disks {
+                let disk = self.disks.get(*n);
+                let about: Vec<String> =
+                    [disk.letters(), disk.model.clone(), disk.hardware(), disk.fullness()].into_iter().filter(|s| !s.is_empty()).collect();
+                if !about.is_empty() {
+                    d!("  disk {n} = {}", about.join("  |  "));
+                }
             }
         }
         if !clock.is_empty() {

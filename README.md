@@ -56,7 +56,7 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide |
 | Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
-| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them |
+| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is |
 
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
 overflow, frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was
@@ -81,8 +81,9 @@ RESULT
        Update the Wi-Fi driver from the chip vendor (Intel/Realtek/MediaTek/Qualcomm), disable adapter
        power saving and background scanning/roaming aggressiveness; test with Wi-Fi off and Ethernet in.
 
-  2. [MEDIUM] Disk 1  -  responding slowly
-       - 3 requests took longer than 200 ms (worst 840 ms).
+  2. [MEDIUM] Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly
+       - 3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware
+         80.00A80. D: 93% full.
      What to try: ...
 ====================================================================================================
 DETAILS

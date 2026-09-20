@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
+use crate::disks::DiskMap;
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
@@ -45,6 +46,7 @@ pub struct Analyzer {
     pending: Vec<Stall>,
     pub modules: ModuleMap,
     pub procs: ProcNames,
+    pub disks: DiskMap,
     profile: bool,
     pub(crate) incidents: Vec<IncidentSummary>,
     /// Recent wake-up delays under the stall threshold, newest last.
@@ -87,6 +89,7 @@ impl Analyzer {
             pending: Vec::new(),
             modules,
             procs: ProcNames::new(),
+            disks: DiskMap::new(),
             profile,
             incidents: Vec::new(),
             minor: VecDeque::new(),
@@ -475,10 +478,10 @@ impl Analyzer {
         let slow_io: Vec<_> = ev.ios.iter().filter(|i| i.dur >= ms_to_ticks(20.0)).collect();
         if let Some(worst) = slow_io.iter().max_by_key(|i| i.dur) {
             say!(
-                "    Slow disk I/O nearby:    {} slow request(s), worst {} on disk {} ({}, issued by {})",
+                "    Slow disk I/O nearby:    {} slow request(s), worst {} on {} ({}, issued by {})",
                 slow_io.len(),
                 fmt_dur(worst.dur),
-                worst.disk,
+                self.disks.get(worst.disk).short(),
                 op_name(worst.op),
                 self.procs.label(worst.pid, worst.tid)
             );
@@ -523,11 +526,11 @@ impl Analyzer {
                     f.bytes / 1024
                 ),
                 Notable::SlowIo(i) => say!(
-                    "[{}] slow disk {:<5} {:>9}  disk {}  {} KB  issued by {}",
+                    "[{}] slow disk {:<5} {:>9}  {}  {} KB  issued by {}",
                     clock().fmt(i.end - i.dur),
                     op_name(i.op),
                     fmt_dur(i.dur),
-                    i.disk,
+                    self.disks.get(i.disk).short(),
                     i.size / 1024,
                     self.procs.label(i.pid, i.tid)
                 ),

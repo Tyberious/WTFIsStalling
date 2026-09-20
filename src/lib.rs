@@ -5,6 +5,7 @@
 
 pub mod analyze;
 pub mod cpuclock;
+pub mod disks;
 pub mod engine;
 pub mod etw;
 pub mod modules;
