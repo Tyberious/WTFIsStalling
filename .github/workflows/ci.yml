@@ -12,13 +12,21 @@ jobs:
   check:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # Surface the first few diagnostics as annotations so they show on the PR itself.
+      - name: cargo clippy
+        shell: pwsh
+        run: |
+          cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | Tee-Object clippy.txt
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content clippy.txt | Select-String '^\S+\.rs:\d+' | Select-Object -First 9 | ForEach-Object { "::error::$_" }
+            exit 1
+          }
       - run: cargo test
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
