@@ -9,6 +9,7 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 use crate::analyze::Analyzer;
 use crate::cpuclock::ClockSample;
+use crate::devices::{self, DeviceMap};
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskwhy::{known_worker, Cause, DiskWhy};
 use crate::evlog::{self, HardwareEvent, HardwareKind};
@@ -486,6 +487,35 @@ const DISPLAY_RESET_ADVICE: &str = "The graphics driver stopped answering for ab
     (use DDU, then the current or the previous driver version); check GPU temperatures and that every PCIe power plug is fully \
     seated, using separate cables rather than one daisy-chained cable; lower in-game settings that fill the VRAM. If it happens at \
     stock settings in every game, suspect the power supply or the card.";
+
+/// Third-party drivers older than this get "update it" put first.
+const OLD_DRIVER_YEARS: i32 = 2;
+
+/// Retitles "driver <file>" findings with the device the driver serves and adds the driver's
+/// version, date and age. Drivers without a device (filters, antivirus, the kernel) stay as they are.
+fn name_devices(found: &mut Findings, map: &DeviceMap, today: (i32, u32, u32)) {
+    for (key, f) in found.0.iter_mut() {
+        let Some(file) = key.strip_prefix("driver ") else { continue };
+        let (Some(title), Some(first)) = (map.device_title(file), map.get(file).first()) else { continue };
+        // Keep whatever followed the description, e.g. ": it hung and was reset".
+        let suffix =
+            f.title.split_once("  -  ").and_then(|(_, rest)| rest.split_once(": ")).map_or(String::new(), |(_, tail)| format!(": {tail}"));
+        f.title = format!("{file}  -  {title}{suffix}");
+        let about = first.describe(today);
+        if !about.is_empty() {
+            f.evidence.push(about);
+        }
+        if let Some(years) = first.age_years(today).filter(|y| *y >= OLD_DRIVER_YEARS) {
+            let provider =
+                if first.provider.is_empty() { "the device maker".to_string() } else { first.provider.trim_end_matches('.').to_string() };
+            f.advice = format!(
+                "Start here: this driver is {years} years old. Install the current one from {provider} or from the support page of your \
+                 PC or motherboard model (Windows Update rarely offers the newest). {}",
+                f.advice
+            );
+        }
+    }
+}
 
 const MEMORY_ERROR_ADVICE: &str = "The PC corrected these errors, but each one pauses everything briefly and they are a warning sign: \
     uncorrected ones crash programs and corrupt files. The usual cause is a memory overclock profile that is not quite stable: in the \
@@ -980,7 +1010,8 @@ impl Analyzer {
             );
             let sev = if times.iter().any(|t| *t >= run_start_unix) { Severity::High } else { Severity::Medium };
             // Same subject as a driver blamed for stalls, so both land in one finding.
-            let key = found.0.iter().map(|(k, _)| k.clone()).find(|k| k.eq_ignore_ascii_case(&file)).unwrap_or(file.clone());
+            let wanted = format!("driver {file}");
+            let key = found.0.iter().map(|(k, _)| k.clone()).find(|k| k.eq_ignore_ascii_case(&wanted)).unwrap_or(wanted);
             if found.note(&key, text.clone()) {
                 found.raise(&key, sev);
                 found.advise(&key, DISPLAY_RESET_ADVICE);
@@ -1056,6 +1087,11 @@ impl Analyzer {
                 ms_to_ticks(1000.0) * throttled.len() as i64,
             );
         }
+
+        // ---- Say which device each blamed driver belongs to, and how old the driver is ----------
+        let device_map = DeviceMap::load();
+        let today = devices::today();
+        name_devices(&mut found, &device_map, today);
 
         let mut findings: Vec<Finding> = found.0.into_iter().map(|(_, f)| f).collect();
         findings.sort_by_key(|f| (std::cmp::Reverse(f.severity), std::cmp::Reverse(f.impact)));
@@ -1152,6 +1188,14 @@ impl Analyzer {
                     fmt_dur(a.total),
                     a.over
                 );
+            }
+            // Which device each third-party driver belongs to; Windows' own drivers need no legend.
+            for (name, _) in drivers.iter().take(12) {
+                if let (Some(title), Some(first)) = (device_map.device_title(name), device_map.get(name).first()) {
+                    if !first.from_microsoft() {
+                        d!("  {name} = {title}  |  {}", first.describe(today));
+                    }
+                }
             }
         }
         if !faults_named.is_empty() {
@@ -1333,6 +1377,63 @@ mod tests {
         let f = health_findings(true, Some(&sata(10, 0)), &sata(14, 3));
         assert!(f.iter().any(|x| x.0 == Severity::High && x.1.contains("4 new CRC") && x.2 == DRIVE_CABLE_ADVICE));
         assert!(f.iter().any(|x| x.0 == Severity::High && x.1.contains("3 pending") && x.2 == DRIVE_FAILING_ADVICE));
+    }
+
+    #[test]
+    fn blamed_drivers_are_named_after_their_device_and_old_ones_say_so() {
+        use crate::devices::DeviceDriver;
+        let mut found = Findings::default();
+        found.add(
+            "driver rtwlane.sys",
+            Severity::High,
+            "rtwlane.sys  -  Wi-Fi adapter driver".into(),
+            "Blamed for 3 stalls.".into(),
+            "Disable power saving.".into(),
+            0,
+        );
+        found.add(
+            "driver nvlddmkm.sys",
+            Severity::High,
+            "nvlddmkm.sys  -  NVIDIA GPU driver: it hung and was reset".into(),
+            "e".into(),
+            "a".into(),
+            0,
+        );
+        found.add("driver wdfilter.sys", Severity::Medium, "wdfilter.sys  -  Microsoft Defender filter".into(), "e".into(), "a".into(), 0);
+        found.add("disk 1", Severity::Medium, "Disk 1  -  responding slowly".into(), "e".into(), "a".into(), 0);
+        let mut map = DeviceMap::default();
+        let dev = |device: &str, provider: &str, date| DeviceDriver {
+            device: device.into(),
+            provider: provider.into(),
+            version: "1.2".into(),
+            date: Some(date),
+        };
+        map.insert_for_test(
+            "rtwlane.sys",
+            vec![dev("Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC", "Realtek Semiconductor Corp.", (2021, 3, 4))],
+        );
+        map.insert_for_test("nvlddmkm.sys", vec![dev("NVIDIA GeForce RTX 5090", "NVIDIA", (2026, 9, 4))]);
+        name_devices(&mut found, &map, (2026, 9, 20));
+
+        let f = |key: &str| &found.0.iter().find(|(k, _)| k == key).unwrap().1;
+        let wifi = f("driver rtwlane.sys");
+        assert_eq!(wifi.title, "rtwlane.sys  -  Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC");
+        assert!(
+            wifi.evidence.iter().any(|e| e.contains("dated 2021-03-04 (5 years old), from Realtek Semiconductor Corp.")),
+            "{:?}",
+            wifi.evidence
+        );
+        assert!(
+            wifi.advice.starts_with("Start here: this driver is 5 years old") && wifi.advice.ends_with("Disable power saving."),
+            "{}",
+            wifi.advice
+        );
+
+        let gpu = f("driver nvlddmkm.sys");
+        assert_eq!(gpu.title, "nvlddmkm.sys  -  NVIDIA GeForce RTX 5090: it hung and was reset");
+        assert_eq!(gpu.advice, "a", "a current driver gets no 'update it' advice");
+        assert_eq!(f("driver wdfilter.sys").title, "wdfilter.sys  -  Microsoft Defender filter", "no device: unchanged");
+        assert_eq!(f("disk 1").title, "Disk 1  -  responding slowly");
     }
 
     #[test]

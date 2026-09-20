@@ -2,15 +2,7 @@
 //! can be reported as "NVIDIA GeForce RTX 4090". Read from the device registry; only devices
 //! that are present right now count, since the registry also remembers every card ever installed.
 
-use std::ptr::{null, null_mut};
-
-use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS};
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
-};
-
-use crate::util::{from_wide, wide};
+use crate::devices::{clean_desc, present, reg_str, subkeys};
 
 const ENUM_PCI: &str = r"SYSTEM\CurrentControlSet\Enum\PCI";
 
@@ -78,62 +70,6 @@ fn parse_location(s: &str) -> Option<(u32, u32, u32)> {
         [b, d, f, ..] => Some((b, d, f)),
         _ => None,
     }
-}
-
-/// "@oem12.inf,%dev.2684%;NVIDIA GeForce RTX 4090" -> "NVIDIA GeForce RTX 4090", and the form with
-/// arguments: "@usbxhci.inf,%x%;%1 USB %2 Host Controller - %3;(AMD,3.10,1.20)".
-fn clean_desc(s: &str) -> String {
-    let parts: Vec<&str> = s.split(';').collect();
-    if !s.starts_with('@') || parts.len() < 2 {
-        return s.trim().to_string();
-    }
-    let mut text = parts[1].trim().to_string();
-    if let Some(args) = parts.get(2).and_then(|a| a.trim().strip_prefix('(')).and_then(|a| a.strip_suffix(')')) {
-        for (i, arg) in args.split(',').enumerate() {
-            text = text.replace(&format!("%{}", i + 1), arg.trim());
-        }
-    }
-    text
-}
-
-fn present(instance_id: &str) -> bool {
-    let mut devinst = 0u32;
-    unsafe { CM_Locate_DevNodeW(&mut devinst, wide(instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS }
-}
-
-fn subkeys(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut key: HKEY = null_mut();
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide(path).as_ptr(), 0, KEY_READ, &mut key) } != ERROR_SUCCESS {
-        return out;
-    }
-    for index in 0..4096 {
-        let mut name = [0u16; 256];
-        let mut len = name.len() as u32;
-        if unsafe { RegEnumKeyExW(key, index, name.as_mut_ptr(), &mut len, null(), null_mut(), null_mut(), null_mut()) } != ERROR_SUCCESS {
-            break;
-        }
-        out.push(String::from_utf16_lossy(&name[..len as usize]));
-    }
-    unsafe { RegCloseKey(key) };
-    out
-}
-
-fn reg_str(subkey: &str, value: &str) -> Option<String> {
-    let mut buf = [0u16; 512];
-    let mut size = (buf.len() * 2) as u32;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            wide(subkey).as_ptr(),
-            wide(value).as_ptr(),
-            RRF_RT_REG_SZ,
-            null_mut(),
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-        )
-    };
-    (r == ERROR_SUCCESS).then(|| from_wide(&buf)).filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]

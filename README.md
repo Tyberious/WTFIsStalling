@@ -57,7 +57,7 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 
 | Cause | How it shows up |
 | --- | --- |
-| A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file, with advice for the usual suspects |
+| A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file and named after the device it drives ("NVIDIA GeForce RTX 5090", "Realtek PCIe 5GbE Family Controller"), with the driver's version, date and age, and advice for the usual suspects |
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide |
@@ -84,11 +84,14 @@ RESULT
 
   Monitored 05:12  |  14 kernel-level stall(s), 0 CPU-starvation stall(s)  |  worst wake-up delay 11.80 ms ...
 
-  1. [HIGH] rtwlane.sys  -  Wi-Fi adapter driver
+  1. [HIGH] rtwlane.sys  -  Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC
        - Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).
+       - Driver version 2024.10.138.3, dated 2021-03-04 (5 years old), from Realtek.
        - Its interrupt handling ran for up to 10.97 ms at a time (14 times over 1.00 ms). Healthy
          drivers stay under 0.5 ms; longer runs block everything else on that CPU core ...
      What to try:
+       Start here: this driver is 5 years old. Install the current one from Realtek or from the
+       support page of your PC or motherboard model ...
        Update the Wi-Fi driver from the chip vendor (Intel/Realtek/MediaTek/Qualcomm), disable adapter
        power saving and background scanning/roaming aggressiveness; test with Wi-Fi off and Ethernet in.
 
