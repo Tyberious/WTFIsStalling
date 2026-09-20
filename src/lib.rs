@@ -14,6 +14,7 @@ pub mod evlog;
 pub mod gpu;
 pub mod health;
 pub mod modules;
+pub mod overhead;
 pub mod pci;
 pub mod period;
 pub mod probe;

@@ -16,6 +16,7 @@ use crate::evlog::{self, HardwareEvent, HardwareKind, UnexpectedShutdown};
 use crate::gpu::GpuLog;
 use crate::health::{self, DriveHealth};
 use crate::modules::knowledge;
+use crate::overhead::Overhead;
 use crate::pci::{self, PciDevice};
 use crate::period;
 use crate::probe::{ProbeStats, StallKind};
@@ -1007,6 +1008,10 @@ const EVENT_LOG_DAYS: u32 = 7;
 pub struct RunData<'a> {
     pub elapsed_s: f64,
     pub events_lost: u32,
+    /// What the measuring itself cost this PC.
+    pub overhead: Overhead,
+    /// Why the run used the lighter settings, if it did.
+    pub light: Option<&'static str>,
     pub stats: &'a ProbeStats,
     pub exec_warn: i64,
     pub io_warn: i64,
@@ -1016,7 +1021,7 @@ pub struct RunData<'a> {
 
 impl Analyzer {
     pub fn summarize(&mut self, run: RunData) -> Summary {
-        let RunData { elapsed_s, events_lost, stats, exec_warn, io_warn, clock, gpu } = run;
+        let RunData { elapsed_s, events_lost, overhead, light, stats, exec_warn, io_warn, clock, gpu } = run;
         let inner = self.shared.inner.lock().unwrap();
         let routines = inner.routines.clone();
         let faults = inner.faults_by_pid.clone();
@@ -1531,6 +1536,32 @@ impl Analyzer {
             }
         }
 
+        // ---- What the measuring itself cost -------------------------------------------------
+        // Always Low: this is about the measurement, not about the PC, so it must never decide
+        // the banner. The first evidence line becomes the headline only if nothing else exists,
+        // and a Low finding never does that.
+        let mut concerns = overhead.concerns(events, events_lost).into_iter();
+        if let Some(first) = concerns.next() {
+            let lighter = match light {
+                Some(_) => "This run already used the lighter settings.",
+                None => "Run from a command prompt, 'wtfis-cli --light' checks half as often, which roughly halves what it costs.",
+            };
+            found.add(
+                "tool overhead",
+                Severity::Low,
+                "Measuring cost this PC enough to be part of the picture".into(),
+                first,
+                format!(
+                    "Close other heavy programs (a browser with many tabs, a game, a video export) and measure again: with less going \
+                     on, measuring costs less and the answer is cleaner. {lighter}"
+                ),
+                0,
+            );
+            for more in concerns {
+                found.note("tool overhead", more);
+            }
+        }
+
         // ---- Say which device each blamed driver belongs to, and how old the driver is ----------
         let device_map = DeviceMap::load();
         let today = devices::today();
@@ -1547,6 +1578,13 @@ impl Analyzer {
             format!("Monitored:        {:02}:{:02}", secs / 60, secs % 60),
             format!("Stalls detected:  {kernel_stalls} kernel-level, {sched_stalls} CPU-starvation"),
         ];
+        // Near the top on purpose: two runs measured differently must never be compared unaware.
+        if let Some(why) = light {
+            overview.push(format!(
+                "Light mode:       on, because {why}; stalls shorter than about {:.0} ms can be missed",
+                crate::overhead::PROBE_MS_LIGHT
+            ));
+        }
         if marks_total > 0 {
             overview.push(format!("Flagged by you:   {marks_total} moment(s), {} with nothing on the system side", self.marks_clean));
         }
@@ -1604,7 +1642,10 @@ impl Analyzer {
 
         // ---- Supporting tables ---------------------------------------------------------
         d!("");
-        d!("{events} kernel events processed, {events_lost} lost.");
+        d!("THIS TOOL'S OWN COST  (what the measuring itself used)");
+        for line in overhead.detail_lines(events, events_lost) {
+            d!("{line}");
+        }
         if self.notable_suppressed > 0 {
             d!("{} of {} individual slow-event lines were suppressed in the event log.", self.notable_suppressed, self.notable_total);
         }
@@ -2027,6 +2068,54 @@ mod tests {
         assert_eq!(e_core_concentration(&topo, &[vec![3u16], vec![4], vec![5], vec![6]]), None);
     }
 
+    /// The tool's own cost is reported, but it is never allowed to become the verdict.
+    #[test]
+    fn the_tools_own_cost_is_reported_and_never_flips_the_banner() {
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+
+        let stats =
+            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let run = |overhead, light, lost| {
+            let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+            az.shared.inner.lock().unwrap().events = 90_000;
+            az.summarize(RunData {
+                elapsed_s: 60.0,
+                events_lost: lost,
+                overhead,
+                light,
+                stats: &stats,
+                exec_warn: ms_to_ticks(1.0),
+                io_warn: ms_to_ticks(200.0),
+                clock: &[],
+                gpu: &GpuLog::default(),
+            })
+        };
+
+        // 30 s + 120 s of CPU over a 60 s run on 4 CPUs, plus 10% of the events lost.
+        let heavy = Overhead { monitor_100ns: 300_000_000, probes_100ns: Some(1_200_000_000), elapsed_s: 60.0, ncpu: 4 };
+        let s = run(heavy, Some("this PC has few processor cores"), 10_000);
+        let f = s.findings.iter().find(|f| f.title.starts_with("Measuring cost")).expect("the cost is a finding");
+        assert_eq!(f.severity, Severity::Low, "an observation about the measuring must never be High or Medium");
+        assert_eq!(s.health, Health::Ok, "and must not turn the banner into a problem");
+        assert!(f.evidence.iter().any(|e| e.contains("total processor capacity")), "{:?}", f.evidence);
+        assert!(f.evidence.iter().any(|e| e.contains("200% of one processor core")), "{:?}", f.evidence);
+        assert!(f.evidence.iter().any(|e| e.contains("10000 of the 100000 kernel events")), "{:?}", f.evidence);
+        assert!(f.advice.contains("already used the lighter settings"), "{}", f.advice);
+        assert!(s.overview.iter().any(|l| l.starts_with("Light mode:") && l.contains("few processor cores")), "{:?}", s.overview);
+        assert!(s.details.iter().any(|l| l.contains("THIS TOOL'S OWN COST")), "the cost block is in DETAILS");
+        assert!(s.details.iter().any(|l| l.contains("1500 per second")), "{:?}", s.details);
+
+        // A cheap run on a normal machine says nothing beyond the DETAILS block.
+        let cheap = Overhead { monitor_100ns: 10_000_000, probes_100ns: Some(20_000_000), elapsed_s: 60.0, ncpu: 16 };
+        let s = run(cheap, None, 0);
+        assert!(!s.findings.iter().any(|f| f.title.starts_with("Measuring cost")), "1% of one core is not worth a finding");
+        assert!(!s.overview.iter().any(|l| l.starts_with("Light mode:")), "no light-mode line when it is off");
+        assert!(s.details.iter().any(|l| l.contains("Monitoring program:")), "{:?}", s.details);
+    }
+
     #[test]
     fn every_flagged_moment_shows_up_in_the_result_whatever_the_verdict() {
         use crate::analyze::IncidentSummary;
@@ -2053,6 +2142,8 @@ mod tests {
         let summary = az.summarize(RunData {
             elapsed_s: 60.0,
             events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
             stats: &stats,
             exec_warn: ms_to_ticks(1.0),
             io_warn: ms_to_ticks(200.0),

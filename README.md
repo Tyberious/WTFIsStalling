@@ -130,12 +130,27 @@ Two independent sources, correlated on one clock (QPC):
   thread → process mapping) and 1 kHz CPU profile samples. Routine addresses are resolved to the loaded
   driver; a built-in knowledge base plus each file's version resource explains what that driver is.
 * **Latency probes.** A helper process in the REALTIME priority class runs one thread per CPU at
-  priority 31, pinned, waking every millisecond and measuring how late each wake-up was. Nothing but
+  priority 31, pinned, waking every millisecond (every 2 ms in light mode) and measuring how late each
+  wake-up was. Nothing but
   DPCs, ISRs, code at raised IRQL, firmware (SMI) or a hypervisor can delay those threads, so a late
   wake-up *is* a kernel-level stall. A second, normal-priority probe detects plain CPU starvation.
   Every logical CPU is covered, including machines past 64 of them, where Windows splits the CPUs into
   *processor groups*: each probe is pinned by (group, index) and reports the system-wide CPU number the
   kernel trace uses, so the two always line up.
+
+**What the measuring costs, and light mode.** Every report ends with what the tool itself used: the CPU
+time of both processes (the monitor and the probes), as a share of one core and of the whole processor,
+plus how many kernel events per second were processed and how many Windows could not deliver. If that
+cost is big enough to be part of what was measured — over 5% of the whole processor, either process
+holding half a core, or more than 1% of the events lost — a low-severity finding says so in plain words.
+On a PC with four logical CPUs or fewer, or one running on battery, the tool switches to **light mode**
+by itself: the probes check every 2 ms instead of 1 ms, which roughly halves what the probes cost. The
+report says light mode is on and
+why, right at the top, because results are then slightly coarser: a stall shorter than about 2 ms between
+wake-ups can be missed, and a measured stall can fall short of the real one by up to 2 ms. The decision is
+made once, before the run starts, so one report is never half of each. CPU sampling is left alone on
+purpose: its interval is a system-wide Windows setting, and this tool changes nothing that could outlive
+a run. `wtfis-cli --light` turns it on by hand and `--no-light` keeps full measuring on a small or unplugged PC.
 
 When a probe reports a stall, the analyzer waits for the trace to catch up, looks at exactly what ran
 on that CPU during that window and issues a verdict:
@@ -180,6 +195,8 @@ probe stalls.
 
 ```
 wtfis-cli --duration 300 --stall-ms 2 --dpc-warn-us 500
+wtfis-cli --light            # measure more gently on a weak or battery-powered PC
+wtfis-cli --no-light         # keep full measuring even there
 ```
 
 Run `wtfis-cli --help` for all options. Press Enter to flag a hitch, Ctrl+C to stop and print the

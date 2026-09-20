@@ -35,6 +35,14 @@ struct Args {
     /// Don't sample the CPU (loses process attribution and firmware/SMI detection)
     #[arg(long)]
     no_profile: bool,
+    /// Measure more gently: probe every 2 ms and sample the CPU half as often, so the tool costs
+    /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
+    /// PC with 4 logical CPUs or fewer, or one running on battery
+    #[arg(long)]
+    light: bool,
+    /// Keep full measuring even on a small or unplugged PC (the opposite of --light)
+    #[arg(long, conflicts_with = "light")]
+    no_light: bool,
     /// Report file path (default: WTFIsStalling-<date>.txt in the current directory)
     #[arg(long)]
     log: Option<String>,
@@ -126,6 +134,12 @@ fn main() {
         fault_warn_ms: args.fault_warn_ms,
         io_warn_ms: args.io_warn_ms,
         profile: !args.no_profile,
+        // Neither flag: decide from the machine itself, exactly as the GUI does.
+        light: match (args.light, args.no_light) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         log: match (args.no_log, args.log) {
             (true, _) => LogTarget::None,
             (false, Some(p)) => LogTarget::Path(p),

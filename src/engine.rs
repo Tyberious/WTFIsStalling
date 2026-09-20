@@ -2,6 +2,7 @@
 //! through `say!` / `util::status`, so the front end decides where it lands.
 
 use std::mem::{size_of, zeroed};
+use std::os::windows::io::AsRawHandle;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -18,10 +19,11 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::overhead::Overhead;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
 use crate::util::{self, from_wide, ms_to_ticks, wide};
-use crate::{analyze, cpuclock, etw, gpu, modules, probe, say, state};
+use crate::{analyze, cpuclock, etw, gpu, modules, overhead, probe, say, state};
 
 pub use crate::analyze::mark_now;
 
@@ -41,6 +43,10 @@ pub struct Config {
     pub fault_warn_ms: f64,
     pub io_warn_ms: f64,
     pub profile: bool,
+    /// Measure with the lighter settings (2 ms probes, slower CPU sampling). `None` lets the
+    /// tool decide before the run from the CPU count and whether the PC is on battery, which is
+    /// what the GUI always uses; `Some` overrides that either way.
+    pub light: Option<bool>,
     pub log: LogTarget,
     pub debug: bool,
 }
@@ -55,19 +61,21 @@ impl Default for Config {
             fault_warn_ms: 50.0,
             io_warn_ms: 200.0,
             profile: true,
+            light: None,
             log: LogTarget::Auto,
             debug: false,
         }
     }
 }
 
-/// Both binaries call this first: when started as `<exe> --probe-child <threshold_ms>` the
-/// process is the real-time latency probe helper and never returns.
+/// Both binaries call this first: when started as `<exe> --probe-child <threshold_ms>
+/// <interval_ms>` the process is the real-time latency probe helper and never returns.
 pub fn run_probe_child_if_requested() {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some(probe::CHILD_ARG) {
         let threshold = args.next().and_then(|a| a.parse().ok()).unwrap_or(5.0);
-        probe::child_main(threshold);
+        let interval = args.next().and_then(|a| a.parse().ok()).unwrap_or(overhead::PROBE_MS_NORMAL);
+        probe::child_main(threshold, interval);
     }
 }
 
@@ -287,6 +295,15 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
     print_system_info(ncpu);
 
+    // Decided once, before anything starts: mid-run switching would make the two halves of one
+    // report incomparable. Both facts are readable without administrator rights.
+    let light_reason = match cfg.light {
+        Some(false) => None,
+        Some(true) => overhead::auto_light_reason(ncpu, overhead::on_battery()).or(Some("you asked for it")),
+        None => overhead::auto_light_reason(ncpu, overhead::on_battery()),
+    };
+    let probe_ms = if light_reason.is_some() { overhead::PROBE_MS_LIGHT } else { overhead::PROBE_MS_NORMAL };
+
     // Since Windows 11 24H2 kernel module addresses are hidden without SeDebugPrivilege.
     etw::enable_privilege("SeDebugPrivilege");
     let modules = modules::ModuleMap::load();
@@ -300,6 +317,13 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
         say!("warning: CPU sampling could not be enabled; process attribution and firmware/SMI detection are off.");
     }
     let _timer_resolution = TimerResolution::raise();
+    // Light mode deliberately leaves CPU sampling alone: its interval is a system-wide Windows
+    // setting, a hard kill would leave it changed until reboot, and other profilers would see it.
+    // The probes are the real cost, and those are ours to slow down.
+    if let Some(why) = light_reason {
+        say!("Light mode: on, because {why}. The probes check every {probe_ms:.0} ms instead of 1 ms, so measuring costs this PC");
+        say!("            less. Stalls shorter than about {probe_ms:.0} ms can be missed.");
+    }
 
     let shared = Arc::new(state::Shared {
         inner: Mutex::new(state::Inner::default()),
@@ -317,7 +341,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     probe::spawn_scheduler_probe(cfg.sched_stall_ms, tx.clone(), probe_stop.clone(), probe_stats.clone());
     let cpu_clock = cpuclock::spawn(probe_stop.clone());
     let gpu_log = gpu::spawn(probe_stop.clone());
-    let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, tx, probe_stats.clone()) {
+    let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, probe_ms, tx, probe_stats.clone()) {
         Ok(c) => Some(c),
         Err(e) => {
             say!("warning: could not start the latency probe process ({e}); only individual slow events will be reported.");
@@ -371,9 +395,13 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
 
     util::status("Stopping: collecting the last trace buffers and analyzing...");
     probe_stop.store(true, Ordering::SeqCst);
+    let mut probes_cpu = None;
     if let Some(mut c) = probe_child.take() {
         drop(c.stdin.take()); // EOF on stdin tells the child to exit
         let _ = c.wait();
+        // `Child` keeps the process handle open until it is dropped, and a process's CPU time
+        // stays readable after it exits, so this is the child's final total.
+        probes_cpu = unsafe { overhead::process_cpu_100ns(c.as_raw_handle() as HANDLE) };
     }
     // ETW flushes once a second; let the tail arrive before the final analysis.
     std::thread::sleep(Duration::from_millis(1200));
@@ -387,9 +415,12 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     analyzer.tick(true);
     let clock_samples = cpu_clock.lock().unwrap().clone();
     let gpu_log = gpu_log.lock().unwrap().clone();
+    let elapsed_s = started.elapsed().as_secs_f64();
     let summary = analyzer.summarize(RunData {
-        elapsed_s: started.elapsed().as_secs_f64(),
+        elapsed_s,
         events_lost: lost,
+        overhead: Overhead { monitor_100ns: overhead::current_process_cpu_100ns().unwrap_or(0), probes_100ns: probes_cpu, elapsed_s, ncpu },
+        light: light_reason,
         stats: &probe_stats,
         exec_warn: shared.exec_warn,
         io_warn: shared.io_warn,

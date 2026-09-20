@@ -5,7 +5,8 @@
 //!   thread can outrank them, so only DPCs, ISRs, code at raised IRQL, SMIs/firmware or a
 //!   hypervisor can delay them. They live in a child process (`--probe-child`) so the
 //!   real-time priority class doesn't also lift the parent's analysis threads; the child
-//!   reports over its stdout. QPC is system-wide, so timestamps line up across processes.
+//!   reports over its stdout. QPC is system-wide, so timestamps line up across processes. In
+//!   light mode they wake every 2 ms instead, which costs the PC about half as much.
 //! * Scheduler probe: a single unpinned normal-priority thread in the parent. It is delayed
 //!   when every CPU is busy with equal-or-higher priority work, i.e. what an ordinary app
 //!   or game feels.
@@ -28,6 +29,7 @@ use windows_sys::Win32::System::Threading::{
     THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
+use crate::overhead::PROBE_MS_NORMAL;
 use crate::topology::{self, Slot};
 use crate::util::{ms_to_ticks, qpc};
 
@@ -149,11 +151,23 @@ pub fn spawn_scheduler_probe(threshold_ms: f64, tx: Sender<Stall>, stop: Arc<Ato
         .expect("spawn scheduler probe");
 }
 
+/// The wake-up interval the child is asked for, kept inside sane bounds. A tiny interval would
+/// turn a priority-31 thread on every CPU into a busy loop, i.e. a frozen machine, so a garbage
+/// command line must not be able to produce one.
+pub fn sane_interval_ms(ms: f64) -> f64 {
+    if ms.is_finite() {
+        ms.clamp(0.5, 10.0)
+    } else {
+        PROBE_MS_NORMAL
+    }
+}
+
 /// Parent side: start the real-time child and forward what it reports.
-pub fn spawn_kernel_probes(threshold_ms: f64, tx: Sender<Stall>, stats: Arc<ProbeStats>) -> std::io::Result<Child> {
+pub fn spawn_kernel_probes(threshold_ms: f64, interval_ms: f64, tx: Sender<Stall>, stats: Arc<ProbeStats>) -> std::io::Result<Child> {
     let mut child = Command::new(std::env::current_exe()?)
         .arg(CHILD_ARG)
         .arg(threshold_ms.to_string())
+        .arg(sane_interval_ms(interval_ms).to_string())
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -190,7 +204,13 @@ pub fn spawn_kernel_probes(threshold_ms: f64, tx: Sender<Stall>, stats: Arc<Prob
 /// Protocol on stdout, one line each: `C <priority class>` once at the start, `S`/`L <cpu>
 /// <start> <end>` for a stall / a sub-threshold blip, `M <max>` as a keep-alive. `<cpu>` is the
 /// system-wide processor index, the same numbering ETW reports.
-pub fn child_main(threshold_ms: f64) -> ! {
+///
+/// `interval_ms` is how often each probe asks to be woken (2 ms in light mode instead of 1 ms).
+/// A stall is still measured as lateness beyond the requested wake-up, so its length means the
+/// same either way; what a longer interval costs is resolution, because a blockage that fits
+/// between two wake-ups is not seen at all and a measured length can fall short of the real one
+/// by up to one interval.
+pub fn child_main(threshold_ms: f64, interval_ms: f64) -> ! {
     crate::etw::enable_privilege("SeIncreaseBasePriorityPrivilege");
     unsafe {
         SetConsoleCtrlHandler(None, 1); // Ctrl+C is the parent's business
@@ -200,6 +220,7 @@ pub fn child_main(threshold_ms: f64) -> ! {
     // One probe per logical CPU, across every processor group: past 64 CPUs Windows splits the
     // machine into groups and a thread pinned in group 0 would never see the rest.
     let slots = topology::processor_slots(&topology::active_groups());
+    let interval_ms = sane_interval_ms(interval_ms);
 
     std::thread::spawn(|| {
         let mut sink = Vec::new();
@@ -212,7 +233,7 @@ pub fn child_main(threshold_ms: f64) -> ! {
     let max = Arc::new(AtomicI64::new(0));
     for slot in slots {
         let (tx, stop, max) = (tx.clone(), stop.clone(), max.clone());
-        std::thread::spawn(move || run(StallKind::Kernel, Some(slot), 1.0, threshold_ms, tx, stop, max));
+        std::thread::spawn(move || run(StallKind::Kernel, Some(slot), interval_ms, threshold_ms, tx, stop, max));
     }
 
     // Reporting is the only non-probe work in this process; keep it at the bottom of the
@@ -228,5 +249,24 @@ pub fn child_main(threshold_ms: f64) -> ! {
         if writeln!(out, "{msg}").and_then(|_| out.flush()).is_err() {
             std::process::exit(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overhead::PROBE_MS_LIGHT;
+
+    /// Priority-31 threads on every CPU: whatever reaches the child's command line, the wait
+    /// between wake-ups must stay a real wait.
+    #[test]
+    fn the_probe_interval_can_never_become_a_spin() {
+        assert_eq!(sane_interval_ms(PROBE_MS_NORMAL), 1.0);
+        assert_eq!(sane_interval_ms(PROBE_MS_LIGHT), 2.0);
+        assert_eq!(sane_interval_ms(0.0), 0.5);
+        assert_eq!(sane_interval_ms(-5.0), 0.5);
+        assert_eq!(sane_interval_ms(1e9), 10.0);
+        assert_eq!(sane_interval_ms(f64::NAN), PROBE_MS_NORMAL);
+        assert_eq!(sane_interval_ms(f64::INFINITY), PROBE_MS_NORMAL);
     }
 }
