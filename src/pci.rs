@@ -167,12 +167,12 @@ mod tests {
     }
 
     #[test]
-    fn this_pc_has_pci_devices() {
+    fn listing_devices_does_not_panic() {
+        // No count is asserted: virtual machines (CI runners included) can have no PCI devices at all.
         let found = devices();
         println!("{} PCI devices present", found.len());
         for d in found.iter().filter(|d| !is_plumbing(&d.name)).take(8) {
             println!("  {}:{}.{}  {}", d.bus, d.device, d.function, d.name);
         }
-        assert!(!found.is_empty());
     }
 }
