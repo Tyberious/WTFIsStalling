@@ -53,7 +53,7 @@ const INTRO: &str = "How to use\r\n\
     \x20 1. Click \"Start monitoring\".\r\n\
     \x20 2. Use the PC normally until the hitch / stall / audio crackle happens, ideally a few times.\r\n\
     \x20    (Run the game or app that has the problem. A few minutes is usually enough.)\r\n\
-    \x20 3. Click \"Stop\". The coloured bar above names the driver, program or hardware responsible,\r\n\
+    \x20 3. Click \"Stop\". The colored bar above names the driver, program or hardware responsible,\r\n\
     \x20    and the report below says what to do about it.\r\n\
     \r\n\
     \x20 \"Copy report\" puts the whole report on the clipboard so it can be pasted to whoever is helping you.\r\n\

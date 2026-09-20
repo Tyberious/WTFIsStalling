@@ -27,7 +27,7 @@ nothing on the system.
 3. Use the PC until the hitch happens, ideally a few times. Run the game or app that has the problem.
 4. Click **Stop**. Read the summary, or click **Copy report** and paste it to whoever is helping you.
 
-The coloured bar gives the verdict; the report underneath starts with the ranked findings and what to
+The colored bar gives the verdict; the report underneath starts with the ranked findings and what to
 try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as
 `WTFIsStalling-<date>.txt`. The window follows the system light / dark theme.
 

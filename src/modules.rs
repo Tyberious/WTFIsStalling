@@ -247,7 +247,7 @@ const KB: &[(&[&str], Knowledge)] = &[
     }),
     (&["winring0", "rtcore", "asio", "asupio", "gdrv", "gpcidrv", "corsairllaccess", "cpuz", "hwinfo", "ntiolib", "eneio", "ene.sys", "inpout", "amdryzenmaster", "lghub", "iocbios", "msio", "glckio", "aida"], Knowledge {
         what: "Hardware monitoring / RGB / overclocking utility driver (polls sensors over SMBus/EC)",
-        advice: "A very common cause of periodic hitches. Fully exit (not just minimise) RGB and monitoring tools: iCUE, Armoury Crate, Aura, RGB Fusion, MSI Center, Afterburner/RTSS, HWiNFO, NZXT CAM, Ryzen Master, etc. and retest.",
+        advice: "A very common cause of periodic hitches. Fully exit (not just minimize) RGB and monitoring tools: iCUE, Armoury Crate, Aura, RGB Fusion, MSI Center, Afterburner/RTSS, HWiNFO, NZXT CAM, Ryzen Master, etc. and retest.",
     }),
     (&["bthport", "bthusb", "bthenum", "ibtusb", "rtkbt", "btha2dp", "bthhfenum"], Knowledge {
         what: "Bluetooth driver",
