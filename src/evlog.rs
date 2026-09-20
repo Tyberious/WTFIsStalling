@@ -86,6 +86,80 @@ fn parse_display_reset(xml: &str) -> Option<DisplayReset> {
     Some(DisplayReset { unix_time, driver })
 }
 
+/// Windows came back up without having shut down cleanly (Kernel-Power event 41).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnexpectedShutdown {
+    pub unix_time: i64,
+    /// Stop code of the blue screen, or 0 when there was none (power loss, hard reset, hang).
+    pub bugcheck: u32,
+    /// The power button was held down, i.e. someone forced it off, usually because it had frozen.
+    pub power_button: bool,
+}
+
+pub fn unexpected_shutdowns(days: u32) -> Vec<UnexpectedShutdown> {
+    query_system("Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41", days)
+        .iter()
+        .filter_map(|xml| parse_shutdown(xml))
+        .collect()
+}
+
+fn parse_shutdown(xml: &str) -> Option<UnexpectedShutdown> {
+    if !tag_attr(xml, "Provider", "Name")?.eq_ignore_ascii_case("Microsoft-Windows-Kernel-Power")
+        || tag_text(xml, "EventID")?.trim() != "41"
+    {
+        return None;
+    }
+    let unix_time = parse_iso(&tag_attr(xml, "TimeCreated", "SystemTime")?)?;
+    let bugcheck = data_named(xml, "BugcheckCode").and_then(|v| number(&v)).unwrap_or(0);
+    // A 64-bit timestamp, so it is compared as text rather than parsed into a u32.
+    let power_button = data_named(xml, "PowerButtonTimestamp").is_some_and(|v| v.trim() != "0" && !v.trim().is_empty());
+    Some(UnexpectedShutdown { unix_time, bugcheck, power_button })
+}
+
+/// Name of a stop code people are likely to search for.
+pub fn bugcheck_name(code: u32) -> &'static str {
+    match code {
+        0x0A => "IRQL_NOT_LESS_OR_EQUAL",
+        0x1A => "MEMORY_MANAGEMENT",
+        0x1E => "KMODE_EXCEPTION_NOT_HANDLED",
+        0x3B => "SYSTEM_SERVICE_EXCEPTION",
+        0x50 => "PAGE_FAULT_IN_NONPAGED_AREA",
+        0x7E => "SYSTEM_THREAD_EXCEPTION_NOT_HANDLED",
+        0x9F => "DRIVER_POWER_STATE_FAILURE",
+        0xD1 => "DRIVER_IRQL_NOT_LESS_OR_EQUAL",
+        0xEF => "CRITICAL_PROCESS_DIED",
+        0x101 => "CLOCK_WATCHDOG_TIMEOUT",
+        0x116 => "VIDEO_TDR_FAILURE",
+        0x124 => "WHEA_UNCORRECTABLE_ERROR",
+        0x133 => "DPC_WATCHDOG_VIOLATION",
+        0x139 => "KERNEL_SECURITY_CHECK_FAILURE",
+        0x1CA => "SYNTHETIC_WATCHDOG_TIMEOUT",
+        _ => "",
+    }
+}
+
+/// Moments at which firmware capped the processor's speed (Kernel-Processor-Power event 37).
+/// Windows logs one event per logical processor, so events within 5 seconds count as one moment.
+pub fn firmware_throttle_times(days: u32) -> Vec<i64> {
+    let filter = "Provider[@Name='Microsoft-Windows-Kernel-Processor-Power'] and EventID=37";
+    let times: Vec<i64> =
+        query_system(filter, days).iter().filter_map(|xml| parse_iso(&tag_attr(xml, "TimeCreated", "SystemTime")?)).collect();
+    collapse_bursts(times, 5)
+}
+
+fn collapse_bursts(mut times: Vec<i64>, gap: i64) -> Vec<i64> {
+    times.sort();
+    let mut out: Vec<i64> = Vec::new();
+    let mut last = i64::MIN;
+    for t in times {
+        if t.saturating_sub(last) > gap {
+            out.push(t);
+        }
+        last = t;
+    }
+    out
+}
+
 /// XML of the newest (at most 500) System-log events matching `filter` (an XPath condition on the
 /// System element), returned oldest first. The time filter runs server-side, so the channel is
 /// not walked end to end.
@@ -385,6 +459,34 @@ mod tests {
         assert_eq!(parse_display_reset(xml), Some(DisplayReset { unix_time: 1_789_701_165, driver: "nvlddmkm".into() }));
         assert!(parse_display_reset(DISK_153_SINGLE).is_none());
         println!("display_resets(7): {} events", display_resets(7).len());
+    }
+
+    #[test]
+    fn unexpected_shutdown_carries_stop_code_and_power_button() {
+        let xml = |data: &str| {
+            format!(
+                "<Event xmlns='x'><System><Provider Name='Microsoft-Windows-Kernel-Power' Guid='{{331c3b3a}}'/><EventID>41</EventID>\
+                 <TimeCreated SystemTime='2026-09-18T03:12:45.1234567Z'/></System><EventData>{data}</EventData></Event>"
+            )
+        };
+        let blue = parse_shutdown(&xml("<Data Name='BugcheckCode'>159</Data><Data Name='PowerButtonTimestamp'>0</Data>")).unwrap();
+        assert_eq!((blue.bugcheck, blue.power_button, bugcheck_name(blue.bugcheck)), (159, false, "DRIVER_POWER_STATE_FAILURE"));
+        let forced =
+            parse_shutdown(&xml("<Data Name='BugcheckCode'>0</Data><Data Name='PowerButtonTimestamp'>134028123456789012</Data>")).unwrap();
+        assert_eq!((forced.bugcheck, forced.power_button), (0, true));
+        assert!(parse_shutdown(DISK_153_SINGLE).is_none());
+        assert_eq!(bugcheck_name(0x124), "WHEA_UNCORRECTABLE_ERROR");
+        println!(
+            "unexpected_shutdowns(7): {}, firmware_throttle_times(7): {}",
+            unexpected_shutdowns(7).len(),
+            firmware_throttle_times(7).len()
+        );
+    }
+
+    #[test]
+    fn per_processor_event_floods_count_as_one_moment() {
+        assert_eq!(collapse_bursts(vec![100, 101, 101, 103, 300, 302, 900], 5), vec![100, 300, 900]);
+        assert!(collapse_bursts(vec![], 5).is_empty());
     }
 
     #[test]

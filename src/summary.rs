@@ -12,7 +12,7 @@ use crate::cpuclock::ClockSample;
 use crate::devices::{self, DeviceMap};
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskwhy::{known_worker, Cause, DiskWhy};
-use crate::evlog::{self, HardwareEvent, HardwareKind};
+use crate::evlog::{self, HardwareEvent, HardwareKind, UnexpectedShutdown};
 use crate::health::{self, DriveHealth};
 use crate::modules::knowledge;
 use crate::pci::{self, PciDevice};
@@ -541,6 +541,55 @@ const FATAL_ERROR_ADVICE: &str = "The PC crashed, froze or restarted because of 
 /// (bus, device, function)
 type PciAddress = (u32, u32, u32);
 
+/// A hardware error and a stall this close together are treated as one event. Event log times are
+/// whole seconds and logging lags the error slightly.
+const COINCIDE_S: i64 = 2;
+
+/// How many of `stalls` fall within COINCIDE_S of any of `events` (Unix seconds).
+fn coinciding(stalls: &[i64], events: &[i64]) -> usize {
+    stalls.iter().filter(|s| events.iter().any(|e| (*e - **s).abs() <= COINCIDE_S)).count()
+}
+
+const SHUTDOWN_ADVICE: &str = "A blue screen names its stop code: search for that code together with your PC or motherboard model, and \
+    update the driver it points at. A sudden restart or power-off with no blue screen is usually power or heat: check CPU and GPU \
+    temperatures under load, reseat the power cables, remove any overclock, undervolt or memory profile (XMP / EXPO) in the BIOS, \
+    and suspect the power supply if it happens under load.";
+
+/// One finding for the times Windows came back up without a clean shutdown.
+fn shutdown_finding(events: &[UnexpectedShutdown], now: i64) -> Option<(Severity, String)> {
+    // Someone holding the power button is a symptom (it had frozen), but not a crash by itself.
+    let crashes: Vec<&UnexpectedShutdown> = events.iter().filter(|e| e.bugcheck != 0 || !e.power_button).collect();
+    if crashes.is_empty() {
+        return None;
+    }
+    let mut codes: Vec<u32> = crashes.iter().map(|e| e.bugcheck).filter(|c| *c != 0).collect();
+    codes.sort();
+    codes.dedup();
+    let blue = crashes.iter().filter(|e| e.bugcheck != 0).count();
+    let silent = crashes.len() - blue;
+    let mut parts = Vec::new();
+    if blue > 0 {
+        let names: Vec<String> = codes
+            .iter()
+            .map(|c| match evlog::bugcheck_name(*c) {
+                "" => format!("0x{c:X}"),
+                name => format!("0x{c:X} {name}"),
+            })
+            .collect();
+        parts.push(format!("{blue} blue screen{} (stop code {})", if blue == 1 { "" } else { "s" }, names.join(", ")));
+    }
+    if silent > 0 {
+        parts.push(format!("{silent} sudden restart{} or power loss with no blue screen", if silent == 1 { "" } else { "s" }));
+    }
+    let times: Vec<i64> = crashes.iter().map(|e| e.unix_time).collect();
+    let text = format!(
+        "Windows event log: this PC went down without shutting down {}: {}.",
+        when_text(&times, now, i64::MAX),
+        parts.join(" and ")
+    );
+    Some((if crashes.len() >= 2 { Severity::Medium } else { Severity::Low }, text))
+}
+
 struct HardwareFinding {
     key: String,
     severity: Severity,
@@ -550,7 +599,8 @@ struct HardwareFinding {
 }
 
 /// One finding per failing component from the WHEA events Windows logged.
-fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], now: i64, run_start: i64) -> Vec<HardwareFinding> {
+/// `stalls` are the wall-clock times (Unix seconds) of this run's stalls and flagged moments.
+fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], stalls: &[i64], now: i64, run_start: i64) -> Vec<HardwareFinding> {
     // PCIe errors are grouped per bus address; everything else per kind.
     let mut groups: Vec<(HardwareKind, Option<PciAddress>)> = events
         .iter()
@@ -631,6 +681,14 @@ fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], now: i64, 
                 Severity::Medium,
             ),
             HardwareKind::Other => continue,
+        };
+        // An error is handled in firmware while the rest of the PC waits, so a stall at the same
+        // moment is cause and effect, not coincidence.
+        let hits = coinciding(stalls, &times);
+        let evidence = if hits > 0 {
+            format!("{evidence} {hits} of this run's stalls / flagged moments happened within {COINCIDE_S} seconds of one of these errors.")
+        } else {
+            evidence
         };
         out.push(HardwareFinding { key, severity: if during { Severity::High } else { floor }, title, evidence, advice });
     }
@@ -1023,8 +1081,44 @@ impl Analyzer {
         // ---- Hardware errors Windows logged (WHEA) ----------------------------------------------
         let hardware_log = evlog::hardware_events(EVENT_LOG_DAYS);
         if !hardware_log.is_empty() {
-            for f in hardware_findings(&hardware_log, &pci::devices(), now_unix, run_start_unix) {
+            // QPC -> wall clock, anchored at "now"; good to well under the 2 s matching window.
+            let (qpc_now, freq) = (qpc(), qpc_freq());
+            let wall = |ticks: i64| now_unix - (qpc_now - ticks) / freq;
+            let stall_times: Vec<i64> = self.incidents.iter().map(|i| wall(i.start)).collect();
+            let whea_times: Vec<i64> = hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).map(|e| e.unix_time).collect();
+            for f in hardware_findings(&hardware_log, &pci::devices(), &stall_times, now_unix, run_start_unix) {
                 found.add(&f.key, f.severity, f.title, f.evidence, f.advice.to_string(), 0);
+            }
+            // "The CPU went dark" is exactly what firmware handling a hardware error looks like.
+            let dark: Vec<i64> = self.incidents.iter().filter(|i| i.culprit.starts_with("CPU went dark")).map(|i| wall(i.start)).collect();
+            let explained = coinciding(&dark, &whea_times);
+            if explained > 0 {
+                let keys: Vec<String> = found.0.iter().map(|(k, _)| k.clone()).filter(|k| k.starts_with("CPU went dark")).collect();
+                for key in keys {
+                    found.note(
+                        &key,
+                        format!(
+                            "{explained} of these happened within {COINCIDE_S} seconds of a hardware error Windows logged (see the hardware \
+                             finding): the firmware was busy handling that error."
+                        ),
+                    );
+                }
+            }
+        }
+
+        // ---- Crashes and sudden power loss ----------------------------------------------------------
+        let shutdown_log = evlog::unexpected_shutdowns(EVENT_LOG_DAYS);
+        if let Some((sev, text)) = shutdown_finding(&shutdown_log, now_unix) {
+            // A fatal hardware error already explains a crash; otherwise it stands alone.
+            if !found.note("whea fatal", text.clone()) {
+                found.add(
+                    "unexpected shutdowns",
+                    sev,
+                    "This PC crashed or lost power unexpectedly".into(),
+                    text,
+                    SHUTDOWN_ADVICE.into(),
+                    0,
+                );
             }
         }
 
@@ -1086,6 +1180,31 @@ impl Analyzer {
                 THROTTLE_ADVICE.into(),
                 ms_to_ticks(1000.0) * throttled.len() as i64,
             );
+        }
+
+        // Windows logs when firmware (not the OS) caps the processor. Some PCs log it at every boot,
+        // so older entries only back up a throttling finding; one during the run stands by itself.
+        let firmware_caps = evlog::firmware_throttle_times(EVENT_LOG_DAYS);
+        let caps_during = firmware_caps.iter().filter(|t| **t >= run_start_unix).count();
+        if !firmware_caps.is_empty() {
+            let text = format!(
+                "Windows event log: firmware limited the processor's speed (Kernel-Processor-Power event 37), {}.",
+                when_text(&firmware_caps, now_unix, run_start_unix)
+            );
+            if found.note("throttling", text.clone()) {
+                if caps_during > 0 {
+                    found.raise("throttling", Severity::High);
+                }
+            } else if caps_during > 0 {
+                found.add(
+                    "throttling",
+                    Severity::Medium,
+                    "CPU throttling  -  firmware is limiting the processor's speed".into(),
+                    text,
+                    THROTTLE_ADVICE.into(),
+                    0,
+                );
+            }
         }
 
         // ---- Say which device each blamed driver belongs to, and how old the driver is ----------
@@ -1231,6 +1350,8 @@ impl Analyzer {
         d!("WINDOWS EVENT LOG  (last {EVENT_LOG_DAYS} days)");
         d!("  storage errors (resets, retries, bad blocks): {}", storage_log.len());
         d!("  graphics driver resets: {}", display_log.len());
+        d!("  crashes / sudden power loss: {}", shutdown_log.iter().filter(|e| e.bugcheck != 0 || !e.power_button).count());
+        d!("  firmware limited the processor's speed: {}", firmware_caps.len());
         d!(
             "  hardware errors (WHEA: memory, processor, PCI Express): {}",
             hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).count()
@@ -1326,7 +1447,7 @@ mod tests {
             ev(now - 60_000, 5, HardwareKind::Other, None, None),
         ];
         let devices = vec![PciDevice { bus: 1, device: 0, function: 0, name: "NVIDIA GeForce RTX 4090".into() }];
-        let f = hardware_findings(&events, &devices, now, now - 600);
+        let f = hardware_findings(&events, &devices, &[now - 49, now - 300], now, now - 600);
         assert_eq!(f.len(), 3, "memory, processor, one PCIe address; 'other' ignored");
 
         let mem = f.iter().find(|f| f.key == "whea memory").unwrap();
@@ -1348,7 +1469,9 @@ mod tests {
             "{}",
             gpu.evidence
         );
-        assert!(hardware_findings(&[], &devices, now, now - 600).is_empty());
+        assert!(mem.evidence.contains("1 of this run's stalls / flagged moments happened within 2 seconds"), "{}", mem.evidence);
+        assert!(!cpu.evidence.contains("within 2 seconds"), "no stall near the processor error");
+        assert!(hardware_findings(&[], &devices, &[], now, now - 600).is_empty());
     }
 
     #[test]
@@ -1434,6 +1557,24 @@ mod tests {
         assert_eq!(gpu.advice, "a", "a current driver gets no 'update it' advice");
         assert_eq!(f("driver wdfilter.sys").title, "wdfilter.sys  -  Microsoft Defender filter", "no device: unchanged");
         assert_eq!(f("disk 1").title, "Disk 1  -  responding slowly");
+    }
+
+    #[test]
+    fn crashes_are_summarized_and_forced_power_offs_alone_are_not() {
+        let now = 3_000_000;
+        let ev = |ago, bugcheck, power_button| UnexpectedShutdown { unix_time: now - ago, bugcheck, power_button };
+        let (sev, text) = shutdown_finding(&[ev(90_000, 0x9F, false), ev(200_000, 0, false), ev(300_000, 0, true)], now).unwrap();
+        assert_eq!(sev, Severity::Medium);
+        assert!(
+            text.contains("2 times in the last 7 days") && text.contains("1 blue screen (stop code 0x9F DRIVER_POWER_STATE_FAILURE)"),
+            "{text}"
+        );
+        assert!(text.contains("1 sudden restart or power loss with no blue screen") && !text.contains("while monitoring"), "{text}");
+        assert_eq!(shutdown_finding(&[ev(100, 0x999, false)], now).unwrap().0, Severity::Low);
+        assert!(shutdown_finding(&[ev(100, 0x999, false)], now).unwrap().1.contains("stop code 0x999)"));
+        assert!(shutdown_finding(&[ev(100, 0, true)], now).is_none(), "held power button only");
+        assert_eq!(coinciding(&[100, 200, 300], &[102, 297, 1000]), 1, "3 s apart is outside the window");
+        assert_eq!(coinciding(&[100, 200, 300], &[102, 298, 1000]), 2);
     }
 
     #[test]
