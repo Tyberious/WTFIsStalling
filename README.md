@@ -120,6 +120,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+RustRover / IntelliJ users get ready-made run targets from the `.run/` folder: the GUI (normal,
+elevated-and-debuggable, or UI-only), 30-second CLI captures, and the same test / clippy / fmt checks
+CI runs.
+
 Working on the window without elevation: set `WTFIS_SKIP_ELEVATION=1` (monitoring itself will fail
 with "access denied", which is also how to test that path).
 
