@@ -58,7 +58,8 @@ pub struct Summary {
     pub headline: String,
     /// One sentence backing the headline (the top finding's evidence, or reassurance).
     pub subline: String,
-    pub overview: String,
+    /// Short "label: value" lines: duration, stall counts, worst delays.
+    pub overview: Vec<String>,
     pub findings: Vec<Finding>,
     /// Supporting tables, already formatted.
     pub details: Vec<String>,
@@ -101,7 +102,7 @@ impl Summary {
         out.push(format!("  >>> {tag}: {}", self.headline));
         wrap(&self.subline, "      ", &mut out);
         out.push(String::new());
-        out.push(format!("  {}", self.overview));
+        out.extend(self.overview.iter().map(|l| format!("  {l}")));
         for (i, f) in self.findings.iter().enumerate() {
             out.push(String::new());
             out.push(format!("  {}. [{}] {}", i + 1, f.severity.label(), f.title));
@@ -166,7 +167,7 @@ impl Summary {
             health,
             headline,
             subline,
-            overview: "Monitored 05:12  |  demo data, not a real measurement".into(),
+            overview: vec!["Monitored:        05:12".into(), "Note:             demo data, not a real measurement".into()],
             findings,
             details: vec![String::new(), "(demo: no details)".into()],
         }
@@ -279,7 +280,7 @@ impl Analyzer {
             let sev = if *n >= 3 || *worst >= ms_to_ticks(15.0) { Severity::High } else { Severity::Medium };
             let stalls = format!("{n} stall{} (worst {}, {} in total)", if *n == 1 { "" } else { "s" }, fmt_dur(*worst), fmt_dur(*total));
             if let Some(m) = culprit.strip_prefix("driver ") {
-                let what = self.modules.describe(m);
+                let what = self.modules.describe_short(m);
                 let advice = knowledge(m).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
                 found.add(culprit, sev, format!("{m}  -  {what}"), format!("Blamed for {stalls}."), advice.into(), *total);
             } else if culprit.starts_with("CPU went dark") {
@@ -344,14 +345,18 @@ impl Analyzer {
         }
         let marks_total = self.marks_total;
         for (culprit, (n, worst)) in &marked {
-            let sev = if *n >= 3 { Severity::High } else { Severity::Medium };
+            let sev = match *n {
+                1 => Severity::Low,
+                2 => Severity::Medium,
+                _ => Severity::High,
+            };
             let evidence = format!(
                 "Was interrupting a CPU core (for up to {}) at {n} of the {marks_total} moment{} you flagged with 'I felt it'.",
                 fmt_dur(*worst),
                 if marks_total == 1 { "" } else { "s" }
             );
             if let Some(m) = culprit.strip_prefix("driver ") {
-                let what = self.modules.describe(m);
+                let what = self.modules.describe_short(m);
                 let advice = knowledge(m).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
                 found.add(culprit, sev, format!("{m}  -  {what}"), evidence, advice.into(), *worst * *n as i64);
             } else if let Some(p) = culprit.strip_prefix("process ") {
@@ -371,7 +376,7 @@ impl Analyzer {
                 Severity::Low,
                 "Hitches you flagged that left no trace on the CPU side".into(),
                 format!(
-                    "At {} of the {marks_total} moment{} you flagged, no CPU core was interrupted for even 1 ms and nothing else stood out.",
+                    "At {} of the {marks_total} moment{} you flagged, no CPU core was held up long enough to feel (3 ms) and nothing else stood out.",
                     self.marks_clean,
                     if marks_total == 1 { "" } else { "s" }
                 ),
@@ -406,7 +411,7 @@ impl Analyzer {
                 continue;
             }
             let sev = if worst >= ms_to_ticks(4.0) && a.over >= 3 { Severity::High } else { Severity::Medium };
-            let what = self.modules.describe(name);
+            let what = self.modules.describe_short(name);
             let advice = knowledge(name).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
             found.add(
                 &format!("driver {name}"),
@@ -556,15 +561,19 @@ impl Analyzer {
         // ---- Verdict -----------------------------------------------------------------
         let kernel_stalls = self.incidents.iter().filter(|i| !i.marked && i.kind == StallKind::Kernel).count();
         let sched_stalls = self.incidents.iter().filter(|i| !i.marked).count() - kernel_stalls;
-        let marks_txt = if marks_total > 0 { format!(", {marks_total} moment(s) flagged by you") } else { String::new() };
         let secs = elapsed_s as u64;
-        let overview = format!(
-            "Monitored {:02}:{:02}  |  {kernel_stalls} kernel-level stall(s), {sched_stalls} CPU-starvation stall(s){marks_txt}  |  worst wake-up delay {} (real-time thread), {} (normal thread)",
-            secs / 60,
-            secs % 60,
+        let mut overview = vec![
+            format!("Monitored:        {:02}:{:02}", secs / 60, secs % 60),
+            format!("Stalls detected:  {kernel_stalls} kernel-level, {sched_stalls} CPU-starvation"),
+        ];
+        if marks_total > 0 {
+            overview.push(format!("Flagged by you:   {marks_total} moment(s), {} with nothing on the system side", self.marks_clean));
+        }
+        overview.push(format!(
+            "Worst wake-up:    {} real-time thread, {} normal thread",
             fmt_dur(stats.max_kernel.load(Ordering::Relaxed)),
             fmt_dur(stats.max_sched.load(Ordering::Relaxed))
-        );
+        ));
 
         let more =
             |n: usize| if n > 1 { format!("  (+{} more finding{} below)", n - 1, if n == 2 { "" } else { "s" }) } else { String::new() };
@@ -605,7 +614,7 @@ impl Analyzer {
         if health == Health::Ok && self.marks_clean > 0 {
             headline = "The hitches you flagged did not come from drivers, interrupts or the CPU".to_string();
             subline = format!(
-                "At {} of the {marks_total} moment(s) you flagged, no CPU core was interrupted for even 1 ms and no disk, paging or \
+                "At {} of the {marks_total} moment(s) you flagged, no CPU core was held up long enough to feel and no disk, paging or \
                  throttling problem showed up. That clears the system side: look inside the app or at the GPU (shader compilation, \
                  VRAM running out, frame pacing, overlays).",
                 self.marks_clean

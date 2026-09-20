@@ -33,6 +33,9 @@ pub fn mark_now() {
 const MARK_BEFORE_MS: f64 = 3000.0;
 /// ...and a little past it, in case they anticipated a periodic one.
 const MARK_AFTER_MS: f64 = 300.0;
+/// Every healthy PC shows 1-2 ms wake-up blips all day; nobody feels those. A flagged moment
+/// is only pinned on an interruption at least this long (or the stall threshold, if lower).
+const MARK_MIN_MS: f64 = 3.0;
 /// How long sub-threshold wake-up delays are kept for marks to draw on.
 const MINOR_KEEP_MS: f64 = 30_000.0;
 
@@ -244,11 +247,17 @@ impl Analyzer {
             return;
         }
 
-        let in_window: Vec<Stall> =
+        let blips: Vec<Stall> =
             self.minor.iter().filter(|s| s.kind == StallKind::Kernel && s.end >= from && s.start <= to).copied().collect();
+        let noise = blips.iter().map(|s| s.end - s.start).max().unwrap_or(0);
+        let in_window: Vec<Stall> = blips.into_iter().filter(|s| s.end - s.start >= ms_to_ticks(MARK_MIN_MS)).collect();
         let Some(worst) = in_window.iter().max_by_key(|s| s.end - s.start).copied() else {
             let ev = self.gather(from, to, from, caught_up);
-            say!("    No CPU was interrupted for even 1 ms in that window, so drivers, interrupts and firmware are in the clear.");
+            say!(
+                "    No CPU core was held up for {MARK_MIN_MS:.0} ms or more in that window (longest blip: {}, normal background noise),",
+                fmt_dur(noise)
+            );
+            say!("    so drivers, interrupts and firmware are in the clear for this one.");
             self.print_longest_execs(&ev);
             self.print_io_context(&ev);
             let all: Vec<&(SampleRec, u32)> = ev.samples.iter().collect();
@@ -267,13 +276,15 @@ impl Analyzer {
         let start = cluster.iter().map(|s| s.start).min().unwrap();
         let end = cluster.iter().map(|s| s.end).max().unwrap();
         let dur = worst.end - worst.start;
+        let offset_s = ticks_to_ms(t - worst.start) / 1000.0;
         say!(
-            "    {} brief CPU interruption(s) in that window; the worst held CPU {} for {} at {} ({:.1} s before your mark)",
+            "    {} CPU interruption(s) in that window; the worst held CPU {} for {} at {} ({:.1} s {} your mark)",
             in_window.len(),
             worst.cpu.unwrap_or(0),
             fmt_dur(dur),
             clock().fmt(worst.start),
-            ticks_to_ms(t - worst.start) / 1000.0
+            offset_s.abs(),
+            if offset_s >= 0.0 { "before" } else { "after" }
         );
         let ev = self.gather(start - ms_to_ticks(0.5), end, from, caught_up);
         let culprit = self.verdict_kernel(&cluster, &ev);
@@ -304,16 +315,18 @@ impl Analyzer {
         for s in stalls {
             let cpu = s.cpu.unwrap_or(0);
             stalled += s.end - s.start;
+            let mut spans: Vec<(i64, i64)> = Vec::new();
             for e in ev.execs.iter().filter(|e| e.cpu == cpu) {
                 let overlap = e.end.min(s.end) - e.start.max(s.start);
                 if overlap > 0 {
-                    covered += overlap;
+                    spans.push((e.start.max(s.start), e.end.min(s.end)));
                     let r = by_routine.entry((e.routine, e.kind)).or_default();
                     r.0 += overlap;
                     r.1 = r.1.max(e.end - e.start);
                     r.2 += 1;
                 }
             }
+            covered += union_len(&mut spans);
             let in_window: Vec<_> = ev.samples.iter().filter(|(x, _)| x.cpu == cpu && x.ts >= s.start && x.ts <= s.end).collect();
             let rate = *ev.baseline.get(&cpu).unwrap_or(&0) as f64 / BASELINE_MS;
             seen_samples += in_window.len() as f64;
@@ -333,7 +346,7 @@ impl Analyzer {
         let (on_cpu_procs, on_cpu_mods) = self.sample_breakdown(&window_samples);
 
         let culprit = if let (true, Some((module, _))) = (coverage >= 0.35, &top_module) {
-            let what = self.modules.describe(module);
+            let what = self.modules.describe_short(module);
             say!("    VERDICT: {module} [{what}] kept the CPU in DPC/ISR code for {:.0}% of the stall", coverage * 100.0);
             format!("driver {module}")
         } else if self.profile && expected_samples >= 3.0 && seen_samples < expected_samples * 0.3 {
@@ -344,7 +357,7 @@ impl Analyzer {
             say!("             running with interrupts disabled. Think BIOS update/settings and failing or misbehaving hardware.");
             "CPU went dark (firmware SMI / hypervisor / interrupts off)".to_string()
         } else if let Some((m, share)) = on_cpu_mods.first().filter(|(_, share)| *share >= 0.4) {
-            let what = self.modules.describe(m);
+            let what = self.modules.describe_short(m);
             say!("    VERDICT: {m} [{what}] was executing for {:.0}% of the stall at raised IRQL (not as a DPC/ISR,", share * 100.0);
             say!("             e.g. holding a spinlock or inside a long driver call), which blocks every thread on that CPU");
             format!("driver {m}")
@@ -412,6 +425,11 @@ impl Analyzer {
         let mut named: HashMap<String, u32> = HashMap::new();
         for ((pid, tid), n) in procs {
             *named.entry(self.procs.label(pid, tid)).or_default() += n;
+        }
+        // Our own probe threads are, by design, what gets interrupted; they are never the cause.
+        let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+        if let Some(own) = own {
+            named.retain(|name, _| !name.to_lowercase().starts_with(&own));
         }
         let to_sorted = |m: HashMap<String, u32>| {
             let mut v: Vec<_> = m.into_iter().map(|(k, n)| (k, n as f64 / total)).collect();
@@ -532,10 +550,35 @@ impl Analyzer {
     }
 }
 
+/// Total length covered by possibly overlapping intervals. ISRs interrupt DPCs, so their
+/// intervals nest; summing them would count the same instant twice.
+fn union_len(spans: &mut [(i64, i64)]) -> i64 {
+    spans.sort_unstable();
+    let (mut covered, mut reach) = (0, i64::MIN);
+    for &(from, to) in spans.iter() {
+        covered += (to - from.max(reach)).max(0);
+        reach = reach.max(to);
+    }
+    covered
+}
+
 fn op_name(op: u8) -> &'static str {
     match op {
         b'R' => "read",
         b'W' => "write",
         _ => "flush",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_and_overlapping_intervals_are_counted_once() {
+        // A 100-tick DPC with two ISRs inside it, a partial overlap, and a separate run.
+        let mut spans = vec![(0, 100), (10, 20), (50, 60), (90, 130), (200, 250)];
+        assert_eq!(union_len(&mut spans), 130 + 50);
+        assert_eq!(union_len(&mut []), 0);
     }
 }

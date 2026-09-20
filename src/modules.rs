@@ -111,6 +111,15 @@ impl ModuleMap {
         }
     }
 
+    /// `describe` without the parenthesized elaboration, for headlines and one-line verdicts.
+    pub fn describe_short(&mut self, name: &str) -> String {
+        let full = self.describe(name);
+        match full.find(" (") {
+            Some(i) if i > 0 => full[..i].to_string(),
+            _ => full,
+        }
+    }
+
     /// One-line explanation of what a module is: knowledge base first, then the
     /// file's own version resource (vendor + description).
     pub fn describe(&mut self, name: &str) -> String {
