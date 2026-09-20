@@ -12,6 +12,7 @@ use crate::cpuclock::ClockSample;
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskwhy::{known_worker, Cause, DiskWhy};
 use crate::evlog::{self, HardwareEvent, HardwareKind};
+use crate::health::{self, DriveHealth};
 use crate::modules::knowledge;
 use crate::pci::{self, PciDevice};
 use crate::period;
@@ -195,6 +196,21 @@ impl Findings {
         }
     }
 
+    fn raise(&mut self, key: &str, severity: Severity) {
+        if let Some((_, f)) = self.0.iter_mut().find(|(k, _)| k == key) {
+            f.severity = f.severity.max(severity);
+        }
+    }
+
+    /// More to try for a subject that is already a finding.
+    fn advise(&mut self, key: &str, advice: &str) {
+        if let Some((_, f)) = self.0.iter_mut().find(|(k, _)| k == key) {
+            if !f.advice.contains(advice) {
+                f.advice = format!("{} {advice}", f.advice.trim_end());
+            }
+        }
+    }
+
     /// Extra evidence for a subject that is already a finding. Returns whether it was.
     fn note(&mut self, key: &str, evidence: String) -> bool {
         match self.0.iter_mut().find(|(k, _)| k == key) {
@@ -350,6 +366,127 @@ fn why_sentences(why: &DiskWhy) -> Vec<String> {
     out
 }
 
+const DRIVE_FAILING_ADVICE: &str = "The drive itself reports damage. Back up everything on it now, before doing anything else, then \
+    replace it; drives in this state fail without further warning, and every retry on a bad spot is a freeze.";
+
+const DRIVE_HOT_ADVICE: &str = "The drive is hot enough to slow itself down, which shows up as hitches during loading and saving. Fit \
+    an M.2 heatsink (many motherboards ship one that is easy to leave off), improve case airflow, and if it sits directly under the \
+    graphics card consider another M.2 slot.";
+
+const DRIVE_CABLE_ADVICE: &str = "CRC errors mean data was damaged between the drive and the motherboard, not on the drive: replace \
+    the SATA cable (they do go bad), make sure both ends click in, and try another SATA port.";
+
+/// What a drive's own health data says, as (severity, sentence, what to try).
+fn health_findings(spinning: bool, start: Option<&DriveHealth>, end: &DriveHealth) -> Vec<(Severity, String, &'static str)> {
+    let mut out = Vec::new();
+    if let Some(n) = &end.nvme {
+        let before = start.and_then(|s| s.nvme.as_ref());
+        let problems: Vec<&str> = [
+            (1, "its spare capacity is running out"),
+            (2, "it is over (or under) its temperature limit"),
+            (4, "its reliability is degraded by media errors"),
+            (8, "it has switched to read-only mode"),
+            (16, "its power-loss protection has failed"),
+        ]
+        .iter()
+        .filter(|(bit, _)| n.critical_warning & bit != 0)
+        .map(|(_, text)| *text)
+        .collect();
+        if !problems.is_empty() {
+            let advice = if n.critical_warning & !2 != 0 { DRIVE_FAILING_ADVICE } else { DRIVE_HOT_ADVICE };
+            out.push((
+                Severity::High,
+                format!("Drive health: the drive has raised its own critical warning: {}.", problems.join("; ")),
+                advice,
+            ));
+        }
+        if n.media_errors > 0 {
+            out.push((
+                Severity::Medium,
+                format!("Drive health: {} unrecoverable media error(s) recorded over its life.", n.media_errors),
+                DRIVE_FAILING_ADVICE,
+            ));
+        }
+        if n.percent_used >= 100 {
+            out.push((
+                Severity::Medium,
+                format!("Drive health: it has used {}% of its rated write endurance, so it is past its designed life.", n.percent_used),
+                DRIVE_FAILING_ADVICE,
+            ));
+        }
+        let throttled = before.map_or(0, |b| n.throttle_seconds.saturating_sub(b.throttle_seconds));
+        let over_temp = before.map_or(0, |b| n.warning_temp_minutes.saturating_sub(b.warning_temp_minutes));
+        if throttled > 0 || over_temp > 0 {
+            let what = if throttled > 0 {
+                format!("spent {throttled} s slowed down by heat")
+            } else {
+                "was over its warning temperature".to_string()
+            };
+            out.push((Severity::High, format!("Drive health: it {what} while monitoring (now {} °C).", n.temperature_c), DRIVE_HOT_ADVICE));
+        } else if n.temperature_c >= 70 {
+            out.push((
+                Severity::Medium,
+                format!("Drive health: it is at {} °C. NVMe drives slow themselves down from roughly 70-80 °C.", n.temperature_c),
+                DRIVE_HOT_ADVICE,
+            ));
+        } else if n.warning_temp_minutes > 0 || n.throttle_seconds >= 600 {
+            out.push((
+                Severity::Low,
+                format!(
+                    "Drive health: over its life it has spent {} min above its warning temperature and {} min slowed down by heat (now {} °C).",
+                    n.warning_temp_minutes,
+                    n.throttle_seconds / 60,
+                    n.temperature_c
+                ),
+                DRIVE_HOT_ADVICE,
+            ));
+        }
+    }
+    if let Some(sata) = &end.sata {
+        let before = start.and_then(|s| s.sata.as_ref());
+        let damaged: Vec<String> =
+            [(sata.reallocated, "reallocated"), (sata.pending, "pending (unreadable)"), (sata.uncorrectable, "uncorrectable")]
+                .iter()
+                .filter_map(|(v, name)| v.filter(|v| *v > 0).map(|v| format!("{v} {name}")))
+                .collect();
+        if !damaged.is_empty() {
+            let total: u64 = [sata.reallocated, sata.pending, sata.uncorrectable].iter().flatten().sum();
+            let sev = if total >= 50 || sata.pending.unwrap_or(0) > 0 { Severity::High } else { Severity::Medium };
+            out.push((sev, format!("Drive health (SMART): bad sectors: {}.", damaged.join(", ")), DRIVE_FAILING_ADVICE));
+        }
+        if let Some(crc) = sata.crc_errors.filter(|c| *c > 0) {
+            let new = before.and_then(|b| b.crc_errors).map_or(0, |b| crc.saturating_sub(b));
+            if new > 0 {
+                out.push((
+                    Severity::High,
+                    format!("Drive health (SMART): {new} new CRC error(s) while monitoring ({crc} in total)."),
+                    DRIVE_CABLE_ADVICE,
+                ));
+            } else {
+                out.push((
+                    Severity::Low,
+                    format!("Drive health (SMART): {crc} CRC error(s) over its life; none while monitoring. Only a problem if the number keeps rising."),
+                    DRIVE_CABLE_ADVICE,
+                ));
+            }
+        }
+    }
+    if end.nvme.is_none() {
+        let limit = if spinning { 55 } else { 70 };
+        if let Some(t) = end.temperature().filter(|t| *t >= limit) {
+            out.push((Severity::Medium, format!("Drive health: it is at {t} °C, which is hot for this kind of drive."), DRIVE_HOT_ADVICE));
+        }
+    }
+    out
+}
+
+const DISPLAY_RESET_ADVICE: &str = "The graphics driver stopped answering for about two seconds, so Windows restarted it: that is a \
+    freeze of several seconds, often with a black flash, and sometimes the game crashes. In order of likelihood: remove any GPU \
+    overclock or undervolt (including factory-overclock tuning in Afterburner or the vendor app); clean-install the graphics driver \
+    (use DDU, then the current or the previous driver version); check GPU temperatures and that every PCIe power plug is fully \
+    seated, using separate cables rather than one daisy-chained cable; lower in-game settings that fill the VRAM. If it happens at \
+    stock settings in every game, suspect the power supply or the card.";
+
 const MEMORY_ERROR_ADVICE: &str = "The PC corrected these errors, but each one pauses everything briefly and they are a warning sign: \
     uncorrected ones crash programs and corrupt files. The usual cause is a memory overclock profile that is not quite stable: in the \
     BIOS turn XMP / EXPO / DOCP off (or lower the memory speed one step) and monitor again. Update the BIOS. If errors continue at \
@@ -468,6 +605,29 @@ fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], now: i64, 
         out.push(HardwareFinding { key, severity: if during { Severity::High } else { floor }, title, evidence, advice });
     }
     out
+}
+
+/// "56 °C  |  1% of rated life used  |  spare 100%  |  0 media errors  |  16169 h powered on"
+fn health_line(h: &DriveHealth) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = h.temperature() {
+        parts.push(format!("{t} °C"));
+    }
+    if let Some(n) = &h.nvme {
+        parts.push(format!("{}% of rated life used", n.percent_used));
+        parts.push(format!("spare {}%", n.spare_percent));
+        parts.push(format!("{} media errors", n.media_errors));
+        parts.push(format!("{} min over temperature", n.warning_temp_minutes + n.critical_temp_minutes));
+        parts.push(format!("{} h powered on", n.power_on_hours));
+    }
+    if let Some(s) = &h.sata {
+        let show = |v: Option<u64>| v.map_or("n/a".to_string(), |v| v.to_string());
+        parts.push(format!("reallocated {}", show(s.reallocated)));
+        parts.push(format!("pending {}", show(s.pending)));
+        parts.push(format!("uncorrectable {}", show(s.uncorrectable)));
+        parts.push(format!("CRC errors {}", show(s.crc_errors)));
+    }
+    parts.join("  |  ")
 }
 
 /// "3 times in the last 7 days (1 while monitoring), most recently 2 day(s) ago"
@@ -781,6 +941,54 @@ impl Analyzer {
             }
         }
 
+        // ---- What the drives say about themselves ------------------------------------------------
+        let mut health_lines: Vec<String> = Vec::new();
+        for n in self.disks.present() {
+            let disk = self.disks.get(n).clone();
+            let now = health::read(n, disk.bus);
+            if now.is_empty() {
+                health_lines.push(format!(
+                    "  disk {n:<3} not readable ({})",
+                    if disk.bus == "USB" { "USB enclosures usually block it" } else { "driver refused" }
+                ));
+                continue;
+            }
+            health_lines.push(format!("  disk {n:<3} {}", health_line(&now)));
+            let key = format!("disk {n}");
+            for (sev, text, advice) in health_findings(disk.spinning == Some(true), self.health_at_start.get(&n), &now) {
+                if found.note(&key, text.clone()) {
+                    found.raise(&key, sev);
+                    found.advise(&key, advice);
+                } else {
+                    found.add(&key, sev, format!("{}  -  drive health warning", disk.title()), text, advice.to_string(), 0);
+                }
+            }
+        }
+
+        // ---- Graphics driver resets (TDR) ---------------------------------------------------------
+        let display_log = evlog::display_resets(EVENT_LOG_DAYS);
+        let mut reset_drivers: Vec<String> = display_log.iter().map(|e| e.driver.to_lowercase()).collect();
+        reset_drivers.sort();
+        reset_drivers.dedup();
+        for driver in reset_drivers {
+            let times: Vec<i64> = display_log.iter().filter(|e| e.driver.eq_ignore_ascii_case(&driver)).map(|e| e.unix_time).collect();
+            let file = format!("{driver}.sys");
+            let what = knowledge(&file).map_or("graphics driver", |k| k.what);
+            let text = format!(
+                "Windows event log: the graphics driver stopped responding and was reset (event 4101), {}.",
+                when_text(&times, now_unix, run_start_unix)
+            );
+            let sev = if times.iter().any(|t| *t >= run_start_unix) { Severity::High } else { Severity::Medium };
+            // Same subject as a driver blamed for stalls, so both land in one finding.
+            let key = found.0.iter().map(|(k, _)| k.clone()).find(|k| k.eq_ignore_ascii_case(&file)).unwrap_or(file.clone());
+            if found.note(&key, text.clone()) {
+                found.raise(&key, sev);
+                found.advise(&key, DISPLAY_RESET_ADVICE);
+            } else {
+                found.add(&key, sev, format!("{file}  -  {what}: it hung and was reset"), text, DISPLAY_RESET_ADVICE.to_string(), 0);
+            }
+        }
+
         // ---- Hardware errors Windows logged (WHEA) ----------------------------------------------
         let hardware_log = evlog::hardware_events(EVENT_LOG_DAYS);
         if !hardware_log.is_empty() {
@@ -970,9 +1178,15 @@ impl Analyzer {
                 }
             }
         }
+        if !health_lines.is_empty() {
+            d!("");
+            d!("DRIVE HEALTH  (what each drive reports about itself)");
+            details.extend(health_lines);
+        }
         d!("");
         d!("WINDOWS EVENT LOG  (last {EVENT_LOG_DAYS} days)");
         d!("  storage errors (resets, retries, bad blocks): {}", storage_log.len());
+        d!("  graphics driver resets: {}", display_log.len());
         d!(
             "  hardware errors (WHEA: memory, processor, PCI Express): {}",
             hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).count()
@@ -1091,6 +1305,34 @@ mod tests {
             gpu.evidence
         );
         assert!(hardware_findings(&[], &devices, now, now - 600).is_empty());
+    }
+
+    #[test]
+    fn drive_health_separates_what_happened_now_from_lifetime_totals() {
+        use crate::health::{NvmeHealth, SataSmart};
+        let nvme = |temperature_c, throttle_seconds, media_errors| DriveHealth {
+            nvme: Some(NvmeHealth { temperature_c, throttle_seconds, media_errors, spare_percent: 100, ..Default::default() }),
+            ..Default::default()
+        };
+        assert!(health_findings(false, Some(&nvme(45, 0, 0)), &nvme(48, 0, 0)).is_empty(), "a healthy drive says nothing");
+
+        let f = health_findings(false, Some(&nvme(60, 100, 0)), &nvme(78, 130, 0));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].0 == Severity::High && f[0].1.contains("30 s slowed down by heat while monitoring"), "{}", f[0].1);
+
+        let f = health_findings(false, None, &nvme(74, 5000, 2));
+        assert!(f.iter().any(|x| x.0 == Severity::Medium && x.1.contains("2 unrecoverable media error")));
+        assert!(f.iter().any(|x| x.1.contains("74 °C") && x.2 == DRIVE_HOT_ADVICE), "hot now, no baseline to compare");
+
+        let sata = |crc, pending| DriveHealth {
+            sata: Some(SataSmart { crc_errors: Some(crc), pending: Some(pending), reallocated: Some(0), ..Default::default() }),
+            ..Default::default()
+        };
+        let f = health_findings(true, Some(&sata(10, 0)), &sata(10, 0));
+        assert!(f.len() == 1 && f[0].0 == Severity::Low && f[0].1.contains("none while monitoring"), "old CRC errors are only a lead");
+        let f = health_findings(true, Some(&sata(10, 0)), &sata(14, 3));
+        assert!(f.iter().any(|x| x.0 == Severity::High && x.1.contains("4 new CRC") && x.2 == DRIVE_CABLE_ADVICE));
+        assert!(f.iter().any(|x| x.0 == Severity::High && x.1.contains("3 pending") && x.2 == DRIVE_FAILING_ADVICE));
     }
 
     #[test]

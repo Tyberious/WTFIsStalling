@@ -126,6 +126,11 @@ impl DiskMap {
         DiskMap::default()
     }
 
+    /// Numbers of the physical disks that exist right now (gaps are normal: USB drives come and go).
+    pub fn present(&mut self) -> Vec<u32> {
+        (0..32).filter(|n| !self.get(*n).model.is_empty() || self.get(*n).size > 0).collect()
+    }
+
     pub fn get(&mut self, number: u32) -> &DiskInfo {
         self.cache.entry(number).or_insert_with(|| query_disk(number))
     }
@@ -143,26 +148,22 @@ pub fn fmt_size(bytes: u64) -> String {
     }
 }
 
-struct Handle(HANDLE);
+pub(crate) struct Handle(HANDLE);
 
 impl Handle {
     /// Zero desired access: enough for the property and geometry ioctls, never reads user data.
-    fn open(path: &str) -> Option<Handle> {
-        let h = unsafe {
-            CreateFileW(
-                wide(path).as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                null(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
-        };
+    pub(crate) fn open(path: &str) -> Option<Handle> {
+        Handle::open_with(path, 0)
+    }
+
+    /// SMART and some protocol commands insist on a read/write handle (they still read no user data).
+    pub(crate) fn open_with(path: &str, access: u32) -> Option<Handle> {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let h = unsafe { CreateFileW(wide(path).as_ptr(), access, share, null(), OPEN_EXISTING, 0, null_mut()) };
         (h != INVALID_HANDLE_VALUE && !h.is_null()).then_some(Handle(h))
     }
 
-    fn ioctl(&self, code: u32, input: &[u8], out: &mut [u8]) -> Option<usize> {
+    pub(crate) fn ioctl(&self, code: u32, input: &[u8], out: &mut [u8]) -> Option<usize> {
         let mut returned = 0u32;
         let inp = if input.is_empty() { null() } else { input.as_ptr() as *const c_void };
         let ok = unsafe {

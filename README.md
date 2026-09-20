@@ -58,6 +58,8 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware) |
 | **Failing or unstable hardware** | WHEA errors from the System event log, last 7 days: corrected memory errors (unstable XMP/EXPO, bad DIMM), corrected processor errors (undervolt, PBO, overclock), PCI Express link errors with the device named (riser cables, GPU, NVMe), and fatal hardware errors that crashed the PC |
+| **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
+| **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM

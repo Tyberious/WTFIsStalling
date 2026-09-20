@@ -62,6 +62,30 @@ pub fn hardware_events(days: u32) -> Vec<HardwareEvent> {
     query_system("Provider[@Name='Microsoft-Windows-WHEA-Logger']", days).iter().filter_map(|xml| parse_whea(xml)).collect()
 }
 
+/// The graphics driver hung and Windows reset it (event 4101, "display driver stopped responding
+/// and has successfully recovered"): a freeze of several seconds, often with a black flash.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayReset {
+    pub unix_time: i64,
+    /// Driver name without extension, as logged: "nvlddmkm", "amdkmdag", "igfx".
+    pub driver: String,
+}
+
+pub fn display_resets(days: u32) -> Vec<DisplayReset> {
+    query_system("Provider[@Name='Display'] and EventID=4101", days).iter().filter_map(|xml| parse_display_reset(xml)).collect()
+}
+
+fn parse_display_reset(xml: &str) -> Option<DisplayReset> {
+    if !tag_attr(xml, "Provider", "Name")?.eq_ignore_ascii_case("Display") || tag_text(xml, "EventID")?.trim() != "4101" {
+        return None;
+    }
+    let unix_time = parse_iso(&tag_attr(xml, "TimeCreated", "SystemTime")?)?;
+    let event_data = &xml[find_ci(xml, "<EventData")?..];
+    let driver =
+        tag_text(event_data, "Data").map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| "display".to_string());
+    Some(DisplayReset { unix_time, driver })
+}
+
 /// XML of the newest (at most 500) System-log events matching `filter` (an XPath condition on the
 /// System element), returned oldest first. The time filter runs server-side, so the channel is
 /// not walked end to end.
@@ -351,6 +375,16 @@ mod tests {
         // Not WHEA: ignored even with a matching ID.
         assert!(parse_whea(DISK_153_SINGLE).is_none());
         assert_eq!((number("0x1F"), number("31"), number("zz")), (Some(31), Some(31), None));
+    }
+
+    #[test]
+    fn display_driver_reset_names_the_driver() {
+        let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Display'/><EventID \
+                   Qualifiers='0'>4101</EventID><TimeCreated SystemTime='2026-09-18T03:12:45.1234567Z'/><Channel>System</Channel></System>\
+                   <EventData><Data>nvlddmkm</Data><Data></Data></EventData></Event>";
+        assert_eq!(parse_display_reset(xml), Some(DisplayReset { unix_time: 1_789_701_165, driver: "nvlddmkm".into() }));
+        assert!(parse_display_reset(DISK_153_SINGLE).is_none());
+        println!("display_resets(7): {} events", display_resets(7).len());
     }
 
     #[test]

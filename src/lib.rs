@@ -10,6 +10,7 @@ pub mod diskwhy;
 pub mod engine;
 pub mod etw;
 pub mod evlog;
+pub mod health;
 pub mod modules;
 pub mod pci;
 pub mod period;

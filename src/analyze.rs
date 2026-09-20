@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
 use crate::diskwhy::{self, Cause, DiskWhy};
+use crate::health::{self, DriveHealth};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
@@ -50,6 +51,8 @@ pub struct Analyzer {
     pub disks: DiskMap,
     /// Why each disk's slow requests were slow, as far as the traffic around them can tell.
     pub(crate) disk_why: HashMap<u32, DiskWhy>,
+    /// Each drive's own health counters when monitoring began; the summary compares against them.
+    pub(crate) health_at_start: HashMap<u32, DriveHealth>,
     started: i64,
     profile: bool,
     pub(crate) incidents: Vec<IncidentSummary>,
@@ -87,14 +90,17 @@ type Shares = Vec<(String, f64)>;
 impl Analyzer {
     pub fn new(shared: Arc<Shared>, rx: Receiver<Stall>, modules: ModuleMap, profile: bool) -> Analyzer {
         MARKS.lock().unwrap().clear(); // anything flagged before this run started is not about this run
+        let mut disks = DiskMap::new();
+        let health_at_start = disks.present().into_iter().map(|n| (n, health::read(n, disks.get(n).bus))).collect();
         Analyzer {
             shared,
             rx,
             pending: Vec::new(),
             modules,
             procs: ProcNames::new(),
-            disks: DiskMap::new(),
+            disks,
             disk_why: HashMap::new(),
+            health_at_start,
             started: qpc(),
             profile,
             incidents: Vec::new(),
