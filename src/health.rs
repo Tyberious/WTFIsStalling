@@ -192,7 +192,7 @@ fn parse_smart_attributes(d: &[u8]) -> Option<SataSmart> {
     }
     let mut smart = SataSmart::default();
     let mut any = false;
-    for slot in d[2..362].chunks_exact(12) {
+    for slot in (0..30).map(|i| &d[2 + i * 12..14 + i * 12]) {
         let raw = slot[5..11].iter().rev().fold(0u64, |acc, b| (acc << 8) | *b as u64);
         match slot[0] {
             0 => continue,
