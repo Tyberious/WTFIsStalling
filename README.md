@@ -42,6 +42,8 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | --- | --- |
 | ![Cause found (dark theme)](docs/screenshot-result-dark.png) | ![Suspect found (light theme)](docs/screenshot-result-light.png) |
 
+![While monitoring: press "I felt it!" or Ctrl+Shift+F9 when a hitch happens](docs/screenshot-monitoring.png)
+
 *(Screenshots show built-in demo data.)*
 
 ## What it can pin down
