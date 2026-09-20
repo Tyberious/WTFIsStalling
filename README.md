@@ -57,10 +57,10 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware) |
-| **Failing or unstable hardware** | WHEA errors from the System event log, last 7 days: corrected memory errors (unstable XMP/EXPO, bad DIMM), corrected processor errors (undervolt, PBO, overclock), PCI Express link errors with the device named (riser cables, GPU, NVMe), and fatal hardware errors that crashed the PC |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
-| **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
+| **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
+| **Failing or unstable hardware** | WHEA errors from the System event log, last 7 days: corrected memory errors (unstable XMP/EXPO, bad DIMM), corrected processor errors (undervolt, PBO, overclock), PCI Express link errors with the device named (riser cables, GPU, NVMe), and fatal hardware errors that crashed the PC |
 
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
 overflow, frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was
@@ -88,10 +88,13 @@ RESULT
   2. [MEDIUM] Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly
        - 3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware
          80.00A80. D: 93% full.
+       - Why: the disk was busy moving a lot of data (every time). The traffic came from steam.exe
+         (3 GB, 97% of the traffic: Steam downloading, updating or verifying a game).
      What to try: ...
 ====================================================================================================
 DETAILS
-  (who caused the stalls, per-driver DPC/ISR table, hard page faults per process, disk latency)
+  (who caused the stalls, per-driver DPC/ISR table, hard page faults per process, disk latency,
+   drive health, what the Windows event log held)
 
 EVENT LOG (chronological)
 [21:14:07.412] STALL #3  kernel-level (DPC/ISR/firmware)  11.80 ms  on CPU 4
@@ -100,8 +103,10 @@ EVENT LOG (chronological)
 ```
 
 Findings come from stalls (who was blamed), drivers whose DPC/ISR routines run too long even without a
-full stall, programs frozen by paging, and disks answering slowly. **HIGH** means it repeatedly or
-badly stalled the machine, **MEDIUM** is a suspect that can cause crackle and micro-stutter.
+full stall, programs frozen by paging, disks answering slowly, what each drive reports about its own
+health, and hardware, storage and graphics-driver errors in the Windows event log. **HIGH** means it
+repeatedly or badly stalled the machine, or went wrong while you were monitoring; **MEDIUM** is a
+suspect that can cause crackle and micro-stutter; **LOW** is a lead worth knowing about.
 
 ## How it works
 
@@ -130,6 +135,19 @@ through the same verdict logic as a full stall; if there is none, the CPU side i
 
 **CPU clock.** Once a second the "Processor Information" counters are read per core. Only cores that are
 busy are judged: an idle core clocking down is normal, a busy core at half speed is throttling.
+
+**Why a disk was slow.** A completed disk request carries its duration, so its start is known too.
+What else that disk finished while a slow request was outstanding tells a busy disk (the programs
+moving the data are named) from one that had nothing else to do and was slow anyway, which points at
+the drive, its cable or its firmware. A slow first request after seconds of silence is a drive waking
+from sleep.
+
+**Drive health and the Windows event log.** Each drive's temperature and health data (NVMe health log,
+SATA SMART) is read when monitoring starts and again when it stops, so that counters which moved
+during the run (thermal throttling, cable CRC errors) stand apart from lifetime totals. The System
+event log is read for the last 7 days: storage resets and retries, WHEA hardware errors (PCI Express
+errors are mapped to the device in that slot) and graphics driver resets. Drive serial numbers are
+never read, so a report is safe to post.
 
 Individually slow events (DPC ≥ 1 ms, hard fault ≥ 50 ms, disk request ≥ 200 ms) are logged even when no
 probe stalls.
