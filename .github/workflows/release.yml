@@ -73,9 +73,10 @@ jobs:
         shell: pwsh
         run: |
           cd dist
-          Get-FileHash WTFIsStalling.exe, wtfis-cli.exe -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
-            Set-Content SHA256SUMS.txt
+          # LF line endings, so that `sha256sum -c SHA256SUMS.txt` works on Linux, macOS and Git Bash.
+          $lines = Get-FileHash WTFIsStalling.exe, wtfis-cli.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" }
+          [IO.File]::WriteAllText("$PWD/SHA256SUMS.txt", ($lines -join "`n") + "`n")
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
