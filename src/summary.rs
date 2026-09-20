@@ -254,11 +254,20 @@ fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool) -> S
     let main = if logged_errors { None } else { why.and_then(|w| w.main_cause()) };
     match main {
         Some(Cause::Busy) => {
-            let who = why.and_then(|w| w.top_movers(1).into_iter().next()).map_or("the program named above".to_string(), |m| m.0);
-            advice.push_str(&format!(
-                "It was slow because it was busy, so deal with the traffic first: let {who} finish, pause it, or schedule it for when \
-                 you are not using the PC. Keeping that work and your game on different drives also fixes it. "
-            ));
+            let who = why.and_then(|w| w.top_movers(1).into_iter().next()).map(|m| m.0);
+            advice.push_str("It was slow because it was busy, so deal with the traffic first. ");
+            match (&who, who.as_deref().and_then(known_worker)) {
+                // Part of Windows: there is nothing to close or pause, only a setting or patience.
+                (Some(who), Some(w)) if w.windows => {
+                    advice.push_str(&format!("{who} is part of Windows ({}), not something you can close. {} ", w.what, w.tip))
+                }
+                (Some(who), Some(w)) => advice.push_str(&format!("{who}: {} ", w.tip)),
+                (Some(who), None) => {
+                    advice.push_str(&format!("Let {who} finish, pause it, or schedule it for when you are not using the PC. "))
+                }
+                (None, _) => {}
+            }
+            advice.push_str("Keeping heavy disk work and your game on different drives also fixes it. ");
         }
         Some(Cause::WokeUp) => advice.push_str(
             "It had gone to sleep and needed time to wake up. Stop it from sleeping: Control Panel > Power Options > Change plan \
@@ -317,7 +326,7 @@ fn why_sentences(why: &DiskWhy) -> Vec<String> {
                     .into_iter()
                     .filter(|m| m.2 >= 0.15)
                     .map(|(name, bytes, share)| {
-                        let what = known_worker(&name).map_or(String::new(), |w| format!(": {w}"));
+                        let what = known_worker(&name).map_or(String::new(), |w| format!(": {}", w.what));
                         format!("{name} ({}, {:.0}% of the traffic{what})", fmt_size(bytes), share * 100.0)
                     })
                     .collect();
@@ -887,7 +896,15 @@ mod tests {
         assert!(!s[0].contains("chrome"), "minor movers stay out: {s:?}");
         assert!(s[1].contains("not traffic"), "{s:?}");
         let advice = disk_advice(&usb_hdd(), Some(&why), false);
-        assert!(advice.contains("let steam.exe finish") && !advice.contains("failing"), "{advice}");
+        assert!(advice.contains("steam.exe: Pause the download") && !advice.contains("failing"), "{advice}");
+
+        // Windows' own work cannot be paused or closed, so the advice must not say so.
+        let mut win = DiskWhy::default();
+        win.causes.insert(Cause::Busy, 3);
+        win.movers.insert("backgroundTaskHost.exe".into(), 50_000_000);
+        let advice = disk_advice(&usb_hdd(), Some(&win), false);
+        assert!(advice.contains("part of Windows") && advice.contains("run in background"), "{advice}");
+        assert!(!advice.contains("pause it") && !advice.contains("Let backgroundTaskHost"), "{advice}");
     }
 
     #[test]
