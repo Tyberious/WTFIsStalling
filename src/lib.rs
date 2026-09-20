@@ -6,8 +6,10 @@
 pub mod analyze;
 pub mod cpuclock;
 pub mod disks;
+pub mod diskwhy;
 pub mod engine;
 pub mod etw;
+pub mod evlog;
 pub mod modules;
 pub mod period;
 pub mod probe;

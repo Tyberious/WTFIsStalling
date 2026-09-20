@@ -9,7 +9,9 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 use crate::analyze::Analyzer;
 use crate::cpuclock::ClockSample;
-use crate::disks::DiskInfo;
+use crate::disks::{fmt_size, DiskInfo};
+use crate::diskwhy::{known_worker, Cause, DiskWhy};
+use crate::evlog;
 use crate::modules::knowledge;
 use crate::period;
 use crate::probe::{ProbeStats, StallKind};
@@ -204,6 +206,11 @@ impl Findings {
     }
 }
 
+const CONTROLLER_RESET_ADVICE: &str = "Every program waits, often for many seconds, while Windows resets a drive. Usual causes: a \
+    loose or bad SATA/M.2 connection, drive firmware, or link power saving. Reseat or replace cables, update SSD firmware and the \
+    chipset/storage driver, and set Power Options > PCI Express > Link State Power Management to Off. Event Viewer > Windows Logs > \
+    System (event 129) shows which controller.";
+
 const GENERIC_DRIVER_ADVICE: &str = "Update this driver from the device maker's site, or roll it back if the problem started after an \
     update. To confirm, temporarily disable the device (or close the software it belongs to) and monitor again.";
 
@@ -241,29 +248,113 @@ struct DriverAgg {
     over: u64,
 }
 
-/// What to try for a slow disk, based on what kind of disk it turned out to be.
-fn disk_advice(disk: &DiskInfo) -> String {
+/// What to try for a slow disk, based on why it seemed slow and what kind of disk it is.
+fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool) -> String {
     let mut advice = String::from("Anything that touches this disk freezes while it answers. ");
+    let main = if logged_errors { None } else { why.and_then(|w| w.main_cause()) };
+    match main {
+        Some(Cause::Busy) => {
+            let who = why.and_then(|w| w.top_movers(1).into_iter().next()).map_or("the program named above".to_string(), |m| m.0);
+            advice.push_str(&format!(
+                "It was slow because it was busy, so deal with the traffic first: let {who} finish, pause it, or schedule it for when \
+                 you are not using the PC. Keeping that work and your game on different drives also fixes it. "
+            ));
+        }
+        Some(Cause::WokeUp) => advice.push_str(
+            "It had gone to sleep and needed time to wake up. Stop it from sleeping: Control Panel > Power Options > Change plan \
+             settings > Advanced > Hard disk > 'Turn off hard disk after' = 0 (never), and for a USB drive also set 'USB selective \
+             suspend' to Disabled there. Or keep files you use while gaming off this drive. ",
+        ),
+        Some(Cause::Flush) => advice.push_str(
+            "A program kept forcing its writes out to the drive, which budget SSDs without their own memory handle badly. See which \
+             program issued the slow flushes in the event log below. ",
+        ),
+        _ => {}
+    }
     let full = disk.nearly_full();
     if !full.is_empty() {
         let letters = full.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" and ");
-        advice.push_str(&format!("{letters} is nearly full, which by itself makes drives slow: free up space first. "));
+        advice.push_str(&format!("{letters} is nearly full, which by itself makes drives slow: free up space. "));
     }
-    advice.push_str("Check its health (SMART) with the maker's tool or CrystalDiskInfo");
-    advice.push_str(match (disk.bus, disk.spinning) {
-        ("USB", _) => ", and try another USB port or cable, plugged straight into the PC rather than a hub.",
-        (_, Some(true)) => {
-            ". A hard drive that takes this long is often failing or waking from sleep: back up what matters, reseat or replace its              cable, and move games and programs to an SSD."
-        }
-        ("NVMe", _) => ", update its firmware, and make sure it isn't overheating (a heatsink helps).",
-        ("SATA" | "ATA", _) => ", update its firmware, and reseat or replace its SATA cable.",
-        _ => ", update SSD firmware, and reseat or replace the cable on SATA drives.",
-    });
+    if logged_errors {
+        advice.push_str(
+            "Windows logged errors for this drive, which is not normal: back up what matters now. Then reseat or replace its cable \
+             (or move an M.2 drive to another slot), update its firmware, and check its health (SMART) with the maker's tool or \
+             CrystalDiskInfo.",
+        );
+    } else if matches!(main, Some(Cause::Busy | Cause::WokeUp)) {
+        advice.push_str("If it stays slow without that, check its health (SMART) with the maker's tool or CrystalDiskInfo.");
+    } else {
+        advice.push_str("Check its health (SMART) with the maker's tool or CrystalDiskInfo");
+        advice.push_str(match (disk.bus, disk.spinning) {
+            ("USB", _) => ", and try another USB port or cable, plugged straight into the PC rather than a hub.",
+            (_, Some(true)) => {
+                ". A hard drive that takes this long with little to do is often failing: back up what matters, reseat or replace its \
+                 cable, and move games and programs to an SSD."
+            }
+            ("NVMe", _) => ", update its firmware, and make sure it isn't overheating (a heatsink helps).",
+            ("SATA" | "ATA", _) => ", update its firmware, and reseat or replace its SATA cable.",
+            _ => ", update SSD firmware, and reseat or replace the cable on SATA drives.",
+        });
+    }
     if disk.model.is_empty() && disk.volumes.is_empty() {
         advice.push_str(&format!(" Disk {} is the number shown in Windows Disk Management.", disk.number));
     }
     advice
 }
+
+/// One sentence per reason the disk's slow requests were slow, most common first.
+fn why_sentences(why: &DiskWhy) -> Vec<String> {
+    let mut causes = [Cause::Busy, Cause::WokeUp, Cause::IdleSlow, Cause::Flush].map(|c| (c, why.count(c)));
+    causes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let of = |n: u32| if n == why.total() { "every time".to_string() } else { format!("{n} of {} times", why.total()) };
+    let mut out = Vec::new();
+    for (cause, n) in causes.into_iter().filter(|(_, n)| *n > 0) {
+        out.push(match cause {
+            Cause::Busy => {
+                let movers: Vec<String> = why
+                    .top_movers(2)
+                    .into_iter()
+                    .filter(|m| m.2 >= 0.15)
+                    .map(|(name, bytes, share)| {
+                        let what = known_worker(&name).map_or(String::new(), |w| format!(": {w}"));
+                        format!("{name} ({}, {:.0}% of the traffic{what})", fmt_size(bytes), share * 100.0)
+                    })
+                    .collect();
+                let who = if movers.is_empty() { String::new() } else { format!(" The traffic came from {}.", movers.join(" and ")) };
+                format!("Why: the disk was busy moving a lot of data ({}).{who}", of(n))
+            }
+            Cause::WokeUp => format!(
+                "Why: the drive had gone to sleep ({}). The slow request was the first after up to {:.0} s of silence.",
+                of(n),
+                why.longest_sleep_ms / 1000.0
+            ),
+            Cause::IdleSlow => format!(
+                "Why: not traffic. The disk had little else to do and still took that long ({}), which points at the drive itself, \
+                 its cable or its firmware.",
+                of(n)
+            ),
+            Cause::Flush => format!("Why: a program forced its writes out to the drive and the drive took its time ({}).", of(n)),
+        });
+    }
+    out
+}
+
+/// "3 times in the last 7 days (1 while monitoring), most recently 2 day(s) ago"
+fn when_text(times: &[i64], now: i64, run_start: i64) -> String {
+    let during = times.iter().filter(|t| **t >= run_start).count();
+    let last = times.iter().copied().max().unwrap_or(now);
+    let ago = match (now - last).max(0) {
+        s if s < 3600 => "within the last hour".to_string(),
+        s if s < 86_400 => format!("{} hour(s) ago", s / 3600),
+        s => format!("{} day(s) ago", s / 86_400),
+    };
+    let during_txt = if during > 0 { format!(" ({during} while monitoring)") } else { String::new() };
+    let plural = if times.len() == 1 { "" } else { "s" };
+    format!("{} time{plural} in the last {EVENT_LOG_DAYS} days{during_txt}, most recently {ago}", times.len())
+}
+
+const EVENT_LOG_DAYS: u32 = 7;
 
 impl Analyzer {
     pub fn summarize(
@@ -283,6 +374,10 @@ impl Analyzer {
         let mut debug_counts: Vec<_> = inner.debug_counts.iter().map(|(k, v)| (*k, *v)).collect();
         let debug_rejected = inner.debug_rejected.clone();
         drop(inner);
+
+        let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let run_start_unix = now_unix - elapsed_s as i64 - 2;
+        let storage_log = evlog::storage_events(EVENT_LOG_DAYS);
 
         let mut found = Findings::default();
         let mut details: Vec<String> = Vec::new();
@@ -513,14 +608,47 @@ impl Analyzer {
                     evidence.push_str(&format!(" {}{}.", extra[..1].to_uppercase(), &extra[1..]));
                 }
             }
-            found.add(
-                &format!("disk {n}"),
-                sev,
-                format!("{}  -  responding slowly", disk.title()),
-                evidence,
-                disk_advice(&disk),
-                s.max * s.slow as i64,
-            );
+            let key = format!("disk {n}");
+            let why = self.disk_why.get(n);
+            let logged = storage_log.iter().any(|e| e.disk == Some(*n));
+            let advice = disk_advice(&disk, why, logged);
+            found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, s.max * s.slow as i64);
+            for sentence in why.map(why_sentences).unwrap_or_default() {
+                found.note(&key, sentence);
+            }
+        }
+
+        // ---- What Windows itself logged about storage ---------------------------------------
+        // Per disk where the event names one; controller resets (129) only name the adapter.
+        let mut logged: Vec<(Option<u32>, u32)> = storage_log.iter().map(|e| (e.disk, e.id)).collect();
+        logged.sort();
+        logged.dedup();
+        for (disk_n, id) in logged {
+            let times: Vec<i64> = storage_log.iter().filter(|e| e.disk == disk_n && e.id == id).map(|e| e.unix_time).collect();
+            let during = times.iter().any(|t| *t >= run_start_unix);
+            let text = format!("Windows event log: {} (event {id}), {}.", evlog::meaning(id), when_text(&times, now_unix, run_start_unix));
+            let (key, title, advice) = match disk_n {
+                Some(n) => {
+                    let disk = self.disks.get(n).clone();
+                    (format!("disk {n}"), format!("{}  -  errors in the Windows event log", disk.title()), disk_advice(&disk, None, true))
+                }
+                None => (
+                    "storage controller".to_string(),
+                    "Storage controller  -  a drive stopped answering and was reset".to_string(),
+                    CONTROLLER_RESET_ADVICE.to_string(),
+                ),
+            };
+            if !found.note(&key, text.clone()) {
+                // Old entries alone are a lead, not a verdict.
+                let sev = if during {
+                    Severity::High
+                } else if times.len() >= 3 {
+                    Severity::Medium
+                } else {
+                    Severity::Low
+                };
+                found.add(&key, sev, title, text, advice, 0);
+            }
         }
 
         // ---- Does it keep time? ------------------------------------------------------------
@@ -739,6 +867,48 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usb_hdd() -> DiskInfo {
+        DiskInfo { number: 4, model: "Seagate FireCuda Dock".into(), bus: "USB", spinning: Some(true), ..Default::default() }
+    }
+
+    #[test]
+    fn a_busy_disk_names_the_program_and_does_not_blame_the_drive() {
+        let mut why = DiskWhy::default();
+        why.causes.insert(Cause::Busy, 9);
+        why.causes.insert(Cause::IdleSlow, 1);
+        why.movers.insert("steam.exe".into(), 3_000_000_000);
+        why.movers.insert("chrome.exe".into(), 100_000_000);
+        let s = why_sentences(&why);
+        assert!(
+            s[0].contains("busy") && s[0].contains("9 of 10 times") && s[0].contains("steam.exe (3 GB, 97% of the traffic: Steam"),
+            "{s:?}"
+        );
+        assert!(!s[0].contains("chrome"), "minor movers stay out: {s:?}");
+        assert!(s[1].contains("not traffic"), "{s:?}");
+        let advice = disk_advice(&usb_hdd(), Some(&why), false);
+        assert!(advice.contains("let steam.exe finish") && !advice.contains("failing"), "{advice}");
+    }
+
+    #[test]
+    fn a_sleeping_drive_gets_power_settings_and_logged_errors_override_everything() {
+        let mut why = DiskWhy { longest_sleep_ms: 42_000.0, ..Default::default() };
+        why.causes.insert(Cause::WokeUp, 2);
+        assert!(why_sentences(&why)[0].contains("every time") && why_sentences(&why)[0].contains("42 s"));
+        assert!(disk_advice(&usb_hdd(), Some(&why), false).contains("Turn off hard disk after"));
+        let logged = disk_advice(&usb_hdd(), Some(&why), true);
+        assert!(logged.contains("back up what matters now") && !logged.contains("Turn off hard disk"), "{logged}");
+    }
+
+    #[test]
+    fn event_log_timing_reads_naturally() {
+        let now = 1_000_000;
+        assert_eq!(
+            when_text(&[now - 3 * 86_400, now - 100], now, now - 600),
+            "2 times in the last 7 days (1 while monitoring), most recently within the last hour"
+        );
+        assert_eq!(when_text(&[now - 2 * 86_400 - 5], now, now - 600), "1 time in the last 7 days, most recently 2 day(s) ago");
+    }
 
     #[test]
     fn result_block_leads_with_the_verdict_and_stays_within_width() {

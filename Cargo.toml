@@ -1,6 +1,6 @@
 [package]
 name = "wtfisstalling"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Finds the driver, app or hardware behind hitches and micro-stalls on Windows"
 default-run = "WTFIsStalling"
@@ -40,6 +40,7 @@ features = [
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_EventLog",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",

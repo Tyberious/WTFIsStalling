@@ -136,8 +136,10 @@ pub fn fmt_size(bytes: u64) -> String {
     let gb = bytes as f64 / 1e9;
     if gb >= 1000.0 {
         format!("{:.1} TB", gb / 1000.0)
-    } else {
+    } else if gb >= 1.0 {
         format!("{gb:.0} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
     }
 }
 
@@ -388,6 +390,7 @@ mod tests {
         assert_eq!(full.hardware(), "NVMe SSD, 2.0 TB, firmware 4B2QJXD7");
         assert_eq!(full.fullness(), "E: 95% full, F: 40% full");
         assert_eq!(full.nearly_full(), vec!['E']);
+        assert_eq!((fmt_size(118_000_000_000), fmt_size(42_500_000)), ("118 GB".to_string(), "42 MB".to_string()));
     }
 
     #[test]

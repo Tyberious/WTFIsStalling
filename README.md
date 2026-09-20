@@ -56,7 +56,8 @@ try for each, followed by the supporting numbers and the event log. A copy is sa
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide |
 | Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
-| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is |
+| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware) |
+| **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 
 What it cannot see: stalls inside an application itself or on the GPU (shader compilation, VRAM
 overflow, frame pacing). It can rule the rest out, though: if you flag a hitch and no CPU core was

@@ -6,6 +6,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
+use crate::diskwhy::{self, Cause, DiskWhy};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
@@ -47,6 +48,9 @@ pub struct Analyzer {
     pub modules: ModuleMap,
     pub procs: ProcNames,
     pub disks: DiskMap,
+    /// Why each disk's slow requests were slow, as far as the traffic around them can tell.
+    pub(crate) disk_why: HashMap<u32, DiskWhy>,
+    started: i64,
     profile: bool,
     pub(crate) incidents: Vec<IncidentSummary>,
     /// Recent wake-up delays under the stall threshold, newest last.
@@ -90,6 +94,8 @@ impl Analyzer {
             modules,
             procs: ProcNames::new(),
             disks: DiskMap::new(),
+            disk_why: HashMap::new(),
+            started: qpc(),
             profile,
             incidents: Vec::new(),
             minor: VecDeque::new(),
@@ -493,6 +499,8 @@ impl Analyzer {
         let notables = std::mem::take(&mut self.shared.inner.lock().unwrap().notable);
         for n in notables {
             self.notable_total += 1;
+            // Every slow request is explained, including the ones the log below leaves out.
+            let why = if let Notable::SlowIo(i) = &n { self.explain_io(i) } else { String::new() };
             if let Notable::LongExec(e) = &n {
                 let times = self.long_exec_times.entry(self.modules.name(e.routine)).or_default();
                 if times.len() < 5000 {
@@ -526,7 +534,7 @@ impl Analyzer {
                     f.bytes / 1024
                 ),
                 Notable::SlowIo(i) => say!(
-                    "[{}] slow disk {:<5} {:>9}  {}  {} KB  issued by {}",
+                    "[{}] slow disk {:<5} {:>9}  {}  {} KB  issued by {}  ({why})",
                     clock().fmt(i.end - i.dur),
                     op_name(i.op),
                     fmt_dur(i.dur),
@@ -535,6 +543,34 @@ impl Analyzer {
                     self.procs.label(i.pid, i.tid)
                 ),
             }
+        }
+    }
+
+    /// Works out what the disk was doing while `slow` was outstanding, adds it to the disk's
+    /// totals and returns a few words for the log line.
+    fn explain_io(&mut self, slow: &IoRec) -> String {
+        let ios: Vec<IoRec> = self.shared.inner.lock().unwrap().ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
+        let spinning = self.disks.get(slow.disk).spinning == Some(true);
+        let ctx = diskwhy::explain(slow, &ios, spinning, self.started);
+        let movers: Vec<(String, u64)> =
+            ctx.movers.iter().map(|(pid, tid, bytes)| (process_name(&self.procs.label(*pid, *tid)), *bytes)).collect();
+        let why = self.disk_why.entry(slow.disk).or_default();
+        *why.causes.entry(ctx.cause).or_default() += 1;
+        match ctx.cause {
+            Cause::Busy => {
+                for (name, bytes) in &movers {
+                    *why.movers.entry(name.clone()).or_default() += bytes;
+                }
+                let top = movers.first().map_or(String::new(), |(n, _)| format!(", mostly {n}"));
+                format!("disk busy: {:.0} MB/s{top}", ctx.mb_per_s)
+            }
+            Cause::WokeUp => {
+                let idle = ctx.idle_before_ms.unwrap_or(0.0);
+                why.longest_sleep_ms = why.longest_sleep_ms.max(idle);
+                format!("first request after {:.0} s of silence: the drive was asleep", idle / 1000.0)
+            }
+            Cause::Flush => "a program forced its writes out to the drive".to_string(),
+            Cause::IdleSlow => "disk had little else to do".to_string(),
         }
     }
 
@@ -570,6 +606,14 @@ fn op_name(op: u8) -> &'static str {
         b'R' => "read",
         b'W' => "write",
         _ => "flush",
+    }
+}
+
+/// "steam.exe (1234)" -> "steam.exe", so several processes of one program add up.
+fn process_name(label: &str) -> String {
+    match label.rsplit_once(" (") {
+        Some((name, rest)) if rest.trim_end_matches(')').chars().all(|c| c.is_ascii_digit()) => name.to_string(),
+        _ => label.to_string(),
     }
 }
 
