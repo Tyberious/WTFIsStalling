@@ -78,8 +78,8 @@ days old) by itself.
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide; backed up by the "firmware limited the processor's speed" event when Windows logged one |
 | **Stalls concentrated on the efficiency cores** of a hybrid processor (P-cores / E-cores) | Each stall says which kind of core it hit. When they pile up on the E-cores, a low-severity finding says so and lists what Windows documents as sending a program there (Task Manager's "Efficiency mode"; on battery, background and out-of-view work) |
 | Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
-| **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen |
-| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware) |
+| **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
+| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 | **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
@@ -141,8 +141,8 @@ suspect that can cause crackle and micro-stutter; **LOW** is a lead worth knowin
 Two independent sources, correlated on one clock (QPC):
 
 * **Kernel ETW trace.** A private real-time system-logger session records every DPC and ISR (with the
-  driver routine address and duration), hard page faults, disk I/O latency, thread creation (for
-  thread → process mapping) and 1 kHz CPU profile samples. Routine addresses are resolved to the loaded
+  driver routine address and duration), hard page faults, disk I/O latency, file names, thread creation
+  (for thread → process mapping) and 1 kHz CPU profile samples. Routine addresses are resolved to the loaded
   driver; a built-in knowledge base plus each file's version resource explains what that driver is.
 * **Latency probes.** A helper process in the REALTIME priority class runs one thread per CPU at
   priority 31, pinned, waking every millisecond (every 2 ms in light mode) and measuring how late each
@@ -297,6 +297,14 @@ policy the project commits to.)*
 * **Privacy:** this program will not transfer any information to other networked systems. It has no
   network code at all: reports are written to a local text file and the clipboard, and only you decide
   whom to show them to. Reports contain hardware and driver names but no drive serial numbers.
+* **File names in reports:** disk findings name the files that waited, because "pagefile.sys" or
+  "game.pak" tells you what to do and "disk 1 was slow" does not. Reports get pasted into forums, so a
+  path is only ever shown in full when it cannot be personal: files on a volume root (`pagefile.sys`,
+  `$Mft`, `hiberfil.sys`), well-known system files, and anything under Windows, Program Files,
+  ProgramData or a game library. Anything under `\Users\` is shown as `C:\Users\...\name.ext` — never
+  your user name, never your folder names. Anything else keeps only its drive and file name
+  (`D:\...\name.ext`), and network paths lose the server and share. Long paths are shortened.
+  The rule lives in one function, `files::public_path`, and every path in the report passes through it.
 
 ## Contributing
 

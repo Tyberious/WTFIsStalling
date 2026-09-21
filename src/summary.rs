@@ -14,6 +14,7 @@ use crate::devices::{self, DeviceMap};
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskwhy::{known_worker, Cause, DiskWhy};
 use crate::evlog::{self, HardwareEvent, HardwareKind, UnexpectedShutdown};
+use crate::files;
 use crate::gpu::GpuLog;
 use crate::health::{self, DriveHealth};
 use crate::modules::knowledge;
@@ -322,6 +323,21 @@ const THROTTLE_ADVICE: &str = "The CPU is being held back by heat or a power lim
     plug in the charger and pick the 'Best performance' power mode. In the BIOS check that power limits, ECO mode or an undervolt \
     are not set too aggressively.";
 
+/// --debug only: the first field of each classic kernel provider GUID, so the event counts can
+/// be read without a lookup table. https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants
+fn provider_name(guid: u32) -> &'static str {
+    match guid {
+        0xce1d_bfb4 => "PerfInfo",
+        0x3d6f_a8d4 => "DiskIo",
+        0x3d6f_a8d3 => "PageFault",
+        0x3d6f_a8d1 => "Thread",
+        0x3d6f_a8d0 => "Process",
+        0x90cb_dc39 => "FileIo",
+        0x0185_3a65 => "Config",
+        _ => "",
+    }
+}
+
 fn secs(ticks: &[i64]) -> Vec<f64> {
     ticks.iter().map(|t| *t as f64 / qpc_freq() as f64).collect()
 }
@@ -347,8 +363,43 @@ struct DriverAgg {
     over: u64,
 }
 
-/// What to try for a slow disk, based on why it seemed slow and what kind of disk it is.
-fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool) -> String {
+/// One row of "which files waited on disk": (path already made public-safe, disk, requests,
+/// total wait, worst wait).
+type FileRow = (String, u32, u64, i64, i64);
+
+/// What the files that waited on one disk change about the advice. Which file waited says
+/// something no latency number can: the paging file means memory, game data means the game.
+#[derive(Default, Clone, Copy)]
+struct FileHint {
+    paging: bool,
+    game: bool,
+}
+
+fn file_hint(rows: &[FileRow]) -> FileHint {
+    FileHint { paging: rows.iter().any(|r| files::is_paging_file(&r.0)), game: rows.iter().any(|r| files::is_game_asset(&r.0)) }
+}
+
+/// "Most of the waiting was for ...", naming the files that waited longest on one disk.
+fn files_sentence(rows: &[FileRow]) -> Option<String> {
+    let top = files::rank(rows, 3);
+    if top.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = top
+        .iter()
+        .map(|(name, _, count, total, _)| format!("{name} ({count} request{}, {})", if *count == 1 { "" } else { "s" }, fmt_dur(*total)))
+        .collect();
+    let mut sentence = format!("Most of the waiting was for: {}.", list.join(", "));
+    // Name what the worst one actually is; almost nobody knows what $Mft or pagefile.sys are.
+    if let Some(what) = files::explain(&top[0].0) {
+        sentence.push_str(&format!(" {} is {what}.", top[0].0));
+    }
+    Some(sentence)
+}
+
+/// What to try for a slow disk, based on why it seemed slow, what kind of disk it is, and which
+/// files did the waiting.
+fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool, hint: FileHint) -> String {
     let mut advice = String::from("Anything that touches this disk freezes while it answers. ");
     let main = if logged_errors { None } else { why.and_then(|w| w.main_cause()) };
     match main {
@@ -378,6 +429,27 @@ fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool) -> S
              program issued the slow flushes in the event log below. ",
         ),
         _ => {}
+    }
+    // Which file waited can change the answer completely, so it goes before the generic checks.
+    if hint.paging {
+        advice.push_str(
+            "Most of the waiting was for Windows' paging file, which means the PC ran out of memory and had to read programs back \
+             off this disk. Close memory-hungry programs (a browser with many tabs is the usual one) or add RAM; that helps more \
+             than anything you can do to the drive. ",
+        );
+        if disk.spinning == Some(true) {
+            advice.push_str(
+                "The paging file is on a hard drive, the slowest place it can be: if this PC has an SSD, put the paging file there \
+                 (search Windows for 'Adjust the appearance and performance of Windows' > Advanced > Virtual memory > Change). ",
+            );
+        }
+    }
+    if hint.game && disk.spinning == Some(true) {
+        advice.push_str(
+            "A game's own data files were waiting on a hard drive. Games stream textures and levels while you play, and a hard \
+             drive cannot keep up: move that game to an SSD (in Steam: right-click the game > Properties > Installed Files > Move \
+             install folder). ",
+        );
     }
     let full = disk.nearly_full();
     if !full.is_empty() {
@@ -409,6 +481,23 @@ fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool) -> S
         advice.push_str(&format!(" Disk {} is the number shown in Windows Disk Management.", disk.number));
     }
     advice
+}
+
+/// The one file a process did most of its paging waiting on, with its share, when a single file
+/// really does dominate. Below half it is a mix and naming one file would mislead.
+fn dominant_file(per_file: &[(String, u64, i64)]) -> Option<(String, f64)> {
+    let total: i64 = per_file.iter().map(|f| f.2).sum();
+    if total <= 0 {
+        return None;
+    }
+    let mut by_name: HashMap<&str, i64> = HashMap::new();
+    for (name, _, wait) in per_file {
+        *by_name.entry(name.as_str()).or_default() += wait;
+    }
+    // Ties resolve by name so two runs on the same data say the same thing.
+    let (name, best) = by_name.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))?;
+    let share = best as f64 / total as f64;
+    (share >= 0.5).then(|| (name.to_string(), share))
 }
 
 /// One sentence per reason the disk's slow requests were slow, most common first.
@@ -1125,7 +1214,32 @@ impl Analyzer {
         let events = inner.events;
         let mut debug_counts: Vec<_> = inner.debug_counts.iter().map(|(k, v)| (*k, *v)).collect();
         let debug_rejected = inner.debug_rejected.clone();
+        // Files the trace named. Anything it never named is dropped here rather than carried
+        // around as an unnamed row: "(file name not available)" repeated is noise, not evidence.
+        let named_files = inner.file_names.len();
+        let raw_waits: Vec<(String, u32, u64, i64, i64)> = inner
+            .file_wait
+            .iter()
+            .filter_map(|(key, w)| inner.file_names.get(*key).map(|p| (p.to_string(), w.disk, w.count, w.total, w.max)))
+            .collect();
+        let raw_fault_files: Vec<(u32, String, u64, i64)> = inner
+            .fault_file
+            .iter()
+            .filter_map(|((pid, key), w)| inner.file_names.get(*key).map(|p| (*pid, p.to_string(), w.count, w.total)))
+            .collect();
         drop(inner);
+
+        // Every path becomes drive-letter form and passes the privacy rule ONCE, here, before
+        // anything else in this function can see it. Nothing below ever touches a raw NT path.
+        let file_waits: Vec<FileRow> =
+            raw_waits.into_iter().map(|(p, d, c, t, m)| (files::public_path(&self.dos.to_dos(&p)), d, c, t, m)).collect();
+        let mut fault_files: HashMap<String, Vec<(String, u64, i64)>> = HashMap::new();
+        for (pid, path, count, total) in raw_fault_files {
+            let shown = files::public_path(&self.dos.to_dos(&path));
+            if !shown.is_empty() {
+                fault_files.entry(self.procs.label(pid, 0)).or_default().push((shown, count, total));
+            }
+        }
 
         let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let run_start_unix = now_unix - elapsed_s as i64 - 2;
@@ -1378,11 +1492,19 @@ impl Analyzer {
                 )
             };
             let key = format!("paging {name}");
+            // Which file the memory came back from turns a number into something to act on.
+            let mostly = match fault_files.get(name).and_then(|f| dominant_file(f)) {
+                Some((file, share)) => {
+                    let what = files::explain(&file).map(|w| format!(" That is {w}.")).unwrap_or_default();
+                    format!(" Mostly reading back {file} ({:.0}% of the waiting).{what}", share * 100.0)
+                }
+                None => String::new(),
+            };
             found.add(
                 &key,
                 sev,
                 format!("{name}  -  waiting for memory to be read back from disk"),
-                format!("Frozen by {} hard page faults for {} in total (longest {}).", s.count, fmt_dur(s.total), fmt_dur(s.max)),
+                format!("Frozen by {} hard page faults for {} in total (longest {}).{mostly}", s.count, fmt_dur(s.total), fmt_dur(s.max)),
                 advice,
                 s.total,
             );
@@ -1414,11 +1536,15 @@ impl Analyzer {
             let key = format!("disk {n}");
             let why = self.disk_why.get(n);
             let logged = storage_log.iter().any(|e| e.disk == Some(*n));
-            let advice = disk_advice(&disk, why, logged);
+            let on_disk: Vec<FileRow> = file_waits.iter().filter(|r| r.1 == *n).cloned().collect();
+            let advice = disk_advice(&disk, why, logged, file_hint(&files::rank(&on_disk, 3)));
             found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, s.max * s.slow as i64);
             found.measure(&key, Metric::count("slow requests", s.slow as f64));
             found.measure(&key, Metric::ms("worst wait", ticks_to_ms(s.max)));
             for sentence in why.map(why_sentences).unwrap_or_default() {
+                found.note(&key, sentence);
+            }
+            if let Some(sentence) = files_sentence(&on_disk) {
                 found.note(&key, sentence);
             }
         }
@@ -1435,7 +1561,12 @@ impl Analyzer {
             let (key, title, advice) = match disk_n {
                 Some(n) => {
                     let disk = self.disks.get(n).clone();
-                    (format!("disk {n}"), format!("{}  -  errors in the Windows event log", disk.title()), disk_advice(&disk, None, true))
+                    let hint = file_hint(&files::rank(&file_waits.iter().filter(|r| r.1 == n).cloned().collect::<Vec<_>>(), 3));
+                    (
+                        format!("disk {n}"),
+                        format!("{}  -  errors in the Windows event log", disk.title()),
+                        disk_advice(&disk, None, true, hint),
+                    )
                 }
                 None => (
                     "storage controller".to_string(),
@@ -1844,6 +1975,25 @@ impl Analyzer {
                 }
             }
         }
+        let top_files = files::rank(&file_waits, 8);
+        if !top_files.is_empty() {
+            d!("");
+            d!("FILES THAT WAITED LONGEST ON DISK  (file names are shortened; see the privacy note in the README)");
+            d!("  {:<64} {:>5} {:>9} {:>12} {:>10}", "file", "disk", "requests", "total wait", "worst");
+            for (name, disk, count, total, max) in &top_files {
+                d!("  {name:<64} {disk:>5} {count:>9} {:>12} {:>10}", fmt_dur(*total), fmt_dur(*max));
+            }
+            // Plain words for the ones nobody recognizes, once each.
+            let mut explained: Vec<&str> = Vec::new();
+            for (name, ..) in &top_files {
+                if let Some(what) = files::explain(name) {
+                    if !explained.contains(&what) {
+                        explained.push(what);
+                        d!("  {name} = {what}");
+                    }
+                }
+            }
+        }
         if !gpu_lines.is_empty() {
             d!("");
             d!("GRAPHICS  (sampled once a second)");
@@ -1885,8 +2035,9 @@ impl Analyzer {
             d!("");
             d!("debug: events by (provider, opcode):");
             for ((guid, op), n) in debug_counts {
-                d!("  {guid:08x} op {op:>3}: {n}");
+                d!("  {guid:08x} {:<9} op {op:>3}: {n}", provider_name(guid));
             }
+            d!("  file names learned: {named_files}; files with a wait total: {}", file_waits.len());
             for (ts, initial) in debug_rejected {
                 d!("  rejected DPC/ISR: event ts {ts}, InitialTime {initial}, now {}", qpc());
             }
@@ -1934,14 +2085,14 @@ mod tests {
         );
         assert!(!s[0].contains("chrome"), "minor movers stay out: {s:?}");
         assert!(s[1].contains("not traffic"), "{s:?}");
-        let advice = disk_advice(&usb_hdd(), Some(&why), false);
+        let advice = disk_advice(&usb_hdd(), Some(&why), false, FileHint::default());
         assert!(advice.contains("steam.exe: Pause the download") && !advice.contains("failing"), "{advice}");
 
         // Windows' own work cannot be paused or closed, so the advice must not say so.
         let mut win = DiskWhy::default();
         win.causes.insert(Cause::Busy, 3);
         win.movers.insert("backgroundTaskHost.exe".into(), 50_000_000);
-        let advice = disk_advice(&usb_hdd(), Some(&win), false);
+        let advice = disk_advice(&usb_hdd(), Some(&win), false, FileHint::default());
         assert!(advice.contains("part of Windows") && advice.contains("run in background"), "{advice}");
         assert!(!advice.contains("pause it") && !advice.contains("Let backgroundTaskHost"), "{advice}");
     }
@@ -1951,9 +2102,74 @@ mod tests {
         let mut why = DiskWhy { longest_sleep_ms: 42_000.0, ..Default::default() };
         why.causes.insert(Cause::WokeUp, 2);
         assert!(why_sentences(&why)[0].contains("every time") && why_sentences(&why)[0].contains("42 s"));
-        assert!(disk_advice(&usb_hdd(), Some(&why), false).contains("Turn off hard disk after"));
-        let logged = disk_advice(&usb_hdd(), Some(&why), true);
+        assert!(disk_advice(&usb_hdd(), Some(&why), false, FileHint::default()).contains("Turn off hard disk after"));
+        let logged = disk_advice(&usb_hdd(), Some(&why), true, FileHint::default());
         assert!(logged.contains("back up what matters now") && !logged.contains("Turn off hard disk"), "{logged}");
+    }
+
+    fn row(name: &str, disk: u32, count: u64, total_ms: f64, worst_ms: f64) -> FileRow {
+        (name.to_string(), disk, count, ms_to_ticks(total_ms), ms_to_ticks(worst_ms))
+    }
+
+    #[test]
+    fn the_files_that_waited_longest_are_named_in_plain_words() {
+        let rows = vec![
+            row("C:\\pagefile.sys", 0, 1204, 3200.0, 480.0),
+            row("D:\\SteamLibrary\\steamapps\\common\\Game\\game.pak", 1, 40, 910.0, 300.0),
+            row("C:\\...\\notes.txt", 0, 1, 5.0, 5.0),
+        ];
+        let s = files_sentence(&rows).expect("a sentence");
+        assert!(s.starts_with("Most of the waiting was for: C:\\pagefile.sys (1204 requests,"), "{s}");
+        assert!(s.contains("game.pak (40 requests"), "{s}");
+        assert!(s.contains("short of memory"), "the worst one is explained: {s}");
+        assert_eq!(files_sentence(&[]), None);
+    }
+
+    /// Which file waited changes the answer: the paging file means memory, game data means the
+    /// game. Neither may push out the drive checks that were there before.
+    #[test]
+    fn the_file_that_waited_changes_the_advice() {
+        let hdd = usb_hdd();
+        let plain = disk_advice(&hdd, None, false, FileHint::default());
+        assert!(!plain.contains("paging file"), "{plain}");
+
+        let paging = disk_advice(&hdd, None, false, file_hint(&[row("C:\\pagefile.sys", 0, 9, 100.0, 50.0)]));
+        assert!(paging.contains("ran out of memory") && paging.contains("add RAM"), "{paging}");
+        assert!(paging.contains("slowest place it can be"), "a paging file on a hard drive is its own problem: {paging}");
+        assert!(paging.contains("CrystalDiskInfo"), "the drive checks still follow: {paging}");
+
+        let game = disk_advice(&hdd, None, false, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
+        assert!(game.contains("move that game to an SSD"), "{game}");
+        // The same files on an SSD are not a reason to move anything.
+        let mut ssd = usb_hdd();
+        ssd.spinning = Some(false);
+        let on_ssd = disk_advice(&ssd, None, false, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
+        assert!(!on_ssd.contains("move that game"), "{on_ssd}");
+    }
+
+    #[test]
+    fn paging_names_one_file_only_when_one_file_really_dominates() {
+        let mixed = [("a.dll".to_string(), 1u64, 100i64), ("b.dll".to_string(), 1, 90), ("c.dll".to_string(), 1, 80)];
+        assert_eq!(dominant_file(&mixed), None, "a mix must not be reported as one file");
+        let clear = [("C:\\pagefile.sys".to_string(), 9u64, 900i64), ("a.dll".to_string(), 1, 100)];
+        let (name, share) = dominant_file(&clear).unwrap();
+        assert_eq!(name, "C:\\pagefile.sys");
+        assert!((share - 0.9).abs() < 1e-9);
+        // Several handles to the same file add up to one file.
+        let split = [("g.pak".to_string(), 1u64, 300i64), ("g.pak".to_string(), 1, 300), ("x".to_string(), 1, 200)];
+        assert_eq!(dominant_file(&split).map(|d| d.0), Some("g.pak".to_string()));
+        assert_eq!(dominant_file(&[]), None);
+        assert_eq!(dominant_file(&[("a".to_string(), 1, 0)]), None, "no waiting at all is not a dominant file");
+    }
+
+    /// The DETAILS tables are printed as-is, with no wrapping to save them, so the widest
+    /// possible file name still has to fit the report.
+    #[test]
+    fn the_file_table_fits_the_report_width() {
+        let widest = "C:\\Program Files\\".to_string() + &"w".repeat(80) + ".bundle";
+        let name = crate::files::public_path(&widest);
+        let line = format!("  {name:<64} {:>5} {:>9} {:>12} {:>10}", 11, 999_999, fmt_dur(ms_to_ticks(9999.0)), fmt_dur(1));
+        assert!(line.chars().count() <= 118, "{} chars: {line}", line.chars().count());
     }
 
     #[test]

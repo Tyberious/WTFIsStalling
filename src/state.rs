@@ -37,6 +37,9 @@ pub struct FaultRec {
     pub tid: u32,
     pub pid: u32,
     pub bytes: u32,
+    /// FileObject/FileKey of the file the page came from; 0 when the event did not carry one.
+    /// Look it up in `Inner::file_names`.
+    pub file: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +52,8 @@ pub struct IoRec {
     pub size: u32,
     /// b'R', b'W' or b'F'
     pub op: u8,
+    /// FileObject of the file, or 0 (flush events carry none). See `Inner::file_names`.
+    pub file: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +70,79 @@ pub struct RoutineStat {
     pub total: i64,
     pub max: i64,
     pub over_warn: u64,
+}
+
+/// How long requests to one file waited over the whole run.
+#[derive(Default, Clone, Copy)]
+pub struct FileWait {
+    pub disk: u32,
+    pub count: u64,
+    pub total: i64,
+    pub max: i64,
+}
+
+/// FileObject/FileKey -> NT path, filled from the kernel's FileIo name events.
+///
+/// A PC can have tens of thousands of files open, and a multi-hour run opens many more, so this
+/// map is hard-capped and evicts oldest-first. Nothing here is ever printed as-is: every path
+/// leaves through `files::public_path`.
+#[derive(Default)]
+pub struct FileNames {
+    map: HashMap<u64, Box<str>>,
+    /// Insertion order, for eviction. Cheaper than any kind of LRU inside the ETW callback.
+    order: VecDeque<u64>,
+}
+
+/// Roughly 4 MB of paths at the cap, which is the worst case, not the normal one.
+pub const FILE_NAME_CAP: usize = 40_000;
+/// Distinct files whose waiting is totaled. Over this the smallest halves are dropped.
+pub const FILE_WAIT_CAP: usize = 8_192;
+
+impl FileNames {
+    pub fn insert(&mut self, key: u64, name: &str) {
+        if key == 0 || name.is_empty() {
+            return;
+        }
+        if self.map.insert(key, name.into()).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > FILE_NAME_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, key: u64) -> Option<&str> {
+        self.map.get(&key).map(|s| &**s)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Keeps a per-file tally from growing without limit over a long run: when it goes over `cap`,
+/// only the half that waited longest is kept. Rare and bounded, so the ETW callback stays cheap.
+pub fn cap_by_wait<K: Copy + Eq + std::hash::Hash>(m: &mut HashMap<K, FileWait>, cap: usize) {
+    if m.len() <= cap {
+        return;
+    }
+    let mut totals: Vec<i64> = m.values().map(|v| v.total).collect();
+    totals.sort_unstable();
+    let cut = totals[totals.len() / 2];
+    let mut room = cap / 2;
+    m.retain(|_, v| {
+        if v.total <= cut || room == 0 {
+            return false;
+        }
+        room -= 1;
+        true
+    });
 }
 
 #[derive(Default, Clone, Copy)]
@@ -98,6 +176,13 @@ pub struct Inner {
     pub faults_by_pid: HashMap<u32, LatStat>,
     pub disks: HashMap<u32, LatStat>,
     pub notable: Vec<Notable>,
+
+    /// File names, and the whole run's waiting totaled per file. The ring buffers above only
+    /// reach 20 s back, so these are what the summary's file tables are built from.
+    pub file_names: FileNames,
+    pub file_wait: HashMap<u64, FileWait>,
+    /// Hard-fault waiting per (process, file), for "mostly reading back <file>".
+    pub fault_file: HashMap<(u32, u64), FileWait>,
 
     /// --debug only: event counts by (provider GUID data1, opcode), and a few DPC/ISR
     /// events whose computed duration was rejected as (event time, InitialTime).

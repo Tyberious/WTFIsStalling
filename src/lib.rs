@@ -12,6 +12,7 @@ pub mod diskwhy;
 pub mod engine;
 pub mod etw;
 pub mod evlog;
+pub mod files;
 pub mod gpu;
 pub mod health;
 pub mod modules;

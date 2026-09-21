@@ -18,8 +18,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD,
-    EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS,
-    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT,
+    EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -45,6 +46,9 @@ const GUID_PERFINFO: u32 = 0xce1d_bfb4;
 const GUID_DISKIO: u32 = 0x3d6f_a8d4;
 const GUID_PAGEFAULT: u32 = 0x3d6f_a8d3;
 const GUID_THREAD: u32 = 0x3d6f_a8d1;
+/// FileIoGuid = 90cbdc39-4a3e-11d1-84f4-0000f80464e3.
+/// https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants
+const GUID_FILEIO: u32 = 0x90cb_dc39;
 
 pub struct Session {
     handle: CONTROLTRACE_HANDLE,
@@ -122,15 +126,23 @@ fn try_start(flags: u32) -> Result<CONTROLTRACE_HANDLE, u32> {
 
 impl Session {
     pub fn start(want_profile: bool) -> Result<Session, String> {
-        let base = EVENT_TRACE_FLAG_PROCESS
+        let core = EVENT_TRACE_FLAG_PROCESS
             | EVENT_TRACE_FLAG_THREAD
             | EVENT_TRACE_FLAG_DISK_IO
             | EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS
             | EVENT_TRACE_FLAG_DPC
             | EVENT_TRACE_FLAG_INTERRUPT;
+        // DISK_FILE_IO (0x200, "requires disk IO" - evntrace.h) adds only the FileIo_Name class:
+        // one small event per file object, not one per file operation. The per-operation classes
+        // live behind FILE_IO_INIT (FileIo_ReadWrite, FileIo_Create, ...) and FILE_IO
+        // (FileIo_OpEnd), which this tool must not enable: those fire for every read and write on
+        // the machine. https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties
+        let base = core | EVENT_TRACE_FLAG_DISK_FILE_IO;
         let profile = want_profile && enable_privilege("SeSystemProfilePrivilege");
-        let mut attempts = vec![(base, false)];
+        // Last resort: a session with no file names at all still reports everything else.
+        let mut attempts = vec![(base, false), (core, false)];
         if profile {
+            attempts.insert(0, (core | EVENT_TRACE_FLAG_PROFILE, true));
             attempts.insert(0, (base | EVENT_TRACE_FLAG_PROFILE, true));
         }
         let mut last = 0;
@@ -201,6 +213,28 @@ fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
 
 fn rd_u64(d: &[u8], off: usize) -> Option<u64> {
     d.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// Longest file path the kernel can hand us that is worth keeping (NTFS allows 32767 with the
+/// \\?\ prefix, but nothing that long belongs in a report).
+const MAX_PATH_CHARS: usize = 320;
+
+/// A UTF-16, null-terminated MOF string at `off`. Returns None for a truncated or empty one.
+/// An odd trailing byte is ignored rather than read past the end of the payload.
+fn rd_wstr(d: &[u8], off: usize) -> Option<String> {
+    let tail = d.get(off..)?;
+    let mut units: Vec<u16> = Vec::new();
+    for pair in tail.chunks(2) {
+        if pair.len() < 2 {
+            break;
+        }
+        let u = u16::from_le_bytes([pair[0], pair[1]]);
+        if u == 0 || units.len() >= MAX_PATH_CHARS {
+            break;
+        }
+        units.push(u);
+    }
+    (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
 }
 
 /// Which CPU an event was logged on. `ETW_BUFFER_CONTEXT` holds a u16 `ProcessorIndex` in a
@@ -292,9 +326,13 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
                 push_notable(inner, Notable::LongExec(r));
             }
         }
-        // HardFault: InitialTime, ReadOffset, VirtualAddress, FileObject, TThreadId, ByteCount
+        // HardFault (64-bit): InitialTime u64 @0, ReadOffset u64 @8, VirtualAddress ptr @16,
+        // FileObject ptr @24, TThreadId u32 @32, ByteCount u32 @36. FileObject: "Match the value
+        // of this pointer to the FileObject pointer value in a FileIo_Name event to determine the
+        // name of the file." https://learn.microsoft.com/en-us/windows/win32/etw/pagefault-hardfault
         (GUID_PAGEFAULT, 32) => {
             let start = rd_u64(d, 0)? as i64;
+            let file = rd_u64(d, 24).unwrap_or(0);
             let tid = rd_u32(d, 32)?;
             let bytes = rd_u32(d, 36).unwrap_or(0);
             let dur = ts.wrapping_sub(start);
@@ -302,39 +340,89 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
                 return None;
             }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
-            let r = FaultRec { start, end: ts, tid, pid, bytes };
+            let r = FaultRec { start, end: ts, tid, pid, bytes, file };
             inner.faults.push_back(r);
             let st = inner.faults_by_pid.entry(pid).or_default();
             st.count += 1;
             st.total += dur;
             st.max = st.max.max(dur);
+            if file != 0 {
+                add_wait(&mut inner.fault_file, (pid, file), 0, dur);
+                cap_by_wait(&mut inner.fault_file, FILE_WAIT_CAP);
+            }
             if dur >= shared.fault_warn {
                 st.slow += 1;
                 push_notable(inner, Notable::SlowFault(r));
             }
         }
-        // Read / Write / Flush completion
+        // Read / Write (DiskIo_TypeGroup1, 64-bit): DiskNumber u32 @0, IrpFlags u32 @4,
+        // TransferSize u32 @8, Reserved u32 @12, ByteOffset i64 @16, FileObject ptr @24,
+        // Irp ptr @32, HighResResponseTime u64 @40, IssuingThreadId u32 @48.
+        // Flush (DiskIo_TypeGroup3): DiskNumber @0, IrpFlags @4, HighResResponseTime u64 @8,
+        // Irp ptr @16, IssuingThreadId u32 @24 - no file object at all, so flushes stay unnamed.
+        // https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1
+        // https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup3
         (GUID_DISKIO, 10 | 11 | 14) => {
             let disk = rd_u32(d, 0)?;
-            let (size, dur, tid, op) = if opcode == 14 {
-                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F')
+            let (size, dur, tid, op, file) = if opcode == 14 {
+                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F', 0)
             } else {
-                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' })
+                let file = rd_u64(d, 24).unwrap_or(0);
+                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' }, file)
             };
             if !(0..MAX_SANE).contains(&dur) {
                 return None;
             }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
-            let r = IoRec { end: ts, dur, disk, tid, pid, size, op };
+            let r = IoRec { end: ts, dur, disk, tid, pid, size, op, file };
             inner.ios.push_back(r);
             let st = inner.disks.entry(disk).or_default();
             st.count += 1;
             st.total += dur;
             st.max = st.max.max(dur);
+            if file != 0 {
+                add_wait(&mut inner.file_wait, file, disk, dur);
+                cap_by_wait(&mut inner.file_wait, FILE_WAIT_CAP);
+            }
             if dur >= shared.io_warn {
                 st.slow += 1;
                 push_notable(inner, Notable::SlowIo(r));
             }
+        }
+        // FileIo_Name / FileCreate / FileDelete / FileRundown, all one MOF class (64-bit):
+        // FileObject ptr @0, FileName UTF-16 null-terminated @8.
+        // https://learn.microsoft.com/en-us/windows/win32/etw/fileio-name
+        // https://learn.microsoft.com/en-us/windows/win32/etw/fileio  (event types 0, 32, 35, 36)
+        //
+        // The field is documented as the FileObject, but in the rundown (36) it is really the
+        // FileKey (the FILE_OBJECT's FsContext), which is what DiskIo and HardFault carry for a
+        // mapped file - a long-known discrepancy, see
+        // https://lowleveldesign.wordpress.com/2020/08/15/fixing-empty-paths-in-fileio-events-etw/
+        // Both are pointers into one kernel address space, so keying every name event by the
+        // value it carries and looking up whatever the I/O event carries resolves either kind
+        // without having to know which is which.
+        //
+        // FileDelete still inserts: the file is gone, but requests already recorded for it are
+        // not, and they still deserve a name. Eviction is what bounds this map, not deletion.
+        (GUID_FILEIO, 0 | 32 | 35 | 36) => {
+            let key = rd_u64(d, 0)?;
+            // The rundown (36) arrives when the session stops and names EVERY open file on the PC:
+            // about 130,000 on the development machine, against a map capped at 40,000. Only files
+            // that waited on a disk during this run are of any use by then, so once the map is
+            // half full the rest are skipped instead of pushing useful names out. (Measured live;
+            // Microsoft documents the timing, "at the end of the trace session", not the count.)
+            if opcode == 36 && inner.file_names.len() >= crate::state::FILE_NAME_CAP / 2 && !inner.file_wait.contains_key(&key) {
+                return Some(());
+            }
+            let name = rd_wstr(d, 8)?;
+            // The kernel recycles FILE_OBJECT addresses, so one key can name a different file
+            // later in the run. Seeing the key change name means the old tally belongs to a file
+            // we can no longer name: drop it rather than add it to the new file's waiting, which
+            // would put someone else's seconds against this one's name.
+            if inner.file_names.get(key).is_some_and(|had| had != name) {
+                inner.file_wait.remove(&key);
+            }
+            inner.file_names.insert(key, &name);
         }
         // Thread Start / DCStart (rundown): ProcessId, TThreadId
         (GUID_THREAD, 1 | 3) => {
@@ -345,6 +433,13 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
         _ => {}
     }
     Some(())
+}
+
+fn add_wait<K: Copy + Eq + std::hash::Hash>(m: &mut std::collections::HashMap<K, FileWait>, key: K, disk: u32, dur: i64) {
+    let e = m.entry(key).or_insert(FileWait { disk, ..FileWait::default() });
+    e.count += 1;
+    e.total += dur;
+    e.max = e.max.max(dur);
 }
 
 fn push_notable(inner: &mut Inner, n: Notable) {
@@ -411,15 +506,184 @@ mod tests {
         thread.extend(77u32.to_le_bytes()); // TThreadId
         handle_event(&sh, &mut inner, GUID_THREAD, 3, 1_000, 0, &thread);
 
-        let mut fault = vec![0u8; 40];
-        fault[0..8].copy_from_slice(&2_000_000u64.to_le_bytes()); // InitialTime
-        fault[32..36].copy_from_slice(&77u32.to_le_bytes()); // TThreadId
-        fault[36..40].copy_from_slice(&4096u32.to_le_bytes()); // ByteCount
-        handle_event(&sh, &mut inner, GUID_PAGEFAULT, 32, 2_060_000, 0, &fault);
+        handle_event(&sh, &mut inner, GUID_PAGEFAULT, 32, 2_060_000, 0, &fault_payload(2_000_000, 0, 77, 4096));
 
         let f = inner.faults.back().expect("fault recorded");
         assert_eq!((f.pid, f.end - f.start), (4242, 60_000));
         assert_eq!(inner.faults_by_pid[&4242].slow, 1);
+    }
+
+    fn fault_payload(initial_time: u64, file: u64, tid: u32, bytes: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 40];
+        d[0..8].copy_from_slice(&initial_time.to_le_bytes()); // InitialTime
+        d[24..32].copy_from_slice(&file.to_le_bytes()); // FileObject
+        d[32..36].copy_from_slice(&tid.to_le_bytes()); // TThreadId
+        d[36..40].copy_from_slice(&bytes.to_le_bytes()); // ByteCount
+        d
+    }
+
+    fn io_payload(disk: u32, size: u32, file: u64, response: u64, tid: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 52];
+        d[0..4].copy_from_slice(&disk.to_le_bytes()); // DiskNumber
+        d[8..12].copy_from_slice(&size.to_le_bytes()); // TransferSize
+        d[24..32].copy_from_slice(&file.to_le_bytes()); // FileObject
+        d[40..48].copy_from_slice(&response.to_le_bytes()); // HighResResponseTime
+        d[48..52].copy_from_slice(&tid.to_le_bytes()); // IssuingThreadId
+        d
+    }
+
+    /// The end-of-session rundown names every open file on the PC; only the ones that waited on
+    /// a disk may take up room once the map is filling.
+    #[test]
+    fn the_rundown_cannot_push_out_the_names_that_matter() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        const BUSY: u64 = 0xffff_aaaa_0000_0010;
+        // A file does slow I/O during the run; its name is not known yet.
+        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 65536, BUSY, 300_000, 9));
+        assert!(inner.file_wait.contains_key(&BUSY));
+        // Rundown: far more files than the cap, the busy one in the middle of them.
+        let total = crate::state::FILE_NAME_CAP as u64 * 3;
+        for k in 1..=total {
+            let key = if k == total / 2 { BUSY } else { 0xffff_bbbb_0000_0000 + k * 16 };
+            handle_event(&sh, &mut inner, GUID_FILEIO, 36, 9_000_000, 0, &name_payload(key, r"\Device\HarddiskVolume3\x.bin"));
+        }
+        assert_eq!(inner.file_names.get(BUSY), Some(r"\Device\HarddiskVolume3\x.bin"), "the file that waited keeps its name");
+        assert!(inner.file_names.len() <= crate::state::FILE_NAME_CAP / 2 + 1, "idle files stop being stored: {}", inner.file_names.len());
+    }
+
+    fn name_payload(key: u64, name: &str) -> Vec<u8> {
+        let mut d = key.to_le_bytes().to_vec();
+        d.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        d.extend([0, 0]); // NUL terminator
+        d
+    }
+
+    const FILE_KEY: u64 = 0xFFFF_8E01_2345_6780;
+
+    #[test]
+    fn a_name_event_names_the_disk_requests_that_carry_the_same_key() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
+        handle_event(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(1, 65536, FILE_KEY, 300_000, 9));
+
+        let io = inner.ios.back().expect("request recorded");
+        assert_eq!((io.file, io.disk, io.op), (FILE_KEY, 1, b'R'));
+        assert_eq!(inner.file_names.get(FILE_KEY), Some("\\Device\\HarddiskVolume3\\pagefile.sys"));
+        let w = inner.file_wait[&FILE_KEY];
+        assert_eq!((w.disk, w.count, w.total), (1, 1, 300_000));
+        // The rundown at the end of the trace carries the same shape and a FileKey instead.
+        handle_event(&sh, &mut inner, GUID_FILEIO, 36, 200, 0, &name_payload(7, "\\Device\\HarddiskVolume3\\$Mft"));
+        assert_eq!(inner.file_names.get(7), Some("\\Device\\HarddiskVolume3\\$Mft"));
+        // Repeating the same name (which the kernel does) must not throw the tally away.
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 300, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
+        assert_eq!(inner.file_wait[&FILE_KEY].count, 1);
+    }
+
+    /// Windows recycles FILE_OBJECT addresses. When a key comes back as a different file, the
+    /// waiting recorded under it must not be handed to the new file.
+    #[test]
+    fn a_recycled_file_object_does_not_inherit_the_old_files_waiting() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        handle_event(&sh, &mut inner, GUID_FILEIO, 32, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\big.log"));
+        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 4096, FILE_KEY, 900_000, 9));
+        assert_eq!(inner.file_wait[&FILE_KEY].total, 900_000);
+
+        handle_event(&sh, &mut inner, GUID_FILEIO, 32, 6_000, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\other.dat"));
+        assert!(!inner.file_wait.contains_key(&FILE_KEY), "the old tally went with the old name");
+        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 7_000, 0, &io_payload(1, 4096, FILE_KEY, 10, 9));
+        assert_eq!(inner.file_wait[&FILE_KEY].total, 10, "the new file starts from zero");
+        assert_eq!(inner.file_names.get(FILE_KEY), Some("\\Device\\HarddiskVolume3\\other.dat"));
+    }
+
+    #[test]
+    fn hard_faults_are_totaled_per_process_and_file() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        let mut thread = 42u32.to_le_bytes().to_vec();
+        thread.extend(7u32.to_le_bytes());
+        handle_event(&sh, &mut inner, GUID_THREAD, 3, 10, 0, &thread);
+        for i in 0..3 {
+            handle_event(&sh, &mut inner, GUID_PAGEFAULT, 32, 1_000 + i * 100, 0, &fault_payload(1_000, FILE_KEY, 7, 4096));
+        }
+        let w = inner.fault_file[&(42, FILE_KEY)];
+        assert_eq!((w.count, w.max), (3, 200));
+        assert_eq!(inner.faults.back().unwrap().file, FILE_KEY);
+    }
+
+    /// Flush events (DiskIo_TypeGroup3) have no FileObject field; nothing may be invented.
+    #[test]
+    fn flushes_and_nameless_requests_are_left_unnamed() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        let mut flush = vec![0u8; 28];
+        flush[8..16].copy_from_slice(&400_000u64.to_le_bytes());
+        handle_event(&sh, &mut inner, GUID_DISKIO, 14, 9_000, 0, &flush);
+        assert_eq!(inner.ios.back().unwrap().file, 0);
+        assert!(inner.file_wait.is_empty(), "a zero file object is never a map key");
+    }
+
+    #[test]
+    fn garbage_and_truncated_name_events_are_ignored() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[]);
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[0xFF; 7]); // no room for the key
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &1u64.to_le_bytes()); // key, no name
+        assert!(inner.file_names.is_empty(), "nothing usable in any of those");
+        // A payload that ends mid-character: keep the characters that are whole, read no further.
+        let mut odd = 2u64.to_le_bytes().to_vec();
+        odd.extend([b'a', 0, b'b', 0, b'c']);
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &odd);
+        assert_eq!(inner.file_names.get(2), Some("ab"));
+        // A name longer than any real path is cut, not stored whole.
+        let mut huge = 3u64.to_le_bytes().to_vec();
+        huge.extend("x".repeat(5000).encode_utf16().flat_map(u16::to_le_bytes));
+        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &huge);
+        assert_eq!(inner.file_names.get(3).map(str::len), Some(MAX_PATH_CHARS));
+        // A payload cut short after the file object still yields the request, just unnamed.
+        handle_event(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(0, 0, 5, 1, 0)[..20]);
+        assert!(inner.ios.is_empty());
+    }
+
+    #[test]
+    fn the_name_map_is_capped_and_evicts_the_oldest() {
+        let mut names = FileNames::default();
+        for i in 1..=(FILE_NAME_CAP as u64 + 100) {
+            names.insert(i, &format!("\\Device\\HarddiskVolume1\\f{i}"));
+        }
+        assert_eq!(names.len(), FILE_NAME_CAP);
+        assert_eq!(names.get(1), None, "the oldest went first");
+        assert!(names.get(FILE_NAME_CAP as u64 + 100).is_some());
+        // Re-inserting a known key must not grow the eviction queue.
+        let before = names.len();
+        names.insert(FILE_NAME_CAP as u64 + 100, "\\Device\\HarddiskVolume1\\renamed");
+        assert_eq!((names.len(), names.get(FILE_NAME_CAP as u64 + 100)), (before, Some("\\Device\\HarddiskVolume1\\renamed")));
+        names.insert(0, "ignored");
+        names.insert(999_999, "");
+        assert_eq!(names.len(), before);
+    }
+
+    #[test]
+    fn the_per_file_tally_is_capped_by_dropping_the_files_that_waited_least() {
+        let mut m: std::collections::HashMap<u64, FileWait> = std::collections::HashMap::new();
+        for i in 1..=(FILE_WAIT_CAP as u64 + 500) {
+            m.insert(i, FileWait { disk: 0, count: 1, total: i as i64, max: i as i64 });
+        }
+        let biggest = (FILE_WAIT_CAP as u64 + 500) as i64;
+        cap_by_wait(&mut m, FILE_WAIT_CAP);
+        assert!(m.len() <= FILE_WAIT_CAP / 2, "{} left", m.len());
+        assert!(m.values().all(|v| v.total > biggest / 3), "only the longest waits survive");
+        // Under the cap nothing is touched, and all-equal totals still terminate.
+        let mut small: std::collections::HashMap<u64, FileWait> = (0..10).map(|i| (i, FileWait::default())).collect();
+        cap_by_wait(&mut small, FILE_WAIT_CAP);
+        assert_eq!(small.len(), 10);
+        let mut tied: std::collections::HashMap<u64, FileWait> =
+            (0..FILE_WAIT_CAP as u64 + 10).map(|i| (i, FileWait { total: 5, ..FileWait::default() })).collect();
+        cap_by_wait(&mut tied, FILE_WAIT_CAP);
+        assert!(tied.is_empty(), "all tied: the whole tally is dropped rather than grown");
     }
 
     /// The flag decides which half of the union is real; without it the u16 is

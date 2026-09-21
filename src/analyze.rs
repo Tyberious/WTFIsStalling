@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
 use crate::diskwhy::{self, Cause, DiskWhy};
+use crate::files::{self, DosMap};
 use crate::health::{self, DriveHealth};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
@@ -53,6 +54,8 @@ pub struct Analyzer {
     pub modules: ModuleMap,
     pub procs: ProcNames,
     pub disks: DiskMap,
+    /// Drive letters, for turning the kernel's `\Device\HarddiskVolume3\...` into `C:\...`.
+    pub(crate) dos: DosMap,
     /// What this PC's CPUs are: processor groups, and P-cores vs E-cores on a hybrid chip.
     pub(crate) topo: Topology,
     /// Why each disk's slow requests were slow, as far as the traffic around them can tell.
@@ -111,6 +114,7 @@ impl Analyzer {
             modules,
             procs: ProcNames::new(),
             disks,
+            dos: DosMap::live(),
             topo: topology().clone(),
             disk_why: HashMap::new(),
             health_at_start,
@@ -153,6 +157,7 @@ impl Analyzer {
             modules,
             procs,
             disks: DiskMap::new(),
+            dos: DosMap::default(),
             topo: Topology::default(),
             disk_why: HashMap::new(),
             health_at_start: HashMap::new(),
@@ -380,6 +385,25 @@ impl Analyzer {
         self.incidents.push(IncidentSummary { kind: StallKind::Kernel, start, dur, culprit, marked: true, cpus });
     }
 
+    /// The one place a file path turns into report text: NT device path -> drive letter, then
+    /// the privacy rule in `files`. `None` when the trace never named that file; the report then
+    /// says nothing rather than printing "(file name not available)" hundreds of times.
+    ///
+    /// Names for files already open when the trace started only arrive with the rundown at the
+    /// end of the session, so during the run this resolves the files opened since it began. By
+    /// the time the summary is built, the rundown has been consumed and nearly everything
+    /// resolves.
+    pub(crate) fn file_label(&self, key: u64) -> Option<String> {
+        if key == 0 {
+            return None;
+        }
+        let inner = self.shared.inner.lock().unwrap();
+        let raw = inner.file_names.get(key)?.to_string();
+        drop(inner);
+        let shown = files::public_path(&self.dos.to_dos(&raw));
+        (!shown.is_empty()).then_some(shown)
+    }
+
     fn print_longest_execs(&mut self, ev: &Evidence) {
         let mut execs: Vec<&ExecRec> = ev.execs.iter().collect();
         execs.sort_by_key(|e| std::cmp::Reverse(e.end - e.start));
@@ -562,8 +586,9 @@ impl Analyzer {
     fn print_slow_io(&mut self, ev: &Evidence) {
         let slow_io: Vec<_> = ev.ios.iter().filter(|i| i.dur >= ms_to_ticks(20.0)).collect();
         if let Some(worst) = slow_io.iter().max_by_key(|i| i.dur) {
+            let file = self.file_label(worst.file).map(|f| format!(", on {f}")).unwrap_or_default();
             say!(
-                "    Slow disk I/O nearby:    {} slow request(s), worst {} on {} ({}, issued by {})",
+                "    Slow disk I/O nearby:    {} slow request(s), worst {} on {} ({}, issued by {}{file})",
                 slow_io.len(),
                 fmt_dur(worst.dur),
                 self.disks.get(worst.disk).short(),
@@ -587,16 +612,30 @@ impl Analyzer {
                 }
             }
             let now = qpc();
+            // The file this event touched, if the trace has named it by now.
+            let file = match &n {
+                Notable::SlowFault(f) => self.file_label(f.file),
+                Notable::SlowIo(i) => self.file_label(i.file),
+                Notable::LongExec(_) => None,
+            };
             // One disk, driver or program that keeps doing the same thing gets a few full lines
-            // and then a roll-up; see `quiet`. The summary still counts every event.
+            // and then a roll-up; see `quiet`. The summary still counts every event. The file is
+            // deliberately NOT part of the subject: a download writing a thousand files would
+            // then be a thousand subjects and nothing would ever fold. It rides along in the
+            // note instead, where the roll-up reports it for the worst event it folded away.
+            let named = file.clone().unwrap_or_default();
             let (subject, duration, note) = match &n {
                 Notable::LongExec(e) => {
                     (format!("driver {}", self.modules.name(e.routine)), e.end - e.start, kind_name(e.kind).to_string())
                 }
                 Notable::SlowFault(f) => {
-                    (format!("paging {}", process_name(&self.procs.label(f.pid, f.tid))), f.end - f.start, String::new())
+                    let note = if named.is_empty() { String::new() } else { format!("from {named}") };
+                    (format!("paging {}", process_name(&self.procs.label(f.pid, f.tid))), f.end - f.start, note)
                 }
-                Notable::SlowIo(i) => (format!("disk {}", i.disk), i.dur, why.clone()),
+                Notable::SlowIo(i) => {
+                    let note = if named.is_empty() { why.clone() } else { format!("{why}, on {named}") };
+                    (format!("disk {}", i.disk), i.dur, note)
+                }
             };
             if !self.quiet.offer(&subject, duration, &note, now) {
                 self.notable_folded += 1;
@@ -621,18 +660,20 @@ impl Analyzer {
                     self.cpu_label(e.cpu)
                 ),
                 Notable::SlowFault(f) => say!(
-                    "[{}] slow hard page fault {:>9}  {} waited on disk for paged-out memory ({} KB)",
+                    "[{}] slow hard page fault {:>9}  {} waited on disk for paged-out memory ({} KB){}",
                     clock().fmt(f.start),
                     fmt_dur(f.end - f.start),
                     self.procs.label(f.pid, f.tid),
-                    f.bytes / 1024
+                    f.bytes / 1024,
+                    file.map(|f| format!("  from {f}")).unwrap_or_default()
                 ),
                 Notable::SlowIo(i) => say!(
-                    "[{}] slow disk {:<5} {:>9}  {}  {} KB  issued by {}  ({why})",
+                    "[{}] slow disk {:<5} {:>9}  {}{}  {} KB  issued by {}  ({why})",
                     clock().fmt(i.end - i.dur),
                     op_name(i.op),
                     fmt_dur(i.dur),
                     self.disks.get(i.disk).short(),
+                    file.map(|f| format!("  {f}")).unwrap_or_default(),
                     i.size / 1024,
                     self.procs.label(i.pid, i.tid)
                 ),
@@ -753,6 +794,25 @@ mod tests {
         az.topo = crate::topology::Topology::build(&[8], &sets);
         assert_eq!(az.cpu_label(1), "1 (P-core)");
         assert_eq!(az.cpu_label(5), "5 (E-core)");
+    }
+
+    /// Every file name in the report goes through this one function: drive letter first, then
+    /// the privacy rule. A file the trace never named must produce nothing at all.
+    #[test]
+    fn file_names_are_converted_and_redacted_before_they_can_be_printed() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        az.dos = DosMap::from_pairs(&[("\\Device\\HarddiskVolume3", "C:")]);
+        {
+            let mut inner = az.shared.inner.lock().unwrap();
+            inner.file_names.insert(10, "\\Device\\HarddiskVolume3\\pagefile.sys");
+            inner.file_names.insert(11, "\\Device\\HarddiskVolume3\\Users\\Jennifer\\Documents\\secret.docx");
+            inner.file_names.insert(12, "\\Device\\HarddiskVolume9\\Stuff\\thing.bin");
+        }
+        assert_eq!(az.file_label(10).as_deref(), Some("C:\\pagefile.sys"));
+        assert_eq!(az.file_label(11).as_deref(), Some("C:\\Users\\...\\(a .docx file)"));
+        assert_eq!(az.file_label(12).as_deref(), Some("\\Device\\HarddiskVolume9\\...\\thing.bin"));
+        assert_eq!(az.file_label(0), None, "no file object: nothing to say");
+        assert_eq!(az.file_label(999), None, "the trace never named it: nothing to say");
     }
 
     // --- verdict_kernel / verdict_sched, on synthetic evidence -----------------------------
