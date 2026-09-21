@@ -202,7 +202,12 @@ const REPORT_WIDTH: usize = 118;
 pub fn compose_report(header: &[String], summary: &Summary, events: &[String]) -> String {
     let mut report: Vec<String> = header.to_vec();
     report.extend(summary.result_lines());
-    report.extend(summary.detail_lines());
+    // Table rows fit by construction; the legends and notes under them (a drive's health line, what
+    // a file is, which device a driver belongs to) are prose and get wrapped like the event log,
+    // so the window never needs a horizontal scroll bar.
+    for line in summary.detail_lines() {
+        wrap_line(&line, &mut report);
+    }
     report.push(String::new());
     report.push("EVENT LOG (chronological)".into());
     let events: Vec<&String> = events.iter().skip_while(|l| l.trim().is_empty()).collect();
@@ -436,7 +441,10 @@ mod tests {
         let header = vec!["WTFIsStalling test".to_string()];
         let long = format!("    VERDICT: {}", "word ".repeat(60));
         let events = vec![String::new(), "[12:00:00.000] STALL #1".to_string(), long];
-        let report = compose_report(&header, &Summary::demo(Health::Problem), &events);
+        // A real run's DETAILS carry prose wider than any table: a drive-health line, what a file is.
+        let mut summary = Summary::demo(Health::Problem);
+        summary.details.push(format!("  disk 0   59 °C  |  {}", "6% of rated life used  |  ".repeat(8)));
+        let report = compose_report(&header, &summary, &events);
 
         assert!(!report.replace("\r\n", "").contains('\n'), "every line break must be CRLF or the GUI shows one endless line");
         let lines: Vec<&str> = report.split("\r\n").collect();

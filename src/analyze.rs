@@ -1,14 +1,16 @@
 //! Correlates probe stalls with what ETW saw on the affected CPUs, prints incident
 //! reports as they happen and the final summary.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
+use crate::diskwait::{self, Role};
 use crate::diskwhy::{self, Cause, DiskWhy};
 use crate::files::{self, DosMap};
 use crate::health::{self, DriveHealth};
+use crate::intr::{self, Flow, Reference};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
 use crate::procs::{process_name, ProcNames};
@@ -18,8 +20,95 @@ use crate::state::*;
 use crate::topology::{topology, Topology};
 use crate::util::{clock, fmt_dur, ms_to_ticks, plural, qpc, ticks_to_ms};
 
+/// What kind of event an incident was. A stall that holds one core is a different animal from
+/// one that stops the whole machine, and the report has to count and word them separately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IncidentClass {
+    /// Every (or nearly every) logical CPU held at once, for long enough to feel.
+    Freeze,
+    /// One or a few cores held at kernel level.
+    Kernel,
+    /// A normal-priority thread could not get a core.
+    Starvation,
+}
+
+/// A whole-PC freeze has to last at least this long. 0.1 s is the classic limit below which a
+/// person perceives a system as reacting instantly (Miller 1968; Card, Robertson & Mackinlay
+/// 1991, as summarized in nngroup.com/articles/response-times-3-important-limits), so a gap
+/// shorter than this is a latency problem, not "the PC stopped". Deliberately well under the
+/// 750-1300 ms of the field reports in issue #15: those must not be what defines the class.
+pub const FREEZE_MS: f64 = 100.0;
+
+/// How many logical CPUs have to be held at once for "the whole PC stopped".
+///
+/// Requiring literally all of them is right on a 4-thread laptop and wrong on a 64-thread
+/// workstation, where a single probe that is itself descheduled, or one CPU parked by the power
+/// manager, would hide every freeze. So: all of them up to 4 CPUs, and three quarters (never
+/// fewer than 4) above that.
+pub fn freeze_cpu_floor(ncpu: usize) -> usize {
+    if ncpu <= 4 {
+        ncpu
+    } else {
+        (ncpu * 3).div_ceil(4).max(4)
+    }
+}
+
+/// Two probes with different priorities, in two processes, see the same freeze a few ms apart.
+/// They are matched by their edges rather than merged blindly, so an unrelated starvation stall
+/// that happens to be nearby stays its own incident.
+const TWIN_SLACK_MS: f64 = 25.0;
+/// How long a ripe cluster is held waiting for its twin from the other probe. Bounded on
+/// purpose: past this the sibling is not coming, and the incident is reported alone.
+const TWIN_WAIT_MS: f64 = 500.0;
+
+/// How far back the reference window for interrupt rates reaches. The ring buffers keep 20 s, and
+/// a single 500 ms slice is far too short for a source that comes in bursts.
+const REF_MS: f64 = 8000.0;
+/// Below this much usable reference, the continuity check says nothing at all.
+const REF_MIN_MS: f64 = 2000.0;
+/// A DPC/ISR share of one CPU's stall this high is the driver executing, not a sample landing.
+const COVER_RULE: f64 = 0.35;
+/// A share of the samples this high points at whatever was on the CPU...
+const SHARE_RULE: f64 = 0.4;
+/// ...but never on fewer samples than this, and the count is printed when it is thin.
+const MIN_SAMPLES: usize = 4;
+const THIN_SAMPLES: usize = 10;
+
+/// Which interrupt sources kept going through a freeze, and what coincided with it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FreezeFacts {
+    pub(crate) cpus: usize,
+    pub(crate) ncpu: usize,
+    /// Share of the CPU samples inside the freeze that were the Idle process.
+    pub(crate) idle_share: f64,
+    pub(crate) samples: usize,
+    /// Programs seen on the CPUs. Context only: in a whole-PC freeze they are stopped too.
+    pub(crate) on_cpu: Vec<String>,
+    /// Steady interrupt sources that stopped, and ones that carried on, with the share of their
+    /// usual rate seen inside the freeze.
+    pub(crate) silent: Vec<(String, f64)>,
+    pub(crate) continued: Vec<(String, f64)>,
+    /// Whether timer DPCs (the clock that wakes threads) stopped, when it could be judged.
+    pub(crate) timer: Option<Flow>,
+    /// Ordinary DPCs kept executing right through it, so no CPU was held at raised IRQL.
+    pub(crate) dpcs_kept_running: bool,
+    /// A driver whose own DPC/ISR code really did cover the stall on most CPUs, if any.
+    pub(crate) holding: Option<(String, usize)>,
+    pub(crate) coincided: Option<Coincided>,
+}
+
+/// A storage event that overlapped a freeze. Never a cause, only a coincidence.
+#[derive(Clone, Debug)]
+pub(crate) struct Coincided {
+    pub(crate) disk: Option<u32>,
+    pub(crate) role: Role,
+    pub(crate) waited: i64,
+    /// That drive had been asleep before this run's slow requests.
+    pub(crate) woke: bool,
+}
+
 pub(crate) struct IncidentSummary {
-    pub(crate) kind: StallKind,
+    pub(crate) class: IncidentClass,
     pub(crate) start: i64,
     pub(crate) dur: i64,
     pub(crate) culprit: String,
@@ -27,6 +116,16 @@ pub(crate) struct IncidentSummary {
     pub(crate) marked: bool,
     /// The CPUs whose probes were held up (system-wide indexes); empty for CPU starvation.
     pub(crate) cpus: Vec<u16>,
+    /// Set on a `Freeze`; what the interrupt records say about it.
+    pub(crate) freeze: Option<FreezeFacts>,
+}
+
+/// One slow request seen on a disk, and whether a whole-PC freeze explains it.
+#[derive(Clone, Copy)]
+pub(crate) struct SlowSeen {
+    pub(crate) end: i64,
+    pub(crate) dur: i64,
+    pub(crate) victim: bool,
 }
 
 /// Moments the user flagged with "I felt it" (QPC), waiting for the analyzer to pick them up.
@@ -60,6 +159,8 @@ pub struct Analyzer {
     pub(crate) topo: Topology,
     /// Why each disk's slow requests were slow, as far as the traffic around them can tell.
     pub(crate) disk_why: HashMap<u32, DiskWhy>,
+    /// Every slow request seen per disk, and whether a freeze explains it (see `diskwait`).
+    pub(crate) disk_slow: HashMap<u32, Vec<SlowSeen>>,
     /// Each drive's own health counters when monitoring began; the summary compares against them.
     pub(crate) health_at_start: HashMap<u32, DriveHealth>,
     started: i64,
@@ -94,6 +195,10 @@ struct Evidence {
     samples: Vec<(SampleRec, u32)>,
     /// Samples per CPU in the 500 ms before the incident: the "normal" sampling rate.
     baseline: HashMap<u16, u32>,
+    /// DPC/ISR runs in the reference window before the incident, and how long that window was.
+    /// Empty when there was no usable stretch (the previous incident was too close).
+    ref_execs: Vec<ExecRec>,
+    ref_seconds: f64,
     etw_caught_up: bool,
 }
 
@@ -101,6 +206,33 @@ const BASELINE_MS: f64 = 500.0;
 
 /// (name, fraction of samples), biggest first.
 type Shares = Vec<(String, f64)>;
+
+/// One DPC/ISR routine's activity inside a stall: ((routine, kind), (overlap, longest, count)).
+type RoutineRow = ((u64, u8), (i64, i64, u32));
+
+/// What the DPC/ISR and sample records say about one cluster of stalls.
+struct Look {
+    routines: Vec<RoutineRow>,
+    /// Per stalled CPU: its own DPC/ISR coverage, and whether DPCs kept running through it.
+    per_cpu: Vec<CpuStall>,
+    /// A module whose own DPC/ISR code covered `COVER_RULE` of the stall on at least half of the
+    /// stalled CPUs, with how many CPUs that was.
+    blame: Option<(String, usize)>,
+    /// Best single-CPU coverage in the cluster, for the "nothing explains it" sentence.
+    best_coverage: f64,
+    /// Share of the stalled CPUs on which ordinary DPCs were NOT running through the stall.
+    held_share: f64,
+    seen_samples: f64,
+    expected_samples: f64,
+    on_cpu_procs: Shares,
+    on_cpu_mods: Shares,
+    samples: usize,
+}
+
+struct CpuStall {
+    coverage: f64,
+    held: bool,
+}
 
 impl Analyzer {
     pub fn new(shared: Arc<Shared>, rx: Receiver<Stall>, modules: ModuleMap, profile: bool) -> Analyzer {
@@ -117,6 +249,7 @@ impl Analyzer {
             dos: DosMap::live(),
             topo: topology().clone(),
             disk_why: HashMap::new(),
+            disk_slow: HashMap::new(),
             health_at_start,
             started: qpc(),
             profile,
@@ -160,6 +293,7 @@ impl Analyzer {
             dos: DosMap::default(),
             topo: Topology::default(),
             disk_why: HashMap::new(),
+            disk_slow: HashMap::new(),
             health_at_start: HashMap::new(),
             started: qpc(),
             profile,
@@ -177,6 +311,22 @@ impl Analyzer {
             notable_folded: 0,
             notable_total: 0,
         }
+    }
+
+    /// Logical CPUs on this PC, or 0 when the topology was never read (tests).
+    fn ncpu(&self) -> usize {
+        self.topo.total()
+    }
+
+    /// Hands stalls to the clustering in `tick` without a probe process behind them.
+    #[cfg(test)]
+    pub(crate) fn feed(&mut self, stalls: &[Stall]) {
+        self.pending.extend_from_slice(stalls);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.pending.len()
     }
 
     /// Called ~10x per second. `force` analyzes everything pending (shutdown).
@@ -211,22 +361,41 @@ impl Analyzer {
             }
         }
 
+        // One freeze is reported twice: by the pinned real-time probes in the child process and,
+        // a few ms later and through a different path, by the normal-priority probe here. Pair
+        // them up so it becomes one incident with one verdict and one tally row.
+        let (kernel, sched): (Vec<Vec<Stall>>, Vec<Vec<Stall>>) = clusters.into_iter().partition(|c| c[0].kind == StallKind::Kernel);
+        let mut sched: Vec<Option<Vec<Stall>>> = sched.into_iter().map(Some).collect();
+        let mut groups: Vec<(Vec<Stall>, Vec<Stall>)> = Vec::new();
+        for k in kernel {
+            let span = span_of(&k);
+            let twin = sched.iter_mut().find(|c| c.as_ref().is_some_and(|c| is_twin(span, span_of(c))));
+            let twin = twin.and_then(|t| t.take()).unwrap_or_default();
+            groups.push((k, twin));
+        }
+        groups.extend(sched.into_iter().flatten().map(|s| (Vec::new(), s)));
+
         // ETW delivers in ~1 s batches. A cluster is ripe once the trace has caught up past
         // its end, or we've waited long enough that it isn't going to.
         let latest = self.shared.inner.lock().unwrap().latest_ts;
-        for c in clusters {
-            let end = c.iter().map(|s| s.end).max().unwrap();
+        for (kernel, sched) in groups {
+            let end = kernel.iter().chain(sched.iter()).map(|s| s.end).max().unwrap();
             let age = now - end;
             let caught_up = latest > end + ms_to_ticks(50.0);
-            if force || (caught_up && age > ms_to_ticks(300.0)) || age > ms_to_ticks(4000.0) {
-                self.analyze(&c, caught_up);
+            let ripe = force || (caught_up && age > ms_to_ticks(300.0)) || age > ms_to_ticks(4000.0);
+            // Both halves in hand, or long enough that the other one is not coming. Time-based,
+            // so nothing can be held forever and nothing waits on a message that never arrives.
+            let paired = !kernel.is_empty() && !sched.is_empty();
+            if force || (ripe && (paired || age > ms_to_ticks(TWIN_WAIT_MS))) {
+                self.analyze(&kernel, &sched, caught_up);
             } else {
-                self.pending.extend(c);
+                self.pending.extend(kernel);
+                self.pending.extend(sched);
             }
         }
     }
 
-    fn gather(&self, from: i64, to: i64, wide_from: i64, caught_up: bool) -> Evidence {
+    fn gather(&self, from: i64, to: i64, wide_from: i64, ref_from: i64, caught_up: bool) -> Evidence {
         let inner = self.shared.inner.lock().unwrap();
         let base_from = from - ms_to_ticks(BASELINE_MS);
         let mut baseline = HashMap::new();
@@ -239,53 +408,95 @@ impl Analyzer {
                 *baseline.entry(s.cpu).or_insert(0) += 1;
             }
         }
+        let usable_ref = from - ref_from >= ms_to_ticks(REF_MIN_MS);
         Evidence {
             execs: inner.execs.iter().filter(|e| e.end >= from && e.start <= to).copied().collect(),
             faults: inner.faults.iter().filter(|f| f.end >= wide_from && f.start <= to).copied().collect(),
             ios: inner.ios.iter().filter(|i| i.end >= wide_from && i.end - i.dur <= to).copied().collect(),
             samples,
             baseline,
+            ref_execs: if usable_ref {
+                inner.execs.iter().filter(|e| e.start >= ref_from && e.start < from).copied().collect()
+            } else {
+                Vec::new()
+            },
+            ref_seconds: if usable_ref { ticks_to_ms(from - ref_from) / 1000.0 } else { 0.0 },
             etw_caught_up: caught_up,
         }
     }
 
-    fn analyze(&mut self, stalls: &[Stall], caught_up: bool) {
-        let kind = stalls[0].kind;
-        let start = stalls.iter().map(|s| s.start).min().unwrap();
-        let end = stalls.iter().map(|s| s.end).max().unwrap();
-        let worst = stalls.iter().map(|s| s.end - s.start).max().unwrap();
-        let lead = ms_to_ticks(if kind == StallKind::Kernel { 0.5 } else { 4.0 });
-        let ev = self.gather(start - lead, end, start - ms_to_ticks(100.0), caught_up);
+    fn analyze(&mut self, kernel: &[Stall], sched: &[Stall], caught_up: bool) {
+        let all: Vec<Stall> = kernel.iter().chain(sched.iter()).copied().collect();
+        let start = all.iter().map(|s| s.start).min().unwrap();
+        let end = all.iter().map(|s| s.end).max().unwrap();
+        let worst = all.iter().map(|s| s.end - s.start).max().unwrap();
+        let lead = ms_to_ticks(if kernel.is_empty() { 4.0 } else { 0.5 });
+        // The reference window for interrupt rates never reaches back into the previous incident:
+        // comparing a freeze with the tail of the last freeze would flatten exactly the signal
+        // this is looking for.
+        let prev_end = self.incidents.last().map_or(i64::MIN / 2, |i| i.start + i.dur);
+        let ref_to = start - lead;
+        let ref_from = (ref_to - ms_to_ticks(REF_MS)).max(prev_end + ms_to_ticks(200.0));
+        let ev = self.gather(ref_to, end, start - ms_to_ticks(100.0), ref_from, caught_up);
 
         let id = self.incidents.len() + 1;
-        let mut cpus: Vec<u16> = stalls.iter().filter_map(|s| s.cpu).collect();
+        let mut cpus: Vec<u16> = kernel.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
         // "4,5" as always; on a hybrid CPU "4 (P-core), 5 (E-core)", which needs the wider gap.
         let sep = if self.topo.hybrid() { ", " } else { "," };
         let cpu_list = cpus.iter().map(|c| self.cpu_label(*c)).collect::<Vec<_>>().join(sep);
 
+        let ncpu = self.ncpu();
+        let class = if kernel.is_empty() {
+            IncidentClass::Starvation
+        } else if ncpu > 0 && cpus.len() >= freeze_cpu_floor(ncpu) && worst >= ms_to_ticks(FREEZE_MS) {
+            IncidentClass::Freeze
+        } else {
+            IncidentClass::Kernel
+        };
+
         say!("");
-        match kind {
-            StallKind::Kernel => {
+        match class {
+            IncidentClass::Freeze => say!(
+                "[{}] FREEZE #{id}  the whole PC stopped  {}  ({} of {ncpu} CPUs held at once)",
+                clock().fmt(start),
+                fmt_dur(worst),
+                cpus.len()
+            ),
+            IncidentClass::Kernel => {
                 say!("[{}] STALL #{id}  kernel-level (DPC/ISR/firmware)  {}  on CPU {cpu_list}", clock().fmt(start), fmt_dur(worst))
             }
-            StallKind::Scheduler => say!(
+            IncidentClass::Starvation => say!(
                 "[{}] STALL #{id}  CPU starvation (normal-priority thread couldn't get a core)  {}",
                 clock().fmt(start),
                 fmt_dur(worst)
             ),
         }
+        if !kernel.is_empty() && !sched.is_empty() {
+            let sched_worst = sched.iter().map(|s| s.end - s.start).max().unwrap();
+            say!(
+                "    The normal-priority probe in this tool's other process was late by {} at the same instant: the same",
+                fmt_dur(sched_worst)
+            );
+            say!("    event seen twice, counted once.");
+        }
 
-        let culprit = match kind {
-            StallKind::Kernel => self.verdict_kernel(stalls, &ev),
-            StallKind::Scheduler => self.verdict_sched(&ev),
+        let mut freeze = None;
+        let culprit = match class {
+            IncidentClass::Freeze => {
+                let (culprit, facts) = self.verdict_freeze(kernel, &ev, ncpu, start, end);
+                freeze = Some(facts);
+                culprit
+            }
+            IncidentClass::Kernel => self.verdict_kernel(kernel, &ev),
+            IncidentClass::Starvation => self.verdict_sched(&ev, start, end),
         };
         self.print_io_context(&ev);
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
-        self.incidents.push(IncidentSummary { kind, start, dur: worst, culprit, marked: false, cpus });
+        self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, freeze });
     }
 
     /// "4" on an ordinary PC; "4 (E-core)" where the cores are not all the same. Nothing is
@@ -342,7 +553,7 @@ impl Analyzer {
         let noise = blips.iter().map(|s| s.end - s.start).max().unwrap_or(0);
         let in_window: Vec<Stall> = blips.into_iter().filter(|s| s.end - s.start >= ms_to_ticks(MARK_MIN_MS)).collect();
         let Some(worst) = in_window.iter().max_by_key(|s| s.end - s.start).copied() else {
-            let ev = self.gather(from, to, from, caught_up);
+            let ev = self.gather(from, to, from, from, caught_up);
             say!(
                 "    No CPU core was held up for {MARK_MIN_MS:.0} ms or more in that window (longest blip: {}, normal background noise),",
                 fmt_dur(noise)
@@ -376,13 +587,14 @@ impl Analyzer {
             offset_s.abs(),
             if offset_s >= 0.0 { "before" } else { "after" }
         );
-        let ev = self.gather(start - ms_to_ticks(0.5), end, from, caught_up);
+        let lead = start - ms_to_ticks(0.5);
+        let ev = self.gather(lead, end, from, lead - ms_to_ticks(REF_MS), caught_up);
         let culprit = self.verdict_kernel(&cluster, &ev);
         self.print_io_context(&ev);
         let mut cpus: Vec<u16> = cluster.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
-        self.incidents.push(IncidentSummary { kind: StallKind::Kernel, start, dur, culprit, marked: true, cpus });
+        self.incidents.push(IncidentSummary { class: IncidentClass::Kernel, start, dur, culprit, marked: true, cpus, freeze: None });
     }
 
     /// The one place a file path turns into report text: NT device path -> drive letter, then
@@ -417,88 +629,305 @@ impl Analyzer {
         }
     }
 
-    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> String {
-        // How much of each probe's blocked window was covered by DPC/ISR execution on its CPU.
+    /// Everything both kernel-side verdicts rest on, worked out once.
+    fn look(&mut self, stalls: &[Stall], ev: &Evidence) -> Look {
         let mut by_routine: HashMap<(u64, u8), (i64, i64, u32)> = HashMap::new(); // overlap, longest, count
-        let mut stalled = 0i64;
-        let mut covered = 0i64;
+                                                                                  // Per (module, CPU): the spans that module's own DPC/ISR code held, so coverage can be
+                                                                                  // judged per processor instead of being diluted across a cluster.
+        let mut per_module: HashMap<(String, u16), Vec<(i64, i64)>> = HashMap::new();
+        let mut per_cpu = Vec::new();
         let (mut seen_samples, mut expected_samples) = (0f64, 0f64);
         let mut window_samples: Vec<&(SampleRec, u32)> = Vec::new();
         for s in stalls {
             let cpu = s.cpu.unwrap_or(0);
-            stalled += s.end - s.start;
+            let len = (s.end - s.start).max(1);
             let mut spans: Vec<(i64, i64)> = Vec::new();
+            let mut dpc_starts: Vec<i64> = Vec::new();
             for e in ev.execs.iter().filter(|e| e.cpu == cpu) {
                 let overlap = e.end.min(s.end) - e.start.max(s.start);
                 if overlap > 0 {
                     spans.push((e.start.max(s.start), e.end.min(s.end)));
+                    per_module.entry((self.modules.name(e.routine), cpu)).or_default().push((e.start.max(s.start), e.end.min(s.end)));
                     let r = by_routine.entry((e.routine, e.kind)).or_default();
                     r.0 += overlap;
                     r.1 = r.1.max(e.end - e.start);
                     r.2 += 1;
+                    if e.kind != KIND_ISR {
+                        dpc_starts.push(e.start.max(s.start));
+                    }
                 }
             }
-            covered += union_len(&mut spans);
+            // A DPC cannot run on a processor that is already at DISPATCH_LEVEL or above, so
+            // DPCs spread right through the stall prove this CPU was never held.
+            let covered_slices = intr::slices_covered(s.start, s.end, dpc_starts.iter().copied());
+            let kept = intr::dpcs_kept_running(covered_slices, dpc_starts.len());
+            per_cpu.push(CpuStall { coverage: union_len(&mut spans) as f64 / len as f64, held: !kept });
+
             let in_window: Vec<_> = ev.samples.iter().filter(|(x, _)| x.cpu == cpu && x.ts >= s.start && x.ts <= s.end).collect();
             let rate = *ev.baseline.get(&cpu).unwrap_or(&0) as f64 / BASELINE_MS;
             seen_samples += in_window.len() as f64;
-            expected_samples += rate * ticks_to_ms(s.end - s.start);
+            expected_samples += rate * ticks_to_ms(len);
             window_samples.extend(in_window);
         }
 
+        // A driver is blamed when ITS code covered the stall on at least half the stalled CPUs.
+        // Summing coverage over a cluster (what this used to do) gave a driver saturating one
+        // core 1/N of an N-core event, so no whole-machine stall could ever reach the bar.
+        let need = stalls.len().div_ceil(2);
+        let mut by_module: HashMap<String, (usize, i64)> = HashMap::new();
+        for ((module, cpu), spans) in per_module.iter_mut() {
+            let Some(s) = stalls.iter().find(|s| s.cpu.unwrap_or(0) == *cpu) else { continue };
+            let covered = union_len(spans);
+            let e = by_module.entry(module.clone()).or_default();
+            e.1 += covered;
+            if covered as f64 / (s.end - s.start).max(1) as f64 >= COVER_RULE {
+                e.0 += 1;
+            }
+        }
+        let blame = by_module
+            .iter()
+            .filter(|(_, (cpus, _))| *cpus >= need && *cpus > 0)
+            .max_by_key(|(_, (cpus, total))| (*cpus, *total))
+            .map(|(m, (cpus, _))| (m.clone(), *cpus));
+
         let mut routines: Vec<_> = by_routine.into_iter().collect();
         routines.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
-        let mut by_module: HashMap<String, i64> = HashMap::new();
-        for ((routine, _), (overlap, _, _)) in &routines {
-            *by_module.entry(self.modules.name(*routine)).or_default() += overlap;
-        }
-        let top_module = by_module.iter().max_by_key(|(_, v)| **v).map(|(k, v)| (k.clone(), *v));
-        let coverage = covered as f64 / stalled.max(1) as f64;
-
+        let held = per_cpu.iter().filter(|c| c.held).count();
+        let held_share = held as f64 / per_cpu.len().max(1) as f64;
+        let best_coverage = per_cpu.iter().map(|c| c.coverage).fold(0.0, f64::max);
+        let samples = window_samples.len();
         let (on_cpu_procs, on_cpu_mods) = self.sample_breakdown(&window_samples);
+        Look { routines, per_cpu, blame, best_coverage, held_share, seen_samples, expected_samples, on_cpu_procs, on_cpu_mods, samples }
+    }
 
-        let culprit = if let (true, Some((module, _))) = (coverage >= 0.35, &top_module) {
-            let what = self.modules.describe_short(module);
-            say!("    VERDICT: {module} [{what}] kept the CPU in DPC/ISR code for {:.0}% of the stall", coverage * 100.0);
-            format!("driver {module}")
-        } else if self.profile && expected_samples >= 3.0 && seen_samples < expected_samples * 0.3 {
-            say!(
-                "    VERDICT: the CPU went dark: only {seen_samples:.0} of ~{expected_samples:.0} expected profiler interrupts arrived and no DPC/ISR explains it."
-            );
-            say!("             Windows itself was frozen out -> firmware SMI (BIOS, USB legacy, thermal/EC), a hypervisor, or a driver");
-            say!("             running with interrupts disabled. Think BIOS update/settings and failing or misbehaving hardware.");
-            "CPU went dark (firmware SMI / hypervisor / interrupts off)".to_string()
-        } else if let Some((m, share)) = on_cpu_mods.first().filter(|(_, share)| *share >= 0.4) {
-            let what = self.modules.describe_short(m);
-            say!("    VERDICT: {m} [{what}] was executing for {:.0}% of the stall at raised IRQL (not as a DPC/ISR,", share * 100.0);
-            say!("             e.g. holding a spinlock or inside a long driver call), which blocks every thread on that CPU");
-            format!("driver {m}")
-        } else if let Some((p, share)) = on_cpu_procs.first().filter(|(p, share)| *share >= 0.4 && !p.starts_with("Idle")) {
-            say!("    VERDICT: {p} was on the CPU for {:.0}% of the stall. Nothing can outrank the probe thread, so it was", share * 100.0);
-            say!("             inside kernel/driver code at raised IRQL on this process's behalf (see kernel modules below)");
-            format!("process {p}")
+    /// "(on 6 of 8 CPUs)" / "" for a single-CPU stall, and "based on only 6 samples" when thin.
+    fn thin(samples: usize) -> String {
+        if samples < THIN_SAMPLES {
+            format!(" (based on only {samples} CPU sample{})", plural(samples as u64))
         } else {
-            say!("    VERDICT: no clear culprit in the trace (DPC/ISR covered only {:.0}% of the stall)", coverage * 100.0);
+            String::new()
+        }
+    }
+
+    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> String {
+        let look = self.look(stalls, ev);
+        let cpus = look.per_cpu.len();
+        // Ordinary DPCs running right through the stall on most of the stalled CPUs means no CPU
+        // was held at raised IRQL. Nothing below may then blame what a sample happened to land in.
+        let could_be_held = look.held_share >= 0.5;
+        let enough_samples = look.samples >= MIN_SAMPLES;
+
+        let culprit = if let Some((module, on)) = &look.blame {
+            let what = self.modules.describe_short(module);
+            let where_ = if cpus > 1 { format!(" on {on} of the {cpus} stalled CPUs") } else { String::new() };
+            say!("    VERDICT: {module} [{what}] kept the CPU in DPC/ISR code for most of the stall{where_}");
+            format!("driver {module}")
+        } else if self.profile && could_be_held && look.expected_samples >= 3.0 && look.seen_samples < look.expected_samples * 0.3 {
+            say!(
+                "    VERDICT: the CPU went dark: only {:.0} of ~{:.0} expected profiler interrupts arrived, no DPC/ISR explains it,",
+                look.seen_samples,
+                look.expected_samples
+            );
+            say!("             and ordinary DPCs stopped too -> firmware SMI (BIOS, USB legacy, thermal/EC), a hypervisor, or a");
+            say!("             driver running with interrupts disabled. Think BIOS update/settings and failing hardware.");
+            "CPU went dark (firmware SMI / hypervisor / interrupts off)".to_string()
+        } else if let Some((m, share)) = look.on_cpu_mods.first().filter(|(_, s)| *s >= SHARE_RULE && could_be_held && enough_samples) {
+            let what = self.modules.describe_short(m);
+            say!(
+                "    VERDICT: {m} [{what}] was executing for {:.0}% of the stall{}, and no DPC ran on the stalled CPU(s) while it",
+                share * 100.0,
+                Self::thin(look.samples)
+            );
+            say!("             did, so it was at raised IRQL (a spinlock or a long driver call), which blocks every thread there");
+            format!("driver {m}")
+        } else if let Some((p, share)) =
+            look.on_cpu_procs.first().filter(|(p, s)| *s >= SHARE_RULE && !p.starts_with("Idle") && could_be_held && enough_samples)
+        {
+            say!(
+                "    VERDICT: {p} was on the CPU for {:.0}% of the stall{}. Nothing can outrank the probe thread and no DPC ran,",
+                share * 100.0,
+                Self::thin(look.samples)
+            );
+            say!("             so it was inside kernel/driver code at raised IRQL on this process's behalf (modules below)");
+            format!("process {p}")
+        } else if !could_be_held {
+            say!("    VERDICT: no CPU was held. Ordinary DPCs kept executing on the stalled CPU(s) right through this, which cannot");
+            say!("             happen at raised IRQL, so the measuring thread was simply not woken: timer delivery or scheduling.");
+            say!("             Whatever the CPU samples landed in was interrupted too, and is not the cause.");
+            "not woken (timers or scheduling)".to_string()
+        } else {
+            say!("    VERDICT: no clear culprit in the trace (DPC/ISR covered at most {:.0}% of the stall)", look.best_coverage * 100.0);
             "unexplained".to_string()
         };
 
-        if !routines.is_empty() {
-            say!("    DPC/ISR activity on the stalled CPU(s):");
-            for ((routine, k), (overlap, longest, count)) in routines.iter().take(6) {
-                say!(
-                    "      {:<42} {:<12} x{count:<4} in-stall {:>9}   longest {:>9}",
-                    self.modules.symbolish(*routine),
-                    kind_name(*k),
-                    fmt_dur(*overlap),
-                    fmt_dur(*longest)
-                );
-            }
-        }
-        self.print_on_cpu(&on_cpu_procs, &on_cpu_mods);
+        self.print_routines(&look);
+        self.print_on_cpu(&look.on_cpu_procs, &look.on_cpu_mods);
         culprit
     }
 
-    fn verdict_sched(&mut self, ev: &Evidence) -> String {
+    /// The whole machine stopped. Whatever the CPU samples landed in was stopped with it, so
+    /// nothing here may name a program or a module from a sample: they are bystanders.
+    fn verdict_freeze(&mut self, stalls: &[Stall], ev: &Evidence, ncpu: usize, start: i64, end: i64) -> (String, FreezeFacts) {
+        let look = self.look(stalls, ev);
+        let cpus = look.per_cpu.len();
+        let dur = fmt_dur(end - start);
+        say!("    VERDICT: the whole PC stopped. {cpus} of this PC's {ncpu} processors were held for {dur} at the same instant,");
+        say!("             so no program or driver that the CPU samples landed in can be the cause: they were stopped too.");
+
+        let idle = look.on_cpu_procs.iter().find(|(p, _)| p == "Idle").map(|(_, s)| *s).unwrap_or(0.0);
+        let on_cpu: Vec<String> = look.on_cpu_procs.iter().filter(|(p, _)| p != "Idle").take(3).map(|(p, _)| p.clone()).collect();
+
+        let mut facts = FreezeFacts {
+            cpus,
+            ncpu,
+            idle_share: idle,
+            samples: look.samples,
+            on_cpu,
+            dpcs_kept_running: look.held_share < 0.5,
+            holding: look.blame.clone(),
+            ..FreezeFacts::default()
+        };
+
+        if let Some((module, on)) = &look.blame {
+            let what = self.modules.describe_short(module);
+            say!("             {module} [{what}] did hold {on} of the {cpus} CPUs in its own DPC/ISR code for most of it.");
+        }
+        if facts.dpcs_kept_running {
+            say!("             Ordinary DPCs kept executing throughout, so no CPU was held at raised IRQL: the processors were");
+            say!("             running, nothing was waking threads.");
+        }
+
+        // Which interrupt sources stopped and which carried on. This is the closest a CPU-side
+        // trace gets to watching a bus or a controller stall.
+        let (silent, continued, timer) = self.continuity(ev, start, end);
+        let say_list = |v: &[(String, f64)]| {
+            v.iter().map(|(n, s)| format!("{n} ({:.0}% of its usual rate)", s * 100.0)).collect::<Vec<_>>().join(", ")
+        };
+        if !silent.is_empty() {
+            say!("    Interrupt sources that STOPPED during the freeze: {}", say_list(&silent));
+        }
+        if !continued.is_empty() {
+            say!("    Interrupt sources that kept going:                {}", say_list(&continued));
+        }
+        if let Some(flow) = timer {
+            say!(
+                "    Timer DPCs (the clock that wakes threads): {}",
+                match flow {
+                    Flow::Silent => "stopped",
+                    Flow::Reduced => "well down",
+                    Flow::Continued => "unchanged",
+                }
+            );
+        }
+        facts.silent = silent;
+        facts.continued = continued;
+        facts.timer = timer;
+
+        // What coincided, and which way round. A request that only started once the machine had
+        // already stopped is a victim of the freeze, not a lead.
+        // Any slow request that sits inside the freeze is explained by it, whichever one turns out
+        // to be the most informative below; it must not also become "this drive responds slowly".
+        self.mark_victims(&ev.ios, start, end);
+        let own = std::process::id();
+        if let Some(w) = diskwait::explain(start, end, &ev.ios, &ev.faults, own) {
+            let woke = w.disk.is_some_and(|d| self.disk_why.get(&d).is_some_and(|why| why.count(Cause::WokeUp) > 0));
+            match (w.disk, w.role) {
+                (Some(d), Role::Trigger) => {
+                    say!(
+                        "    Coincided with: a {} request to {} that was already outstanding {} before the freeze began and ended",
+                        op_name(w.op),
+                        self.disks.get(d).short(),
+                        fmt_dur((start - (w.io_end - w.waited)).max(0))
+                    );
+                    say!("                    with it ({} in all). Correlation, not proof.", fmt_dur(w.waited));
+                }
+                (Some(d), Role::Victim) => {
+                    say!(
+                        "    Coincided with: a {} {} request to {}, which began after the freeze had already started,",
+                        fmt_dur(w.waited),
+                        op_name(w.op),
+                        self.disks.get(d).short()
+                    );
+                    say!("                    so the freeze is what made it slow, not the other way round.");
+                }
+                (Some(d), Role::Overlap) => say!(
+                    "    Coincided with: a {} {} request to {} that overlapped it. Correlation, not proof.",
+                    fmt_dur(w.waited),
+                    op_name(w.op),
+                    self.disks.get(d).short()
+                ),
+                (None, _) => say!("    Coincided with: this tool's own thread waiting {} for memory from disk", fmt_dur(w.waited)),
+            }
+            facts.coincided = Some(Coincided { disk: w.disk, role: w.role, waited: w.waited, woke });
+        }
+
+        self.print_routines(&look);
+        self.print_on_cpu(&look.on_cpu_procs, &look.on_cpu_mods);
+        ("whole-PC freeze".to_string(), facts)
+    }
+
+    /// Records every slow request that sits entirely inside this freeze as explained by it.
+    fn mark_victims(&mut self, ios: &[IoRec], start: i64, end: i64) {
+        let warn = self.shared.io_warn;
+        for io in ios.iter().filter(|i| i.dur >= warn) {
+            if diskwait::role_of(start, end, io.end - io.dur, io.end) == Role::Victim {
+                if let Some(seen) = self.disk_slow.get_mut(&io.disk) {
+                    for s in seen.iter_mut().filter(|s| s.end == io.end && s.dur == io.dur) {
+                        s.victim = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per interrupt source: did it keep going, or stop? Only sources that were STEADY before the
+    /// stall can say anything, so a driver that naturally fires in bursts raises no alarm.
+    #[allow(clippy::type_complexity)]
+    fn continuity(&mut self, ev: &Evidence, start: i64, end: i64) -> (Vec<(String, f64)>, Vec<(String, f64)>, Option<Flow>) {
+        if ev.ref_seconds <= 0.0 {
+            return (Vec::new(), Vec::new(), None);
+        }
+        let slices = (ev.ref_seconds.round() as u32).max(2);
+        let slice_len = ms_to_ticks(ev.ref_seconds * 1000.0 / f64::from(slices));
+        let ref_start = ev.ref_execs.iter().map(|e| e.start).min().unwrap_or(start);
+        let mut refs: HashMap<String, (u32, HashSet<u32>)> = HashMap::new();
+        let mut timer_ref = (0u32, HashSet::new());
+        for e in &ev.ref_execs {
+            let slot = (((e.start - ref_start).max(0) / slice_len.max(1)) as u32).min(slices - 1);
+            let r = refs.entry(self.modules.name(e.routine)).or_default();
+            r.0 += 1;
+            r.1.insert(slot);
+            if e.kind == KIND_TIMER_DPC {
+                timer_ref.0 += 1;
+                timer_ref.1.insert(slot);
+            }
+        }
+        let mut inside: HashMap<String, u32> = HashMap::new();
+        let mut timer_in = 0u32;
+        for e in ev.execs.iter().filter(|e| e.start >= start && e.start <= end) {
+            *inside.entry(self.modules.name(e.routine)).or_default() += 1;
+            if e.kind == KIND_TIMER_DPC {
+                timer_in += 1;
+            }
+        }
+        let stall_s = ticks_to_ms(end - start) / 1000.0;
+        let (mut silent, mut continued) = (Vec::new(), Vec::new());
+        let mut rows: Vec<(String, u32, HashSet<u32>)> = refs.into_iter().map(|(k, (n, s))| (k, n, s)).collect();
+        rows.sort_by_key(|(name, n, _)| (std::cmp::Reverse(*n), name.clone()));
+        for (name, events, seen) in rows {
+            let reference = Reference { events, slices_seen: seen.len() as u32, slices, seconds: ev.ref_seconds };
+            let Some((flow, share)) = intr::flow(&reference, inside.get(&name).copied().unwrap_or(0), stall_s) else { continue };
+            match flow {
+                Flow::Silent => silent.push((name, share)),
+                Flow::Continued => continued.push((name, share)),
+                Flow::Reduced => {}
+            }
+        }
+        let timer_reference = Reference { events: timer_ref.0, slices_seen: timer_ref.1.len() as u32, slices, seconds: ev.ref_seconds };
+        (silent, continued, intr::flow(&timer_reference, timer_in, stall_s).map(|(f, _)| f))
+    }
+
+    fn verdict_sched(&mut self, ev: &Evidence, start: i64, end: i64) -> String {
         let all: Vec<&(SampleRec, u32)> = ev.samples.iter().collect();
         let (procs, mods) = self.sample_breakdown(&all);
         let idle = procs.iter().find(|(p, _)| p == "Idle").map(|(_, s)| *s).unwrap_or(0.0);
@@ -514,8 +943,37 @@ impl Analyzer {
                 share * 100.0
             );
             format!("process {top}")
+        } else if let Some(w) = diskwait::explain(start, end, &ev.ios, &ev.faults, std::process::id()) {
+            // Idle CPUs and a thread that did not run means it was blocked, not starved. When a
+            // disk covers the delay, say so; "a one-off scheduling quirk, ignore it" was wrong.
+            match w.disk {
+                Some(d) => {
+                    say!(
+                        "    VERDICT: not a CPU shortage ({:.0}% idle): the thread was blocked on storage. A {} {} request to {}",
+                        idle * 100.0,
+                        fmt_dur(w.waited),
+                        op_name(w.op),
+                        self.disks.get(d).short()
+                    );
+                    say!("             covered this delay. Everything that touches that drive waits with it.");
+                    format!("disk {d}")
+                }
+                None => {
+                    say!(
+                        "    VERDICT: not a CPU shortage ({:.0}% idle): this tool's own thread waited {} for memory to be read back",
+                        idle * 100.0,
+                        fmt_dur(w.waited)
+                    );
+                    say!("             from disk, which is what any program in the same position would do.");
+                    "waiting on paging".to_string()
+                }
+            }
         } else {
-            say!("    VERDICT: inconclusive, CPUs were {:.0}% idle during this delay (likely a one-off scheduling quirk; ignore unless frequent)", idle * 100.0);
+            say!(
+                "    VERDICT: the CPUs were {:.0}% idle and nothing in this trace explains the delay. The cause is not visible",
+                idle * 100.0
+            );
+            say!("             yet: it is not CPU load, and no disk request or page fault lines up with it.");
             "scheduling delay with idle CPUs".to_string()
         };
         self.print_on_cpu(&busy, &mods);
@@ -549,6 +1007,22 @@ impl Analyzer {
             v
         };
         (to_sorted(named), to_sorted(mods))
+    }
+
+    fn print_routines(&mut self, look: &Look) {
+        if look.routines.is_empty() {
+            return;
+        }
+        say!("    DPC/ISR activity on the stalled CPU(s):");
+        for ((routine, k), (overlap, longest, count)) in look.routines.iter().take(6) {
+            say!(
+                "      {:<42} {:<12} x{count:<4} in-stall {:>9}   longest {:>9}",
+                self.modules.symbolish(*routine),
+                kind_name(*k),
+                fmt_dur(*overlap),
+                fmt_dur(*longest)
+            );
+        }
     }
 
     fn print_on_cpu(&self, procs: &[(String, f64)], mods: &[(String, f64)]) {
@@ -704,6 +1178,12 @@ impl Analyzer {
         let ios: Vec<IoRec> = self.shared.inner.lock().unwrap().ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
         let spinning = self.disks.get(slow.disk).spinning == Some(true);
         let ctx = diskwhy::explain(slow, &ios, spinning, self.started);
+        // Remembered so a freeze can later say "this one was a victim of the freeze, not a
+        // problem of its own". Capped: a sick drive can produce thousands over a long run.
+        let seen = self.disk_slow.entry(slow.disk).or_default();
+        if seen.len() < 4096 {
+            seen.push(SlowSeen { end: slow.end, dur: slow.dur, victim: false });
+        }
         let movers: Vec<(String, u64)> =
             ctx.movers.iter().map(|(pid, tid, bytes)| (process_name(&self.procs.label(*pid, *tid)), *bytes)).collect();
         let why = self.disk_why.entry(slow.disk).or_default();
@@ -739,6 +1219,17 @@ impl Analyzer {
         };
         format!("{:02}:{:02} monitored  |  {} stall(s)  |  {worst_txt}", elapsed_s / 60, elapsed_s % 60, self.incidents.len())
     }
+}
+
+fn span_of(stalls: &[Stall]) -> (i64, i64) {
+    (stalls.iter().map(|s| s.start).min().unwrap_or(0), stalls.iter().map(|s| s.end).max().unwrap_or(0))
+}
+
+/// Two probes reporting the same event: same start and same end, to within a few ms. Matching on
+/// both edges keeps an unrelated starvation stall that merely happens to be nearby separate.
+fn is_twin(a: (i64, i64), b: (i64, i64)) -> bool {
+    let slack = ms_to_ticks(TWIN_SLACK_MS);
+    (a.0 - b.0).abs() <= slack && (a.1 - b.1).abs() <= slack
 }
 
 /// Total length covered by possibly overlapping intervals. ISRs interrupt DPCs, so their
@@ -807,6 +1298,30 @@ mod tests {
         assert_eq!(az.file_label(999), None, "the trace never named it: nothing to say");
     }
 
+    /// The whole-PC rule has to work on a 4-thread laptop and on a 64-thread workstation, where
+    /// one parked or descheduled CPU must not hide a machine-wide freeze.
+    #[test]
+    fn the_whole_pc_rule_scales_from_a_laptop_to_a_workstation() {
+        assert_eq!(freeze_cpu_floor(1), 1);
+        assert_eq!(freeze_cpu_floor(4), 4, "a 4-thread PC: all of them");
+        assert_eq!(freeze_cpu_floor(6), 5);
+        assert_eq!(freeze_cpu_floor(8), 6);
+        assert_eq!(freeze_cpu_floor(64), 48);
+        assert_eq!(freeze_cpu_floor(192), 144);
+    }
+
+    #[test]
+    fn twin_stalls_are_matched_on_both_edges() {
+        let ms = ms_to_ticks;
+        // The field pair: kernel 888 ms at t, scheduler 885 ms 3 ms later.
+        assert!(is_twin((ms(0.0), ms(888.0)), (ms(3.0), ms(888.0))));
+        assert!(is_twin((ms(0.0), ms(1324.0)), (ms(2.0), ms(1331.0))));
+        // Same start, very different length: two different events.
+        assert!(!is_twin((ms(0.0), ms(888.0)), (ms(0.0), ms(30.0))));
+        // Same length, far apart in time.
+        assert!(!is_twin((ms(0.0), ms(888.0)), (ms(900.0), ms(1788.0))));
+    }
+
     // --- verdict_kernel / verdict_sched, on synthetic evidence -----------------------------
 
     fn ms(v: f64) -> i64 {
@@ -837,7 +1352,16 @@ mod tests {
     }
 
     fn evidence(execs: Vec<ExecRec>, samples: Vec<(SampleRec, u32)>, baseline: HashMap<u16, u32>) -> Evidence {
-        Evidence { execs, faults: Vec::new(), ios: Vec::new(), samples, baseline, etw_caught_up: true }
+        Evidence {
+            execs,
+            faults: Vec::new(),
+            ios: Vec::new(),
+            samples,
+            baseline,
+            ref_execs: Vec::new(),
+            ref_seconds: 0.0,
+            etw_caught_up: true,
+        }
     }
 
     const MOD_A: u64 = KERNEL_SPACE + 0x1_0000;
@@ -879,10 +1403,28 @@ mod tests {
         let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
         let s = stall(0, 0.0, 100.0);
         // A DPC and an ISR from two different drivers, both covering the exact same 0-20ms
-        // window. Naive summing would give 20+20=40ms => 40% of the 100ms stall, clearing the
-        // 35% rule-1 threshold; the real (unioned) coverage is only 20ms => 20%, which doesn't.
+        // window. Neither driver's own code reaches the 35% bar, and the two must not be added
+        // together into one: the honest answer is that nothing explains the stall.
         let ev = evidence(vec![dpc(0, 0.0, 20.0, MOD_A + 0x10), isr(0, 0.0, 20.0, MOD_B + 0x10)], vec![], HashMap::new());
         assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    /// The dilution bug from the verdict audit: on a multi-CPU cluster, coverage used to be
+    /// summed over every per-CPU stall, so a driver holding one core scored 1/N.
+    #[test]
+    fn a_driver_holding_its_own_cpu_is_judged_per_cpu_not_across_the_cluster() {
+        let modules = ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
+        // Two CPUs stalled; the driver's DPCs cover 90% of BOTH, which used to work out to 45%
+        // of the cluster and now correctly reads as "it held both of them".
+        let stalls = [stall(0, 0.0, 10.0), stall(1, 0.0, 10.0)];
+        let ev = evidence(vec![dpc(0, 0.0, 9.0, MOD_A + 0x10), dpc(1, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&stalls, &ev), "driver nvlddmkm.sys");
+
+        // Holding ONE of eight CPUs is not an explanation for an eight-CPU event.
+        let stalls: Vec<Stall> = (0..8).map(|c| stall(c, 0.0, 10.0)).collect();
+        let ev = evidence(vec![dpc(3, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
+        assert_eq!(az.verdict_kernel(&stalls, &ev), "unexplained");
     }
 
     #[test]
@@ -899,6 +1441,22 @@ mod tests {
         // Same evidence, but sampling wasn't enabled: it must not claim the CPU went dark.
         let mut unprofiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
         assert_eq!(unprofiled.verdict_kernel(&[s], &ev), "unexplained");
+    }
+
+    /// From the field logs: "the CPU went dark, Windows itself was frozen out" printed for a
+    /// window that also contained hundreds of DPC/ISR executions. A DPC cannot run on a frozen
+    /// processor, so the claim is not allowed to be made.
+    #[test]
+    fn the_cpu_did_not_go_dark_while_dpcs_were_still_running_on_it() {
+        let modules = ModuleMap::for_test(&[("Wdf01000.sys", MOD_A, 0x1000)]);
+        let mut baseline = HashMap::new();
+        baseline.insert(0u16, 500u32);
+        let s = stall(0, 0.0, 800.0);
+        // 800 DPCs, one per millisecond, right through the stall: the CPU was alive.
+        let execs: Vec<ExecRec> = (0..800).map(|i| dpc(0, i as f64, 0.01, MOD_A + 0x10)).collect();
+        let ev = evidence(execs, vec![], baseline);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), true);
+        assert_eq!(az.verdict_kernel(&[s], &ev), "not woken (timers or scheduling)");
     }
 
     #[test]
@@ -929,6 +1487,20 @@ mod tests {
         assert_eq!(az.verdict_kernel(&[s], &ev), "driver rtwlane.sys");
     }
 
+    /// The behavior that was right and has to survive: one core held for 8 ms with a network
+    /// filter in 90% of the samples and NOT ONE DPC on that core while it happened.
+    #[test]
+    fn a_driver_holding_one_core_with_no_dpcs_running_is_still_blamed() {
+        let modules = ModuleMap::for_test(&[("NETIO.SYS", MOD_B, 0x1000)]);
+        let procs = ProcNames::for_test(&[(4, "System (kernel threads)")]);
+        let mut az = Analyzer::for_test(modules, procs, false);
+        let s = stall(5, 0.0, 8.0);
+        let mut samples: Vec<(SampleRec, u32)> = (0..9).map(|i| sample(5, i as f64, MOD_B + 0x10, 4)).collect();
+        samples.push(sample(5, 9.0, USER_IP, 4));
+        let ev = evidence(vec![], samples, HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "driver NETIO.SYS");
+    }
+
     #[test]
     fn user_process_holding_most_samples_is_blamed() {
         let procs = ProcNames::for_test(&[(200, "game.exe"), (300, "other.exe")]);
@@ -943,6 +1515,16 @@ mod tests {
         ];
         let ev = evidence(vec![], samples, HashMap::new());
         assert_eq!(az.verdict_kernel(&[s], &ev), "process game.exe (200)");
+    }
+
+    /// A share of nearly nothing is not evidence. Two samples in a stall cannot name a culprit.
+    #[test]
+    fn a_share_of_two_samples_names_nobody() {
+        let procs = ProcNames::for_test(&[(200, "game.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, false);
+        let s = stall(0, 0.0, 100.0);
+        let ev = evidence(vec![], vec![sample(0, 10.0, USER_IP, 200), sample(0, 20.0, USER_IP, 200)], HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
     }
 
     #[test]
@@ -972,14 +1554,14 @@ mod tests {
     fn sched_without_profiling_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(500, "app.exe")]), false);
         let ev = evidence(vec![], vec![sample(0, 1.0, USER_IP, 500)], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "CPU starvation (unattributed)");
     }
 
     #[test]
     fn sched_with_no_samples_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let ev = evidence(vec![], vec![], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "CPU starvation (unattributed)");
     }
 
     #[test]
@@ -989,17 +1571,203 @@ mod tests {
         let mut samples: Vec<(SampleRec, u32)> = (0..8).map(|i| sample(0, i as f64, USER_IP, 500)).collect();
         samples.extend((0..2).map(|i| sample(0, i as f64, USER_IP, 0))); // Idle: 2/10 = 20% < 25%
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_sched(&ev), "process app.exe (500)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "process app.exe (500)");
+    }
+
+    /// A late wake-up with idle CPUs is not "a scheduling quirk, ignore it": when a disk request
+    /// covers the delay, the thread was blocked on that disk, and when nothing does, the honest
+    /// answer is that the cause is not visible.
+    #[test]
+    fn a_scheduler_delay_with_idle_cpus_names_the_disk_or_admits_it_cannot() {
+        let procs = ProcNames::for_test(&[(500, "app.exe"), (600, "other.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, true);
+        let idle_samples = || -> Vec<(SampleRec, u32)> {
+            let mut s: Vec<(SampleRec, u32)> = (0..7).map(|i| sample(0, i as f64, USER_IP, 0)).collect();
+            s.extend((0..3).map(|i| sample(0, i as f64, USER_IP, 500)));
+            s
+        };
+        let mut ev = evidence(vec![], idle_samples(), HashMap::new());
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0)), "scheduling delay with idle CPUs");
+
+        ev.ios = vec![IoRec { end: ms(1883.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0 }];
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0)), "disk 5");
+    }
+
+    // --- the twin merge --------------------------------------------------------------------
+
+    fn freeze_probes(start: i64, dur: i64) -> Vec<Stall> {
+        (0..8).map(|c| Stall { kind: StallKind::Kernel, cpu: Some(c), start, end: start + dur, minor: false }).collect()
+    }
+
+    fn sched_probe(start: i64, dur: i64) -> Stall {
+        Stall { kind: StallKind::Scheduler, cpu: None, start, end: start + dur, minor: false }
+    }
+
+    fn eight_cpu_analyzer() -> Analyzer {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        az
+    }
+
+    /// The field shape: eight real-time probes and the normal-priority probe in the other
+    /// process report the same ~900 ms gap a few ms apart. That is ONE event.
+    #[test]
+    fn a_freeze_and_its_starvation_twin_become_one_incident() {
+        let mut az = eight_cpu_analyzer();
+        let start = qpc() - ms(6000.0);
+        let mut stalls = freeze_probes(start, ms(900.0));
+        stalls.push(sched_probe(start + ms(2.0), ms(903.0)));
+        az.feed(&stalls);
+        az.tick(false);
+        assert_eq!(az.incidents.len(), 1, "one freeze, not a freeze plus a starvation stall");
+        assert_eq!(az.incidents[0].class, IncidentClass::Freeze);
+        assert_eq!(az.incidents[0].culprit, "whole-PC freeze");
+        assert_eq!(az.waiting(), 0);
     }
 
     #[test]
-    fn sched_reports_idle_cpus_when_idle_share_is_high() {
-        let procs = ProcNames::for_test(&[(500, "app.exe"), (600, "other.exe")]);
-        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, true);
-        let mut samples: Vec<(SampleRec, u32)> = (0..3).map(|i| sample(0, i as f64, USER_IP, 0)).collect(); // Idle: 30%
-        samples.extend((0..4).map(|i| sample(0, i as f64, USER_IP, 500)));
-        samples.extend((0..3).map(|i| sample(0, i as f64, USER_IP, 600)));
+    fn a_scheduler_stall_with_no_kernel_twin_stays_a_scheduler_incident() {
+        let mut az = eight_cpu_analyzer();
+        az.feed(&[sched_probe(qpc() - ms(6000.0), ms(30.0))]);
+        az.tick(false);
+        assert_eq!(az.incidents.len(), 1);
+        assert_eq!(az.incidents[0].class, IncidentClass::Starvation);
+    }
+
+    /// A ripe cluster waits a little for its sibling, and then gives up. Nothing is held for
+    /// ever, and shutting down flushes whatever is still waiting.
+    #[test]
+    fn an_unpaired_cluster_is_held_briefly_and_then_reported_alone() {
+        let mut az = eight_cpu_analyzer();
+        let end = qpc() - ms(380.0);
+        let stalls = freeze_probes(end - ms(900.0), ms(900.0));
+        az.shared.inner.lock().unwrap().latest_ts = end + ms(100.0);
+        az.feed(&stalls);
+        az.tick(false);
+        assert_eq!(az.incidents.len(), 0, "ripe, but its twin could still arrive");
+        assert_eq!(az.waiting(), 8, "and it is kept, not dropped");
+        // Shutdown analyzes everything pending, whatever the clock says.
+        az.tick(true);
+        assert_eq!(az.incidents.len(), 1);
+        assert_eq!(az.waiting(), 0);
+
+        // Past the wait, an unpaired cluster is reported on its own rather than held for ever.
+        let mut az = eight_cpu_analyzer();
+        az.shared.inner.lock().unwrap().latest_ts = qpc();
+        az.feed(&freeze_probes(qpc() - ms(1500.0), ms(900.0)));
+        az.tick(false);
+        assert_eq!(az.incidents.len(), 1);
+    }
+
+    /// Two events that merely happen near each other are not twins.
+    #[test]
+    fn an_unrelated_starvation_stall_is_not_swallowed_by_a_freeze() {
+        let mut az = eight_cpu_analyzer();
+        let start = qpc() - ms(6000.0);
+        let mut stalls = freeze_probes(start, ms(900.0));
+        stalls.push(sched_probe(start + ms(1200.0), ms(40.0)));
+        az.feed(&stalls);
+        az.tick(false);
+        assert_eq!(az.incidents.len(), 2);
+        assert_eq!(az.incidents[0].class, IncidentClass::Freeze);
+        assert_eq!(az.incidents[1].class, IncidentClass::Starvation);
+    }
+
+    /// A short all-CPU stall is not a freeze: the field logs are full of 5-13 ms stalls that hit
+    /// every core, and calling those "the whole PC stopped" would be as wrong in the other
+    /// direction.
+    #[test]
+    fn a_short_all_cpu_stall_is_not_a_whole_pc_freeze() {
+        let mut az = eight_cpu_analyzer();
+        az.feed(&freeze_probes(qpc() - ms(6000.0), ms(6.0)));
+        az.tick(false);
+        assert_eq!(az.incidents[0].class, IncidentClass::Kernel);
+    }
+
+    // --- whole-PC freezes ------------------------------------------------------------------
+
+    fn eight_cpu_freeze(dur_ms: f64) -> Vec<Stall> {
+        (0..8).map(|c| stall(c, 0.0, dur_ms)).collect()
+    }
+
+    /// The shape of the field reports: eight CPUs held for 900 ms, DPCs flowing as usual, the
+    /// CPUs mostly idle. No program, no module, and not one word about raised IRQL.
+    #[test]
+    fn an_all_cpu_freeze_with_dpcs_flowing_blames_nobody() {
+        let modules = ModuleMap::for_test(&[("Wdf01000.sys", MOD_A, 0x1000)]);
+        let procs = ProcNames::for_test(&[(300, "explorer.exe")]);
+        let mut az = Analyzer::for_test(modules, procs, true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        let stalls = eight_cpu_freeze(900.0);
+        // ~100 DPCs per CPU, evenly spread: the machine's interrupts never stopped.
+        let mut execs = Vec::new();
+        for cpu in 0..8u16 {
+            execs.extend((0..100).map(|i| dpc(cpu, i as f64 * 9.0, 0.02, MOD_A + 0x10)));
+        }
+        let mut samples: Vec<(SampleRec, u32)> = (0..70).map(|i| sample(0, i as f64, USER_IP, 0)).collect();
+        samples.extend((0..30).map(|i| sample(1, i as f64, USER_IP, 300)));
+        let ev = evidence(execs, samples, HashMap::new());
+        let (culprit, facts) = az.verdict_freeze(&stalls, &ev, 8, 0, ms(900.0));
+        assert_eq!(culprit, "whole-PC freeze");
+        assert!(facts.dpcs_kept_running, "DPCs ran throughout, so no CPU was held");
+        assert_eq!(facts.holding, None, "no driver held a majority of the CPUs");
+        assert!(facts.idle_share > 0.6, "{}", facts.idle_share);
+    }
+
+    /// The other flavor in the field logs: one program in 91% of the samples, all of it inside
+    /// ntoskrnl. It is still a freeze and it is still not that program's fault.
+    #[test]
+    fn a_freeze_with_one_program_all_over_the_samples_still_blames_nobody() {
+        let modules = ModuleMap::for_test(&[("ntoskrnl.exe", MOD_A, 0x1000)]);
+        let procs = ProcNames::for_test(&[(32468, "SignalRgb.exe")]);
+        let mut az = Analyzer::for_test(modules, procs, true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        let stalls = eight_cpu_freeze(924.0);
+        let samples: Vec<(SampleRec, u32)> = (0..91).map(|i| sample((i % 8) as u16, i as f64 * 10.0, MOD_A + 0x10, 32468)).collect();
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_sched(&ev), "scheduling delay with idle CPUs");
+        let (culprit, facts) = az.verdict_freeze(&stalls, &ev, 8, 0, ms(924.0));
+        assert_eq!(culprit, "whole-PC freeze");
+        assert_eq!(facts.holding, None);
+        assert!(facts.on_cpu.contains(&"SignalRgb.exe (32468)".to_string()), "named as context only: {:?}", facts.on_cpu);
+    }
+
+    /// A slow request that only began once the machine had already stopped is a victim of the
+    /// freeze; it must not also be counted against its drive.
+    #[test]
+    fn a_slow_request_inside_a_freeze_is_marked_as_the_freezes_victim() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        let (start, end) = (ms(1000.0), ms(1886.0));
+        let victim = IoRec { end: ms(1887.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0 };
+        az.disk_slow.insert(5, vec![SlowSeen { end: victim.end, dur: victim.dur, victim: false }]);
+        let stalls: Vec<Stall> = (0..8).map(|c| Stall { kind: StallKind::Kernel, cpu: Some(c), start, end, minor: false }).collect();
+        let mut ev = evidence(vec![], vec![], HashMap::new());
+        ev.ios = vec![victim];
+        let (_, facts) = az.verdict_freeze(&stalls, &ev, 8, start, end);
+        assert_eq!(facts.coincided.as_ref().map(|c| c.role), Some(Role::Victim));
+        assert!(az.disk_slow[&5][0].victim, "the request is explained by the freeze");
+    }
+
+    /// One source stops dead while another carries on: the signal issue #15 asks for.
+    #[test]
+    fn a_freeze_says_which_interrupt_sources_stopped_and_which_kept_going() {
+        let modules = ModuleMap::for_test(&[("Wdf01000.sys", MOD_A, 0x1000), ("dxgkrnl.sys", MOD_B, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        // 5 s of reference: both sources at ~500/s, firing in every second.
+        let mut ref_execs = Vec::new();
+        for i in 0..2500 {
+            ref_execs.push(dpc(0, -5000.0 + i as f64 * 2.0, 0.01, MOD_A + 0x10));
+            ref_execs.push(isr(0, -5000.0 + i as f64 * 2.0, 0.01, MOD_B + 0x10));
+        }
+        // Inside the 900 ms freeze: the USB side stops, the graphics side keeps coming.
+        let execs: Vec<ExecRec> = (0..450).map(|i| isr(0, i as f64 * 2.0, 0.01, MOD_B + 0x10)).collect();
+        let mut ev = evidence(execs, vec![], HashMap::new());
+        ev.ref_execs = ref_execs;
+        ev.ref_seconds = 5.0;
+        let stalls = eight_cpu_freeze(900.0);
+        let (_, facts) = az.verdict_freeze(&stalls, &ev, 8, 0, ms(900.0));
+        assert!(facts.silent.iter().any(|(s, _)| s == "Wdf01000.sys"), "{:?}", facts.silent);
+        assert!(facts.continued.iter().any(|(s, _)| s == "dxgkrnl.sys"), "{:?}", facts.continued);
     }
 }

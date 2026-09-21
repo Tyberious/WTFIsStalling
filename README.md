@@ -72,6 +72,7 @@ days old) by itself.
 
 | Cause | How it shows up |
 | --- | --- |
+| **The whole PC stopping** (cursor and sound gone for a moment) | A kernel-level stall that holds every logical CPU at the same instant for 100 ms or more is its own kind of incident, counted once even though both probes see it. Nothing that happened to be on the CPUs is blamed for it: they were stopped too. Instead the report says how often it happens and how long it lasts, whether the processors were idle or busy, **which device interrupts stopped and which kept arriving** during it, whether the timer interrupts that wake threads stopped, and what coincided with it (a slow request to a drive, a drive that had been asleep, a page fault) — in correlation language, with the number that coincided with *nothing* said just as plainly |
 | A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file and named after the device it drives ("NVIDIA GeForce RTX 5090", "Realtek PCIe 5GbE Family Controller"), with the driver's version, date and age, and advice for the usual suspects |
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
@@ -97,36 +98,65 @@ interrupted for even a millisecond around it, the report says so, and that's whe
 ====================================================================================================
 RESULT
 
-  >>> PROBLEM FOUND: rtwlane.sys  -  Wi-Fi adapter driver
-      Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).  (+1 more finding below)
+  >>> PROBLEM FOUND: The whole PC stopped responding, 12 times
+      12 freezes in 59 minutes (12 per hour), typically 950 ms and at worst 1000 ms. All 8
+      processors stopped at the same instant each time, so no program that happened to be running
+      can be the cause.
 
-  Monitored 05:12  |  14 kernel-level stall(s), 0 CPU-starvation stall(s)  |  worst wake-up delay 11.80 ms ...
+  Monitored:        59:21
+  Stalls detected:  12 whole-PC freezes, 71 short kernel-level, 35 CPU-starvation
+  Worst wake-up:    1000 ms real-time thread, 1005 ms normal thread
 
-  1. [HIGH] rtwlane.sys  -  Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC
-       - Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).
-       - Driver version 2024.10.138.3, dated 2021-03-04 (5 years old), from Realtek.
-       - Its interrupt handling ran for up to 10.97 ms at a time (14 times over 1.00 ms). Healthy
-         drivers stay under 0.5 ms; longer runs block everything else on that CPU core ...
+  WHAT THIS RUN FOUND
+    the whole PC stops                 1 finding
+    short interruptions                4 findings
+    one program waits                  5 findings
+    worth knowing, not a hitch yet     3 findings
+
+  ORDER OF ATTACK  (change ONE thing, run this again, and the comparison above will say what moved)
+    Start here: The whole PC stopped responding, 12 times
+    Then: Disk 6 (I:), Seagate FireCuda Forge - responding slowly
+    Later: the 3 warnings under 'worth knowing, not a hitch yet'. They are not causing hitches yet.
+
+  THE WHOLE PC STOPS
+
+  1. [HIGH] The whole PC stopped responding, 12 times
+       - 12 freezes in 59 minutes, about 12 per hour. Typically 950 ms, at worst 1000 ms. ...
+       - The processors were not busy working: they were 2-86% idle during the freezes ...
+       - Device interrupts did not all stop together: Wdf01000.sys stopped completely in 8 of 12.
+         Meanwhile dxgkrnl.sys kept arriving in 8 of 12 ...
+       - 8 of the 12 freezes coincided with a slow request to disk 6 (I:), a drive that had been
+         asleep, taking up to 2173 ms. 'Coincided' is all this says ...
+       - 4 of the 12 freezes coincided with nothing at all that this tool can see.
+       - Context, not blame: the programs the processors were interrupted in were SignalRgb.exe,
+         explorer.exe, NordVPN.exe ... They were frozen along with everything else.
+       - What is NOT explained: no driver's interrupt handling was long enough to do this, no
+         single processor was held, and the cause of the freezes is not visible in this trace.
      What to try:
-       Start here: this driver is 5 years old. Install the current one from Realtek or from the
-       support page of your PC or motherboard model ...
-       Update the Wi-Fi driver from the chip vendor (Intel/Realtek/MediaTek/Qualcomm), disable adapter
-       power saving and background scanning/roaming aggressiveness; test with Wi-Fi off and Ethernet in.
+       Test one layer at a time and run this tool again after each change ...
 
-  2. [MEDIUM] Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly
-       - 3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware
-         80.00A80. D: 93% full.
-       - Why: the disk was busy moving a lot of data (every time). The traffic came from steam.exe
-         (3 GB, 97% of the traffic: Steam downloading, updating or verifying a game).
+  SHORT INTERRUPTIONS  (audio crackle, micro-stutter)
+
+  2. [MEDIUM] NETIO.SYS  -  Windows network stack
+       - Blamed for 55 stalls (worst 13.52 ms, 415 ms in total), about 56 per hour.
+       - The stalls keep time. Repeats about every 60.0 s (41 of 44 intervals) ...
      What to try: ...
+
+     + 3 more in this group, with the full tables under DETAILS below: ...
 ====================================================================================================
 DETAILS
-  (who caused the stalls, per-driver DPC/ISR table, hard page faults per process, disk latency,
-   drive health, what the Windows event log held)
+  (every finding including the folded ones, who caused the stalls, per-driver DPC/ISR table, hard
+   page faults per process, disk latency, drive health, what the Windows event log held)
 
 EVENT LOG (chronological)
-[21:14:07.412] STALL #3  kernel-level (DPC/ISR/firmware)  11.80 ms  on CPU 4
-    VERDICT: rtwlane.sys [Wi-Fi adapter driver] kept the CPU in DPC/ISR code for 93% of the stall
+[10:50:01.300] FREEZE #50  the whole PC stopped  990 ms  (8 of 8 CPUs held at once)
+    The normal-priority probe in this tool's other process was late by 991 ms at the same instant: the same
+    event seen twice, counted once.
+    VERDICT: the whole PC stopped. 8 of this PC's 8 processors were held for 990 ms at the same instant,
+             so no program or driver that the CPU samples landed in can be the cause: they were stopped too.
+             Ordinary DPCs kept executing throughout, so no CPU was held at raised IRQL ...
+    Interrupt sources that STOPPED during the freeze: Wdf01000.sys (0% of its usual rate)
+    Interrupt sources that kept going:                dxgkrnl.sys (78% of its usual rate)
     ...
 ```
 
@@ -135,6 +165,20 @@ full stall, programs frozen by paging, disks answering slowly, what each drive r
 health, and hardware, storage and graphics-driver errors in the Windows event log. **HIGH** means it
 repeatedly or badly stalled the machine, or went wrong while you were monitoring; **MEDIUM** is a
 suspect that can cause crackle and micro-stutter; **LOW** is a lead worth knowing about.
+
+**Several problems at once.** Real PCs rarely have one. Findings are grouped by the symptom they
+produce — the whole PC stops; short interruptions (crackle, micro-stutter); one program waits (disk,
+memory, graphics); worth knowing but not a hitch yet — and the first screen is a plan: how many of
+each, then an order of attack. Change **one** thing, run again, and the comparison at the top of the
+next report says which layer moved. The five worst findings are shown in full (plus the worst of any
+group that would otherwise be empty); the rest are folded into one line per group, and every finding
+is listed under DETAILS.
+
+**Severity is relative to the run, not to how long you watched.** A count-based rule turns an
+hour-long run into a wall of HIGH: one 31 ms stall was HIGH because 31 is over 15. So severity is
+judged on rates and shares — stalls per hour and the share of the run they cover, over-long DPC runs
+per hour, paging time as a percentage of the run, slow disk requests per hour — with one absolute
+exception, because a single interruption long enough to see is serious however rarely it happens.
 
 ## How it works
 
@@ -170,10 +214,42 @@ a run. `wtfis-cli --light` turns it on by hand and `--no-light` keeps full measu
 When a probe reports a stall, the analyzer waits for the trace to catch up, looks at exactly what ran
 on that CPU during that window and issues a verdict:
 
-1. DPC/ISR time covers the stall → blame the driver that owns the routine.
-2. Almost no profiler interrupts arrived and no DPC/ISR explains it → the CPU was taken away from
-   Windows entirely: SMI/firmware, hypervisor, or interrupts disabled.
-3. Otherwise → whichever kernel module or process the CPU samples show.
+0. Every (or nearly every) logical CPU was held at the same instant, for at least 100 ms → **the
+   whole PC stopped**. The verdict names nobody: everything the CPU samples landed in was stopped
+   along with the rest. See below.
+1. A driver's own DPC/ISR time covers at least 35% of the stall **on at least half of the stalled
+   CPUs** → blame the driver that owns the routine. Coverage is worked out per processor, so a
+   driver saturating one core is not diluted to 1/N across a multi-core stall.
+2. Almost no profiler interrupts arrived, no DPC/ISR explains it **and ordinary DPCs stopped too**
+   → the CPU was taken away from Windows entirely: SMI/firmware, hypervisor, or interrupts disabled.
+3. Otherwise → whichever kernel module or process the CPU samples show, but only when the DPC
+   records agree that the CPU really was held (see below), and never on a handful of samples.
+4. If ordinary DPCs kept executing right through the stall → nothing was holding the CPU at all and
+   nothing is blamed: the measuring thread was not woken (timer delivery or scheduling).
+
+**Checking before claiming.** A DPC runs at DISPATCH_LEVEL and cannot preempt code already at
+DISPATCH_LEVEL or above on the same processor, so ordinary DPCs executing *right through* a stall
+are proof that the processor was not held at raised IRQL. The stall is cut into ten slices and the
+claim is only allowed when DPCs are missing from most of them; a queue draining in the last
+millisecond does not count. The same check gates "the CPU went dark", which used to be printed for
+windows that also contained hundreds of DPC and ISR executions. Percentages of CPU samples are
+never quoted on fewer than four samples, and the report says how many samples a share rests on
+whenever there are fewer than ten.
+
+**Whole-PC freezes.** "Nearly every CPU" means all of them up to four logical CPUs and three
+quarters (never fewer than four) above that, so the rule works both on a 4-thread laptop and on a
+64-thread workstation where one parked CPU must not hide a machine-wide freeze. 100 ms is the
+classic limit above which an interruption stops feeling instantaneous. One freeze is reported by
+the real-time probes *and*, a few milliseconds later and through a different path, by the
+normal-priority probe in the other process; the two are matched on both edges and merged into one
+incident, so the counts at the top of the report are honest ("12 whole-PC freezes, 71 short
+kernel-level stalls, 35 CPU-starvation stalls", not 83 and 47 with the freezes counted twice). For
+each freeze, every interrupt source that was firing *steadily* in the seconds before it is compared
+with its rate inside it, which is the closest a CPU-side trace gets to watching a bus or a
+controller stall. A slow disk request that only began after the machine had already stopped is
+marked as a victim of the freeze and is not counted against its drive as well; one that was already
+outstanding well before the freeze began is reported as having coincided with it, and nothing more
+than that.
 
 **Flagged moments.** Wake-up delays from 1 ms up are kept for 30 seconds even though they are far below
 the stall threshold. When you press "I felt it", the worst one in the 3 seconds before the press goes

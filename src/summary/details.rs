@@ -57,14 +57,20 @@ pub(super) fn tool_cost(cx: &mut Ctx) {
 }
 
 /// The "label: value" lines under the verdict.
-pub(super) fn overview(cx: &Ctx, kernel_stalls: usize, sched_stalls: usize) -> Vec<String> {
+pub(super) fn overview(cx: &Ctx, freezes: usize, kernel_stalls: usize, sched_stalls: usize) -> Vec<String> {
     let (elapsed_s, light, stats) = (cx.run.elapsed_s, cx.run.light, cx.run.stats);
     let marks_total = cx.az.marks_total;
     let secs = elapsed_s as u64;
-    let mut overview = vec![
-        format!("Monitored:        {:02}:{:02}", secs / 60, secs % 60),
-        format!("Stalls detected:  {kernel_stalls} kernel-level, {sched_stalls} CPU-starvation"),
-    ];
+    // Counted once each. A whole-PC freeze is reported by both probes and used to appear twice,
+    // as a kernel-level stall AND as a CPU-starvation stall; it is one event.
+    let mut counts = Vec::new();
+    if freezes > 0 {
+        counts.push(format!("{freezes} whole-PC freeze{}", crate::util::plural(freezes as u64)));
+    }
+    counts.push(format!("{kernel_stalls} short kernel-level"));
+    counts.push(format!("{sched_stalls} CPU-starvation"));
+    let mut overview =
+        vec![format!("Monitored:        {:02}:{:02}", secs / 60, secs % 60), format!("Stalls detected:  {}", counts.join(", "))];
     // Near the top on purpose: two runs measured differently must never be compared unaware.
     if let Some(why) = light {
         overview.push(format!(

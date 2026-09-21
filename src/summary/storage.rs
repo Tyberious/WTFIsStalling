@@ -344,6 +344,24 @@ fn health_line(h: &DriveHealth) -> String {
     parts.join("  |  ")
 }
 
+/// How much a program's waiting for paged-out memory matters.
+///
+/// A total inflates with the run: 6.7 s of waiting spread over 59 minutes is 0.2% of the time and
+/// nobody feels it, while the same 6.7 s inside five minutes is a program that visibly stutters.
+/// So judge by the share of the run - 2% is where a program stops feeling smooth, half a percent
+/// is where it shows during loading - plus the single worst wait, because a fifth of a second in
+/// one go is felt however rarely it happens.
+fn paging_severity(total: i64, max: i64, run_s: f64) -> Severity {
+    let share = ticks_to_ms(total) / (run_s.max(1.0) * 1000.0);
+    if share >= 0.02 {
+        Severity::High
+    } else if share >= 0.005 || max >= ms_to_ticks(200.0) {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
+}
+
 /// Programs frozen while memory was read back from disk.
 pub(super) fn paging(cx: &mut Ctx) {
     let faults = std::mem::take(&mut cx.faults);
@@ -363,7 +381,8 @@ pub(super) fn paging(cx: &mut Ctx) {
         if s.total < ms_to_ticks(1000.0) && s.max < ms_to_ticks(200.0) {
             continue;
         }
-        let sev = if s.total >= ms_to_ticks(5000.0) { Severity::High } else { Severity::Medium };
+        let share = ticks_to_ms(s.total) / (cx.run.elapsed_s.max(1.0) * 1000.0);
+        let sev = paging_severity(s.total, s.max, cx.run.elapsed_s);
         let advice = if mem >= 85 {
             format!(
                 "Memory is {mem}% full, so Windows keeps pushing programs out to disk. Close memory-hungry programs \
@@ -388,7 +407,13 @@ pub(super) fn paging(cx: &mut Ctx) {
             &key,
             sev,
             format!("{name}  -  waiting for memory to be read back from disk"),
-            format!("Frozen by {} hard page faults for {} in total (longest {}).{mostly}", s.count, fmt_dur(s.total), fmt_dur(s.max)),
+            format!(
+                "Frozen by {} hard page faults for {} in total, which is {:.1}% of this run (longest single wait {}).{mostly}",
+                s.count,
+                fmt_dur(s.total),
+                share * 100.0,
+                fmt_dur(s.max)
+            ),
             advice,
             s.total,
         );
@@ -400,19 +425,44 @@ pub(super) fn paging(cx: &mut Ctx) {
     cx.mem = mem;
 }
 
+/// How many of a disk's slow requests were the disk's own doing, and how bad the worst of those
+/// was. A request that began only after the whole machine had already stopped waited because
+/// everything waited; counting it against its drive turns one problem into two (see `diskwait`).
+/// Falls back to the raw totals unless every slow request on that disk was actually seen.
+fn discount_victims(seen: Option<&Vec<crate::analyze::SlowSeen>>, slow: u64, max: i64) -> (u64, i64) {
+    let Some(seen) = seen.filter(|v| v.len() as u64 == slow) else { return (slow, max) };
+    let kept: Vec<i64> = seen.iter().filter(|s| !s.victim).map(|s| s.dur).collect();
+    (kept.len() as u64, kept.into_iter().max().unwrap_or(0))
+}
+
 /// Disks that took too long to answer.
 pub(super) fn slow_disks(cx: &mut Ctx) {
     let io_warn = cx.run.io_warn;
+    let run_s = cx.run.elapsed_s.max(1.0);
     let disks = cx.disk_stats.clone();
-    let (storage_log, file_waits) = (&cx.storage_log, &cx.file_waits);
     for (n, s) in &disks {
         if s.slow == 0 {
             continue;
         }
-        let sev = if s.max >= ms_to_ticks(1000.0) || s.slow >= 10 { Severity::High } else { Severity::Medium };
+        let (slow, worst) = discount_victims(cx.az.disk_slow.get(n), s.slow, s.max);
+        if slow == 0 {
+            // Every one of them is explained by a whole-PC freeze; the freeze finding says so.
+            continue;
+        }
+        let (storage_log, file_waits) = (&cx.storage_log, &cx.file_waits);
+        // A one-second wait is felt by anything that touches the drive, whenever it happens; below
+        // that, what matters is how often. One every five minutes is a drive to look at.
+        let per_hour = slow as f64 * 3600.0 / run_s;
+        let sev = if worst >= ms_to_ticks(1000.0) || per_hour >= 12.0 { Severity::High } else { Severity::Medium };
         let disk = cx.az.disks.get(*n).clone();
+        let victims = s.slow - slow;
+        let discounted = if victims > 0 {
+            format!(" {victims} more happened while the whole PC was frozen and are counted there instead.")
+        } else {
+            String::new()
+        };
         let mut evidence =
-            format!("{} request{} took longer than {} (worst {}).", s.slow, plural(s.slow), fmt_dur(io_warn), fmt_dur(s.max));
+            format!("{slow} request{} took longer than {} (worst {}).{discounted}", plural(slow), fmt_dur(io_warn), fmt_dur(worst));
         for extra in [disk.hardware(), disk.fullness()] {
             if !extra.is_empty() {
                 evidence.push_str(&format!(" {}{}.", extra[..1].to_uppercase(), &extra[1..]));
@@ -423,9 +473,9 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         let logged = storage_log.iter().any(|e| e.disk == Some(*n));
         let on_disk: Vec<FileRow> = file_waits.iter().filter(|r| r.1 == *n).cloned().collect();
         let advice = disk_advice(&disk, why, logged, file_hint(&files::rank(&on_disk, 3)));
-        cx.found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, s.max * s.slow as i64);
-        cx.found.measure(&key, Metric::count("slow requests", s.slow as f64));
-        cx.found.measure(&key, Metric::ms("worst wait", ticks_to_ms(s.max)));
+        cx.found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, worst * slow as i64);
+        cx.found.measure(&key, Metric::count("slow requests", slow as f64));
+        cx.found.measure(&key, Metric::ms("worst wait", ticks_to_ms(worst)));
         for sentence in why.map(why_sentences).unwrap_or_default() {
             cx.found.note(&key, sentence);
         }
@@ -610,6 +660,37 @@ mod tests {
         let name = crate::files::public_path(&widest);
         let line = format!("  {name:<64} {:>5} {:>9} {:>12} {:>10}", 11, 999_999, fmt_dur(ms_to_ticks(9999.0)), fmt_dur(1));
         assert!(line.chars().count() <= 118, "{} chars: {line}", line.chars().count());
+    }
+
+    /// The field numbers: 6.7 s of page-fault waiting spread over 59 minutes is 0.2% of the run
+    /// and must not be HIGH; the same 6.7 s inside five minutes is 2% and is.
+    #[test]
+    fn paging_is_judged_by_its_share_of_the_run() {
+        let ms = ms_to_ticks;
+        assert_eq!(paging_severity(ms(6718.0), ms(29.26), 3561.0), Severity::Low);
+        assert_eq!(paging_severity(ms(6718.0), ms(29.26), 300.0), Severity::High);
+        // One wait of a fifth of a second is felt whenever it happened.
+        assert_eq!(paging_severity(ms(1486.0), ms(219.0), 3561.0), Severity::Medium);
+    }
+
+    /// A slow request that only began once the whole PC had already stopped is explained by the
+    /// freeze. Counting it against its drive turns one problem into two, and in the field log it
+    /// gave a healthy internal NVMe its own "responding slowly" finding.
+    #[test]
+    fn requests_a_freeze_explains_do_not_count_against_a_healthy_drive() {
+        use crate::analyze::SlowSeen;
+        let seen = |durs: &[(f64, bool)]| -> Vec<SlowSeen> {
+            durs.iter().enumerate().map(|(i, (d, v))| SlowSeen { end: i as i64, dur: ms_to_ticks(*d), victim: *v }).collect()
+        };
+        // Both of this disk's slow requests sat inside freezes: nothing is left to report.
+        let all_victims = seen(&[(976.0, true), (878.0, true)]);
+        assert_eq!(discount_victims(Some(&all_victims), 2, ms_to_ticks(976.0)), (0, 0));
+        // One was, one was not: the drive keeps the one that is really its own.
+        let mixed = seen(&[(976.0, true), (300.0, false)]);
+        assert_eq!(discount_victims(Some(&mixed), 2, ms_to_ticks(976.0)), (1, ms_to_ticks(300.0)));
+        // Nothing was seen, or not all of it: fall back to the raw totals rather than guess.
+        assert_eq!(discount_victims(None, 6, ms_to_ticks(2173.0)), (6, ms_to_ticks(2173.0)));
+        assert_eq!(discount_victims(Some(&mixed), 6, ms_to_ticks(2173.0)), (6, ms_to_ticks(2173.0)));
     }
 
     #[test]

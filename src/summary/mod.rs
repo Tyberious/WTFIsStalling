@@ -6,6 +6,7 @@
 
 mod ctx;
 mod details;
+mod freezes;
 mod gpu;
 mod hardware;
 mod stalls;
@@ -14,13 +15,13 @@ mod wording;
 
 use std::sync::atomic::Ordering;
 
-use crate::analyze::Analyzer;
+use crate::analyze::{Analyzer, IncidentClass};
 use crate::baseline::{self, Metric, RunFacts, RunRecord, MAX_METRICS};
 use crate::cpuclock::ClockSample;
 use crate::gpu::GpuLog;
 use crate::modules::knowledge;
 use crate::overhead::Overhead;
-use crate::probe::{ProbeStats, StallKind};
+use crate::probe::ProbeStats;
 use crate::util::{plural, ticks_to_ms};
 
 use ctx::Ctx;
@@ -54,10 +55,52 @@ pub enum Health {
     NoData,
 }
 
+/// What a person would FEEL from a finding. Real PCs have several problems at once, and a list
+/// ranked only by severity cannot say which layer to attack first; grouping by symptom can.
+/// The order of the variants is the order the report presents them in.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Group {
+    /// The whole PC stops: cursor and sound included.
+    WholePc,
+    /// Short interruptions: audio crackle, micro-stutter, a core held by a driver.
+    Interruptions,
+    /// One program waits: disk, paging, GPU limits. The rest of the PC carries on.
+    OneProgram,
+    /// Worth knowing, not a hitch yet: drive errors, hardware errors, old drivers, health.
+    Health,
+}
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::WholePc => "THE WHOLE PC STOPS",
+            Group::Interruptions => "SHORT INTERRUPTIONS  (audio crackle, micro-stutter)",
+            Group::OneProgram => "ONE PROGRAM WAITS  (disk, memory, graphics)",
+            Group::Health => "WORTH KNOWING  (not causing hitches yet)",
+        }
+    }
+
+    /// The short form used in the plan at the top of the report.
+    pub fn short(self) -> &'static str {
+        match self {
+            Group::WholePc => "the whole PC stops",
+            Group::Interruptions => "short interruptions",
+            Group::OneProgram => "one program waits",
+            Group::Health => "worth knowing, not a hitch yet",
+        }
+    }
+
+    pub fn all() -> [Group; 4] {
+        [Group::WholePc, Group::Interruptions, Group::OneProgram, Group::Health]
+    }
+}
+
 pub struct Finding {
     /// The subject this finding is about ("driver rtwlane.sys", "disk 1"); the same subject in
     /// another run carries the same key, which is how two runs are compared.
     pub key: String,
+    /// Which symptom this finding produces; see `Group`.
+    pub group: Group,
     pub severity: Severity,
     pub title: String,
     pub evidence: Vec<String>,
@@ -86,6 +129,8 @@ pub struct Summary {
 }
 
 const WIDTH: usize = 100;
+/// The DETAILS tables are printed as-is and are allowed to be wider than the RESULT block.
+const DETAIL_WIDTH: usize = 118;
 
 /// Word-wraps `text`; the first line starts with `first`, the rest align under its text.
 fn wrap(text: &str, first: &str, out: &mut Vec<String>) {
@@ -108,8 +153,41 @@ fn wrap(text: &str, first: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Findings shown in full before the rest are folded into one line per group. The plan at the
+/// top (verdict, overview, the group headlines, the order of attack) is about twenty lines and a
+/// finding is four to six, so five full ones is what fits a console window before a reader has
+/// to scroll. Nothing is lost: the folded ones are listed in DETAILS.
+const SHOWN_IN_FULL: usize = 5;
+/// ...and this is the ceiling once every group's own worst finding has been given a place.
+const SHOWN_MAX: usize = 8;
+
+/// Which findings are shown in full: the worst ones overall, plus the worst of every group that
+/// has something a person can feel, so that a long tail of Low notes can never push a real
+/// problem off the first screen. `findings` is already worst-first.
+fn shown_in_full(findings: &[Finding]) -> Vec<usize> {
+    let real: Vec<usize> = (0..findings.len()).filter(|i| findings[*i].severity > Severity::Low).collect();
+    let pool: Vec<usize> = if real.is_empty() { (0..findings.len()).collect() } else { real };
+    let mut shown: Vec<usize> = pool.iter().copied().take(SHOWN_IN_FULL).collect();
+    // Then the worst of every group that has nothing shown yet, so a group never appears as a
+    // heading with only a "and 3 more" line under it. Low findings can reach the list this way
+    // but never before the five above, so they cannot push a real problem off the first screen.
+    for g in Group::all() {
+        if shown.iter().any(|i| findings[*i].group == g) {
+            continue;
+        }
+        if let Some(i) = (0..findings.len()).find(|i| findings[*i].group == g) {
+            if shown.len() < SHOWN_MAX {
+                shown.push(i);
+            }
+        }
+    }
+    shown.sort_unstable();
+    shown
+}
+
 impl Summary {
-    /// The answer block: verdict first, then each finding with evidence and what to try.
+    /// The answer block: the verdict, then a plan (what the layers are, which to attack first),
+    /// then the findings grouped by the symptom they produce.
     pub fn result_lines(&self) -> Vec<String> {
         let bar = "=".repeat(WIDTH);
         let mut out = vec![bar.clone(), "RESULT".into(), String::new()];
@@ -133,21 +211,102 @@ impl Summary {
                 }
             }
         }
-        for (i, f) in self.findings.iter().enumerate() {
-            out.push(String::new());
-            out.push(format!("  {}. [{}] {}", i + 1, f.severity.label(), f.title));
-            for e in &f.evidence {
-                wrap(e, "       - ", &mut out);
+
+        let shown = shown_in_full(&self.findings);
+        self.plan(&shown, &mut out);
+        let mut n = 0;
+        for group in Group::all() {
+            let in_group: Vec<&Finding> = self.findings.iter().filter(|f| f.group == group).collect();
+            if in_group.is_empty() {
+                continue;
             }
-            out.push("     What to try:".into());
-            wrap(&f.advice, "       ", &mut out);
+            out.push(String::new());
+            out.push(format!("  {}", group.title()));
+            let mut folded: Vec<&str> = Vec::new();
+            for (i, f) in self.findings.iter().enumerate().filter(|(_, f)| f.group == group) {
+                if !shown.contains(&i) {
+                    folded.push(&f.title);
+                    continue;
+                }
+                n += 1;
+                out.push(String::new());
+                out.push(format!("  {n}. [{}] {}", f.severity.label(), f.title));
+                for e in &f.evidence {
+                    wrap(e, "       - ", &mut out);
+                }
+                out.push("     What to try:".into());
+                wrap(&f.advice, "       ", &mut out);
+            }
+            if !folded.is_empty() {
+                out.push(String::new());
+                wrap(
+                    &format!("+ {} more in this group, with the full tables under DETAILS below: {}", folded.len(), folded.join("; ")),
+                    "     ",
+                    &mut out,
+                );
+            }
         }
         out.push(bar);
         out
     }
 
+    /// The first screen has to read as a plan: how many problems of each kind there are, and
+    /// which one to change first. One change at a time, because the next run's comparison can
+    /// then say which layer moved.
+    fn plan(&self, shown: &[usize], out: &mut Vec<String>) {
+        if self.findings.is_empty() {
+            return;
+        }
+        out.push(String::new());
+        out.push("  WHAT THIS RUN FOUND".into());
+        for group in Group::all() {
+            let n = self.findings.iter().filter(|f| f.group == group).count();
+            if n > 0 {
+                out.push(format!("    {:<34} {n} finding{}", group.short(), plural(n as u64)));
+            }
+        }
+        // The cheapest useful order: the worst thing a person can feel first, then the worst of
+        // a different kind, and the warnings that are not hitches last.
+        let first = shown.first().map(|i| &self.findings[*i]);
+        let Some(first) = first else { return };
+        out.push(String::new());
+        out.push("  ORDER OF ATTACK  (change ONE thing, run this again, and the comparison above will say what moved)".into());
+        wrap(&format!("Start here:  {}", first.title), "    ", out);
+        if let Some(next) = shown.iter().map(|i| &self.findings[*i]).find(|f| f.group != first.group && f.severity > Severity::Low) {
+            wrap(&format!("Then:        {}", next.title), "    ", out);
+        }
+        let later = self.findings.iter().filter(|f| f.group == Group::Health).count();
+        if later > 0 {
+            wrap(
+                &format!(
+                    "Later:       the {later} warning{} under '{}'. They are not causing hitches yet.",
+                    plural(later as u64),
+                    Group::Health.short()
+                ),
+                "    ",
+                out,
+            );
+        }
+    }
+
     pub fn detail_lines(&self) -> Vec<String> {
         let mut out = vec!["DETAILS".to_string()];
+        if !self.findings.is_empty() {
+            out.push(String::new());
+            out.push("ALL FINDINGS  (including the ones folded away above)".into());
+            for group in Group::all() {
+                for f in self.findings.iter().filter(|f| f.group == group) {
+                    let mut line = format!("  [{:<6}] {:<32} {}", f.severity.label(), group.short(), f.title);
+                    line.truncate(DETAIL_WIDTH);
+                    out.push(line);
+                    if let Some(first) = f.evidence.first() {
+                        let mut line = format!("            {first}");
+                        line.truncate(DETAIL_WIDTH);
+                        out.push(line);
+                    }
+                }
+            }
+        }
         out.extend(self.details.iter().cloned());
         out
     }
@@ -156,39 +315,78 @@ impl Summary {
 impl Summary {
     /// Canned results for working on the front ends without admin rights or a sick PC.
     pub fn demo(health: Health) -> Summary {
-        let finding = |severity, key: &str, title: &str, evidence: &str, advice: &str, metrics| Finding {
+        let finding = |severity, group, key: &str, title: &str, evidence: Vec<&str>, advice: &str, metrics| Finding {
             key: key.into(),
+            group,
             severity,
             title: title.into(),
-            evidence: vec![evidence.into()],
+            evidence: evidence.into_iter().map(String::from).collect(),
             advice: advice.into(),
             metrics,
             impact: 0,
         };
         let findings = match health {
+            // Several layers at once, which is what a real PC looks like: a whole-PC freeze, a
+            // driver holding one core, a slow drive, and a warning that is not a hitch yet.
             Health::Problem => vec![
                 finding(
                     Severity::High,
+                    Group::WholePc,
+                    "whole-PC freeze",
+                    "The whole PC stopped responding, 12 times",
+                    vec![
+                        "12 freezes in 59 minutes (12 per hour), typically 950 ms and at worst 1000 ms. All 8 processors stopped at \
+                         the same instant each time, so no program that happened to be running can be the cause.",
+                        "Device interrupts did not all stop together: Wdf01000.sys stopped completely in 8 of the 12 while \
+                         dxgkrnl.sys kept arriving; in 3 it was the other way round. Which device goes quiet differs from freeze to \
+                         freeze, which points below the drivers, at the board, its firmware or a bus.",
+                        "8 of the 12 coincided with a slow write to disk 6 (I:), a drive that had been asleep; 4 coincided with \
+                         nothing this tool can see.",
+                        "What is NOT explained: no driver's interrupt handling was long enough to do this, no single processor was \
+                         held, and the cause of the freezes is not visible in this trace.",
+                    ],
+                    "Nothing in this trace names a cause, so test one layer at a time and run this tool again after each change: \
+                     the comparison at the top of the next report will say whether the freezes moved. 1) Fully exit (not just close) \
+                     any utility that talks to the hardware directly - RGB, fan, lighting and monitoring tools - one at a time. 2) \
+                     Unplug external drives, especially any this report mentions. 3) Update the motherboard BIOS/UEFI and load its \
+                     defaults.",
+                    vec![Metric::flat("freezes per hour", 12), Metric::ms("worst freeze", 1000.0)],
+                ),
+                finding(
+                    Severity::Medium,
+                    Group::Interruptions,
                     "driver rtwlane.sys",
                     "rtwlane.sys  -  Wi-Fi adapter driver",
-                    "Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).",
+                    vec!["Blamed for 14 stalls (worst 11.80 ms, 121 ms in total), about 14 per hour."],
                     knowledge("rtwlane.sys").map_or("", |k| k.advice),
                     vec![Metric::count("stalls blamed", 14), Metric::ms("worst stall", 11.8)],
                 ),
                 finding(
                     Severity::Medium,
+                    Group::OneProgram,
                     "disk 1",
                     "Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly",
-                    "3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware 80.00A80. D: 93% full.",
+                    vec!["3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware 80.00A80. D: 93% full."],
                     "Check its health (SMART), free up space on D:, and reseat or replace its cable.",
                     vec![Metric::count("slow requests", 3), Metric::ms("worst wait", 840.0)],
+                ),
+                finding(
+                    Severity::Low,
+                    Group::Health,
+                    "disk 0",
+                    "Disk 0 (C:), Samsung SSD 990 PRO  -  drive health warning",
+                    vec!["Drive health: 2 CRC error(s) over its life; none while monitoring. Only a problem if the number keeps rising."],
+                    "CRC errors mean data was damaged between the drive and the motherboard, not on the drive. Only act if the number \
+                     grows between runs.",
+                    vec![Metric::flat("errors while monitoring", 0)],
                 ),
             ],
             Health::Warning => vec![finding(
                 Severity::Medium,
+                Group::Interruptions,
                 "driver nvlddmkm.sys",
                 "nvlddmkm.sys  -  NVIDIA GPU driver",
-                "Its interrupt handling ran for up to 1.84 ms at a time (6 times over 1.00 ms).",
+                vec!["Its interrupt handling ran for up to 1.84 ms at a time (6 times over 1.00 ms)."],
                 knowledge("nvlddmkm.sys").map_or("", |k| k.advice),
                 vec![Metric::ms("worst DPC/ISR", 1.84), Metric::count("long runs", 6)],
             )],
@@ -202,7 +400,7 @@ impl Summary {
             ),
         };
         let facts = RunFacts {
-            seconds: 312.0,
+            seconds: if health == Health::Problem { 3561.0 } else { 312.0 },
             light: false,
             stalls_kernel: match health {
                 Health::Problem => 14,
@@ -237,7 +435,17 @@ impl Summary {
             health,
             headline,
             subline,
-            overview: vec!["Monitored:        05:12".into(), "Note:             demo data, not a real measurement".into()],
+            overview: vec![
+                match health {
+                    Health::Problem => "Monitored:        59:21".to_string(),
+                    _ => "Monitored:        05:12".to_string(),
+                },
+                match health {
+                    Health::Problem => "Stalls detected:  12 whole-PC freezes, 14 short kernel-level stalls".to_string(),
+                    _ => "Stalls detected:  2 short kernel-level stalls".to_string(),
+                },
+                "Note:             demo data, not a real measurement".into(),
+            ],
             comparison: baseline::compare(&previous, &record),
             findings,
             details: vec![String::new(), "(demo: no details)".into()],
@@ -248,11 +456,25 @@ impl Summary {
 
 /// Findings keyed by subject so that e.g. a driver blamed for stalls *and* seen running long
 /// DPCs becomes one entry with both pieces of evidence.
-#[derive(Default)]
-pub(super) struct Findings(pub(super) Vec<(String, Finding)>);
+pub(super) struct Findings(pub(super) Vec<(String, Finding)>, Group);
+
+impl Default for Findings {
+    fn default() -> Findings {
+        Findings(Vec::new(), Group::Interruptions)
+    }
+}
 
 impl Findings {
+    /// Which group the sections that follow put their NEW findings in. Like the title and the
+    /// advice, the group is decided by whichever section introduces a subject first: a disk that
+    /// actually responded slowly this run belongs under "one program waits", the same disk known
+    /// only from the event log belongs under "worth knowing".
+    pub(super) fn in_group(&mut self, group: Group) {
+        self.1 = group;
+    }
+
     pub(super) fn add(&mut self, key: &str, severity: Severity, title: String, evidence: String, advice: String, impact: i64) {
+        let group = self.1;
         match self.0.iter_mut().find(|(k, _)| k == key) {
             Some((_, f)) => {
                 f.severity = f.severity.max(severity);
@@ -261,7 +483,7 @@ impl Findings {
             }
             None => self.0.push((
                 key.to_string(),
-                Finding { key: key.to_string(), severity, title, evidence: vec![evidence], advice, metrics: Vec::new(), impact },
+                Finding { key: key.to_string(), group, severity, title, evidence: vec![evidence], advice, metrics: Vec::new(), impact },
             )),
         }
     }
@@ -330,7 +552,15 @@ impl Analyzer {
     /// is introduced, and everything after it can only add to that. The constraints found in the
     /// code, and why each one holds:
     ///
-    /// * `stalls::tally` runs first of all, so a driver, process or "CPU went dark" that actually
+    /// Each section also declares which `Group` its NEW findings belong to, and `add` keeps the
+    /// group of whichever section introduced a subject first, exactly as it keeps the title and
+    /// the advice. That is what puts a disk which really responded slowly this run under "one
+    /// program waits" and a disk known only from the event log under "worth knowing".
+    ///
+    /// * `freezes::whole_pc` runs before everything, so that whole-PC freezes are one finding at
+    ///   the top of the report instead of a dozen bystanders; `stalls::tally` then never sees
+    ///   those incidents.
+    /// * `stalls::tally` runs next, so a driver, process or "CPU went dark" that actually
     ///   stalled the PC is introduced as such ("Blamed for N stalls"), with that culprit's advice.
     ///   `stalls::flagged_moments`, `stalls::long_dpc_isr`, `gpu::driver_resets` and
     ///   `hardware::whea` all add to those same keys afterwards.
@@ -358,19 +588,28 @@ impl Analyzer {
     pub fn summarize(&mut self, run: RunData) -> Summary {
         let mut cx = Ctx::new(self, run);
 
+        cx.found.in_group(Group::WholePc);
+        freezes::whole_pc(&mut cx);
+        cx.found.in_group(Group::Interruptions);
         stalls::tally(&mut cx);
         stalls::flagged_moments(&mut cx);
         hardware::e_cores(&mut cx);
         stalls::long_dpc_isr(&mut cx);
+        cx.found.in_group(Group::OneProgram);
         storage::paging(&mut cx);
         storage::slow_disks(&mut cx);
+        cx.found.in_group(Group::Health);
         storage::event_log(&mut cx);
         storage::drive_health(&mut cx);
+        cx.found.in_group(Group::OneProgram);
         gpu::driver_resets(&mut cx);
         gpu::graphics(&mut cx);
+        cx.found.in_group(Group::Health);
         hardware::whea(&mut cx);
         hardware::unexpected_shutdowns(&mut cx);
+        cx.found.in_group(Group::Interruptions);
         stalls::periodicity(&mut cx);
+        cx.found.in_group(Group::Health);
         hardware::cpu_throttling(&mut cx);
         hardware::firmware_throttle(&mut cx);
         details::tool_cost(&mut cx);
@@ -380,9 +619,11 @@ impl Analyzer {
         findings.sort_by_key(|f| (std::cmp::Reverse(f.severity), std::cmp::Reverse(f.impact)));
 
         // ---- Verdict -----------------------------------------------------------------
-        let kernel_stalls = cx.az.incidents.iter().filter(|i| !i.marked && i.kind == StallKind::Kernel).count();
-        let sched_stalls = cx.az.incidents.iter().filter(|i| !i.marked).count() - kernel_stalls;
-        let overview = details::overview(&cx, kernel_stalls, sched_stalls);
+        let count = |class| cx.az.incidents.iter().filter(|i| !i.marked && i.class == class).count();
+        let (freezes, short_kernel, sched_stalls) =
+            (count(IncidentClass::Freeze), count(IncidentClass::Kernel), count(IncidentClass::Starvation));
+        let kernel_stalls = freezes + short_kernel;
+        let overview = details::overview(&cx, freezes, short_kernel, sched_stalls);
         let (events, secs, marks_total) = (cx.events, cx.run.elapsed_s as u64, cx.az.marks_total);
         let more = |n: usize| if n > 1 { format!("  (+{} more finding{} below)", n - 1, plural(n as u64 - 1)) } else { String::new() };
         let top = findings.first();
@@ -534,12 +775,13 @@ mod tests {
 
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let flagged = |culprit: &str| IncidentSummary {
-            kind: StallKind::Kernel,
+            class: IncidentClass::Kernel,
             start: qpc(),
             dur: ms_to_ticks(6.0),
             culprit: culprit.to_string(),
             marked: true,
             cpus: vec![0],
+            freeze: None,
         };
         az.incidents.push(flagged("CPU went dark (firmware SMI / hypervisor / interrupts off)"));
         az.incidents.push(flagged("unexplained"));
@@ -581,12 +823,13 @@ mod tests {
         let freq = crate::util::qpc_freq();
         let t0 = qpc() - 400 * freq;
         let stall = |culprit: &str, at_s: i64| IncidentSummary {
-            kind: StallKind::Scheduler,
+            class: IncidentClass::Starvation,
             start: t0 + at_s * freq,
             dur: ms_to_ticks(30.0),
             culprit: culprit.to_string(),
             marked: false,
             cpus: Vec::new(),
+            freeze: None,
         };
         for (i, pid) in [42216, 42980, 2308, 18996].into_iter().enumerate() {
             az.incidents.push(stall(&format!("process msedge.exe ({pid})"), 300 + i as i64));
@@ -618,13 +861,59 @@ mod tests {
         assert!(netio.advice.contains("iCUE") && netio.advice.contains("HWiNFO"), "product names keep their case: {}", netio.advice);
     }
 
+    /// The first screen has to read as a plan: the verdict, then how many problems of each kind
+    /// there are, then what to change first - and the whole-PC freeze above everything else.
     #[test]
     fn result_block_leads_with_the_verdict_and_stays_within_width() {
         let lines = Summary::demo(Health::Problem).result_lines();
         let verdict = lines.iter().find(|l| l.contains(">>>")).expect("verdict line");
-        assert!(verdict.contains("PROBLEM FOUND") && verdict.contains("rtwlane.sys"));
+        assert!(verdict.contains("PROBLEM FOUND") && verdict.contains("The whole PC stopped"), "{verdict}");
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        assert!(at("WHAT THIS RUN FOUND") < at("ORDER OF ATTACK"), "{lines:?}");
+        assert!(at("ORDER OF ATTACK") < at("THE WHOLE PC STOPS"), "the plan comes before the findings: {lines:?}");
+        assert!(at("THE WHOLE PC STOPS") < at("SHORT INTERRUPTIONS"), "groups in felt-impact order: {lines:?}");
+        assert!(at("SHORT INTERRUPTIONS") < at("ONE PROGRAM WAITS"), "{lines:?}");
+        assert!(at("ONE PROGRAM WAITS") < at("WORTH KNOWING"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Start here:")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("What to try:")));
         assert!(lines.iter().all(|l| l.chars().count() <= WIDTH), "advice text must be wrapped");
+        // Correlation language, never causation, and the gaps are named.
+        let text = lines.join(" ");
+        assert!(text.contains("coincided with") && text.contains("coincided with nothing"), "{text}");
+        assert!(text.contains("What is NOT explained"), "{text}");
+    }
+
+    /// A long tail of findings must not bury the answer, and nothing may be silently dropped.
+    #[test]
+    fn only_the_top_findings_are_shown_in_full_and_the_rest_are_folded_into_details() {
+        let mut summary = Summary::demo(Health::Problem);
+        let noise = |i: usize, group: Group, severity| Finding {
+            key: format!("driver noise{i}.sys"),
+            group,
+            severity,
+            title: format!("noise{i}.sys  -  something"),
+            evidence: vec!["e".into()],
+            advice: "a".into(),
+            metrics: Vec::new(),
+            impact: 0,
+        };
+        for i in 0..10 {
+            summary.findings.push(noise(i, Group::Interruptions, Severity::Medium));
+            summary.findings.push(noise(100 + i, Group::Health, Severity::Low));
+        }
+        let lines = summary.result_lines();
+        let shown = lines.iter().filter(|l| l.contains("] ") && l.contains("  -  ")).count();
+        assert!(shown <= SHOWN_MAX, "{shown} findings shown in full");
+        assert!(lines.iter().any(|l| l.contains("more in this group")), "the rest are folded: {lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= WIDTH), "{lines:?}");
+        // The freeze is still first, and every finding is still listed under DETAILS.
+        assert!(lines.iter().position(|l| l.contains("The whole PC stopped")) < lines.iter().position(|l| l.contains("noise")));
+        let details = summary.detail_lines();
+        assert!(details.iter().any(|l| l.contains("ALL FINDINGS")), "{details:?}");
+        for f in &summary.findings {
+            assert!(details.iter().any(|l| l.contains(f.title.split("  -  ").next().unwrap())), "{} missing from DETAILS", f.title);
+        }
+        assert!(details.iter().all(|l| l.chars().count() <= DETAIL_WIDTH), "{details:?}");
     }
 
     /// The demo carries a canned previous run, so the block can be seen (and checked) without
@@ -670,6 +959,139 @@ mod tests {
         assert_eq!(m.len(), MAX_METRICS);
         assert_eq!((m[0].label.as_str(), m[0].value), ("slow requests", 9.0));
         assert_eq!(m[1].label, "worst wait");
+    }
+
+    /// The 59-minute field report from issue #15, rebuilt from synthetic incidents: one
+    /// recurring whole-PC freeze plus three background problems. What used to come out as 34
+    /// findings, 23 of them HIGH, blaming a dozen bystanders.
+    #[test]
+    fn the_field_report_becomes_one_freeze_finding_and_a_plan() {
+        use crate::analyze::{Coincided, FreezeFacts, IncidentClass, IncidentSummary};
+        use crate::diskwait::Role;
+        use crate::intr::Flow;
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(32468, "SignalRgb.exe")]), true);
+        let freq = crate::util::qpc_freq();
+        let t0 = qpc() - 3561 * freq;
+        // Twelve freezes; eight of them coincide with a slow request to a drive that had been
+        // asleep, four with nothing at all. Every one of them has a different program on the
+        // CPUs, which is exactly how the old report produced a dozen accusations.
+        for i in 0..12i64 {
+            let coincided = (i < 8).then(|| Coincided { disk: Some(6), role: Role::Trigger, waited: ms_to_ticks(2173.0), woke: true });
+            az.incidents.push(IncidentSummary {
+                class: IncidentClass::Freeze,
+                start: t0 + i * 290 * freq,
+                dur: ms_to_ticks(900.0 + i as f64 * 8.0),
+                culprit: "whole-PC freeze".into(),
+                marked: false,
+                cpus: (0..8).collect(),
+                freeze: Some(FreezeFacts {
+                    cpus: 8,
+                    ncpu: 8,
+                    idle_share: if i % 2 == 0 { 0.86 } else { 0.02 },
+                    samples: 120,
+                    on_cpu: vec!["SignalRgb.exe (32468)".into(), "explorer.exe (23584)".into()],
+                    silent: if i < 8 { vec![("Wdf01000.sys".into(), 0.0)] } else { vec![("dxgkrnl.sys".into(), 0.05)] },
+                    continued: if i < 8 { vec![("dxgkrnl.sys".into(), 0.68)] } else { vec![("Wdf01000.sys".into(), 1.37)] },
+                    timer: Some(Flow::Silent),
+                    dpcs_kept_running: true,
+                    holding: None,
+                    coincided,
+                }),
+            });
+        }
+        // The background layer: a network filter stalling one core every 60 s.
+        for i in 0..55i64 {
+            az.incidents.push(IncidentSummary {
+                class: IncidentClass::Kernel,
+                start: t0 + i * 60 * freq,
+                dur: ms_to_ticks(13.52),
+                culprit: "driver NETIO.SYS".into(),
+                marked: false,
+                cpus: vec![5],
+                freeze: None,
+            });
+        }
+        // ...and a single 31 ms starvation stall, which used to be reported as HIGH.
+        az.incidents.push(IncidentSummary {
+            class: IncidentClass::Starvation,
+            start: t0 + 900 * freq,
+            dur: ms_to_ticks(31.6),
+            culprit: "process consent.exe (18812)".into(),
+            marked: false,
+            cpus: Vec::new(),
+            freeze: None,
+        });
+
+        let stats =
+            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        az.shared.inner.lock().unwrap().events = 37_917_537;
+        let summary = az.summarize(RunData {
+            elapsed_s: 3561.0,
+            events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+        });
+
+        let freeze = summary.findings.iter().find(|f| f.key == "whole-PC freeze").expect("one freeze finding");
+        assert_eq!(freeze.group, Group::WholePc);
+        assert_eq!(summary.findings.iter().filter(|f| f.key == "whole-PC freeze").count(), 1, "one finding, not twelve");
+        assert_eq!(summary.findings[0].key, "whole-PC freeze", "and it is the first thing the report says");
+        let said = freeze.evidence.join(" ");
+        assert!(said.contains("12 freezes"), "{said}");
+        assert!(said.contains("8 of the 12 freezes coincided with a slow request"), "{said}");
+        assert!(said.contains("4 of the 12 freezes coincided with nothing at all"), "both numbers: {said}");
+        assert!(said.contains("Wdf01000.sys stopped completely in 8 of 12"), "{said}");
+        assert!(said.contains("What is NOT explained"), "{said}");
+        assert!(said.contains("Context, not blame") && said.contains("SignalRgb.exe"), "named, never blamed: {said}");
+        // No bystander is a finding of its own, and nothing anywhere claims raised IRQL.
+        for f in &summary.findings {
+            assert!(!f.title.starts_with("SignalRgb.exe"), "a bystander became a finding: {}", f.title);
+            assert!(!f.title.starts_with("explorer.exe"), "{}", f.title);
+        }
+        assert!(!summary.findings.iter().any(|f| f.evidence.iter().any(|e| e.contains("raised IRQL"))));
+
+        // The background layers are still reported, at a severity that matches how often they
+        // happen rather than how long the run was.
+        let netio = summary.findings.iter().find(|f| f.key == "driver NETIO.SYS").expect("the network filter");
+        assert_eq!((netio.severity, netio.group), (Severity::Medium, Group::Interruptions), "{:?}", netio.evidence);
+        let consent = summary.findings.iter().find(|f| f.key.contains("consent.exe")).expect("the one starvation stall");
+        assert_eq!(consent.severity, Severity::Low, "one 31 ms stall in an hour is a lead, not a HIGH");
+
+        // The first screen reads as a plan and every line fits the report.
+        let lines = summary.result_lines();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        assert!(at("WHAT THIS RUN FOUND") < at("ORDER OF ATTACK"));
+        assert!(at("ORDER OF ATTACK") < at("THE WHOLE PC STOPS"));
+        assert!(lines.iter().any(|l| l.contains("Start here:") && l.contains("whole PC")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("12 whole-PC freezes")), "the counts are honest: {:?}", summary.overview);
+        assert!(lines.iter().any(|l| l.contains("55 short kernel-level")), "{:?}", summary.overview);
+        let full = lines.iter().filter(|l| l.contains("] ") && l.contains("  -  ")).count();
+        assert!(full <= SHOWN_MAX, "{full} findings shown in full");
+        assert!(lines.iter().all(|l| l.chars().count() <= WIDTH), "{lines:?}");
+        // The block this section adds to DETAILS. (The DRIVE HEALTH table below it can
+        // already run past the width on a PC with several NVMe drives; that is issue #13's
+        // table, not this one.)
+        let details = summary.detail_lines();
+        let all_findings = details.iter().skip_while(|l| !l.contains("ALL FINDINGS")).take_while(|l| !l.is_empty());
+        for l in all_findings {
+            assert!(l.chars().count() <= DETAIL_WIDTH, "{} chars: {l}", l.chars().count());
+        }
+
+        // The freeze can be compared with the next run without a process ID or a timestamp in
+        // the key, and by a number that does not grow with the length of the run.
+        assert_eq!(crate::baseline::stable_key(&freeze.key), "whole-PC freeze");
+        assert_eq!(freeze.metrics[0].label, "freezes per hour");
+        assert!((freeze.metrics[0].value - 12.13).abs() < 0.1, "{:?}", freeze.metrics);
     }
 
     #[test]

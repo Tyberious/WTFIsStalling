@@ -4,6 +4,7 @@
 use crate::baseline::stable_key;
 use std::collections::HashMap;
 
+use crate::analyze::IncidentClass;
 use crate::modules::knowledge;
 use crate::period;
 use crate::state::KIND_ISR;
@@ -11,7 +12,7 @@ use crate::util::{fmt_dur, ms_to_ticks, plural, qpc_freq, ticks_to_ms};
 
 use super::ctx::Ctx;
 use super::wording::{process_advice, process_title, GENERIC_DRIVER_ADVICE, POLLING_ADVICE};
-use super::{Metric, Severity};
+use super::{Group, Metric, Severity};
 
 const DARK_ADVICE: &str = "Windows itself was frozen out, which points below the operating system. Update the BIOS/UEFI, load BIOS \
     defaults (undo overclocks and memory tweaks), disable 'Legacy USB support' and unused onboard devices as a test, check for \
@@ -32,10 +33,48 @@ fn secs(ticks: &[i64]) -> Vec<f64> {
     ticks.iter().map(|t| *t as f64 / qpc_freq() as f64).collect()
 }
 
-/// Stalls grouped by who was blamed, worst total first.
+/// How bad a run of stalls blamed on one subject is, relative to the length of the run and to
+/// what a person can feel.
+///
+/// Counting alone inflated everything on a long run: "1 stall, 31 ms" came out HIGH because a
+/// separate rule said "worst >= 15 ms". So:
+/// * 100 ms is the classic limit above which an interruption stops feeling instantaneous
+///   (nngroup.com/articles/response-times-3-important-limits), so one of those is serious on its
+///   own, whenever it happened.
+/// * Under that, what makes a short stall matter is how OFTEN it comes back. Once every ten
+///   seconds (360 per hour) at 5 ms or more is continuous audio crackle; that is High.
+/// * So is anything that adds up to half a percent of the whole run, however it is distributed.
+/// * A couple an hour is a lead worth knowing (Low). Between the two, a suspect (Medium).
+fn stall_severity(n: u32, worst: i64, total: i64, run_s: f64) -> Severity {
+    let per_hour = f64::from(n) * 3600.0 / run_s.max(1.0);
+    let share = ticks_to_ms(total) / (run_s.max(1.0) * 1000.0);
+    if worst >= ms_to_ticks(100.0) || (per_hour >= 360.0 && worst >= ms_to_ticks(5.0)) || share >= 0.005 {
+        Severity::High
+    } else if per_hour >= 2.0 || worst >= ms_to_ticks(50.0) {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
+}
+
+/// "14 stalls (worst 11.80 ms, 121 ms in total), about 14 per hour"
+fn how_often(n: u32, worst: i64, total: i64, run_s: f64) -> String {
+    let per_hour = f64::from(n) * 3600.0 / run_s.max(1.0);
+    let rate = if n > 1 {
+        format!(", about {} per hour", if per_hour >= 10.0 { format!("{per_hour:.0}") } else { format!("{per_hour:.1}") })
+    } else {
+        String::new()
+    };
+    format!("{n} stall{} (worst {}, {} in total){rate}", plural(u64::from(n)), fmt_dur(worst), fmt_dur(total))
+}
+
+/// Stalls grouped by who was blamed, worst total first. Whole-PC freezes are not here: they are
+/// one incident class with one finding of their own (`freezes`), because everything the samples
+/// inside them landed in was a bystander.
 pub(super) fn tally(cx: &mut Ctx) {
+    let run_s = cx.run.elapsed_s;
     let mut tally: HashMap<String, (u32, i64, i64)> = HashMap::new();
-    for i in cx.az.incidents.iter().filter(|i| !i.marked) {
+    for i in cx.az.incidents.iter().filter(|i| !i.marked && i.class != IncidentClass::Freeze) {
         // Keyed without the process ID: a browser runs a dozen processes, and four findings for
         // "msedge.exe" are one finding said four times.
         let t = tally.entry(stable_key(&i.culprit)).or_default();
@@ -47,8 +86,8 @@ pub(super) fn tally(cx: &mut Ctx) {
     tally.sort_by_key(|(_, t)| std::cmp::Reverse(t.1));
 
     for (culprit, (n, total, worst)) in &tally {
-        let sev = if *n >= 3 || *worst >= ms_to_ticks(15.0) { Severity::High } else { Severity::Medium };
-        let stalls = format!("{n} stall{} (worst {}, {} in total)", plural(*n as u64), fmt_dur(*worst), fmt_dur(*total));
+        let sev = stall_severity(*n, *worst, *total, run_s);
+        let stalls = how_often(*n, *worst, *total, run_s);
         if let Some(m) = culprit.strip_prefix("driver ") {
             let what = cx.az.modules.describe_short(m);
             let advice = knowledge(m).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
@@ -64,8 +103,59 @@ pub(super) fn tally(cx: &mut Ctx) {
             );
         } else if let Some(p) = culprit.strip_prefix("process ") {
             cx.found.add(culprit, sev, process_title(p), format!("Was occupying the CPU during {stalls}."), process_advice(p), *total);
+        } else if let Some(n_disk) = culprit.strip_prefix("disk ").and_then(|n| n.parse::<u32>().ok()) {
+            // A normal thread that could not run while the CPUs were idle was blocked, and the
+            // trace says on which drive. Same subject as the storage section's "disk N", so it
+            // belongs in the same finding and in the same group.
+            let disk = cx.az.disks.get(n_disk).clone();
+            cx.found.in_group(Group::OneProgram);
+            cx.found.add(
+                culprit,
+                sev,
+                format!("{}  -  froze what was waiting on it", disk.title()),
+                format!(
+                    "A normal program thread could not run during {stalls} while the processors were idle, because it was \
+                         waiting for this drive to answer."
+                ),
+                "Anything that touches this drive waits with it. Check its health (SMART) with the maker's tool or \
+                 CrystalDiskInfo, stop it from sleeping (Power Options > Hard disk > 'Turn off hard disk after' = 0), and keep \
+                 files you use while playing or working off it."
+                    .into(),
+                *total,
+            );
+            cx.found.in_group(Group::Interruptions);
+        } else if culprit == "waiting on paging" {
+            cx.found.add(
+                culprit,
+                sev,
+                "Threads were held up waiting for memory to come back from disk".into(),
+                format!(
+                    "During {stalls} the processors were idle and this tool's own thread was waiting for memory to be read \
+                         back from disk, which is what any program in the same position would be doing."
+                ),
+                "See the paging findings in this report: close memory-hungry programs (a browser with many tabs is the usual \
+                 one), or move the paging file to your fastest drive."
+                    .into(),
+                *total,
+            );
+        } else if culprit.starts_with("not woken") {
+            cx.found.add(
+                culprit,
+                sev,
+                "Threads were not woken on time, with no processor held".into(),
+                format!(
+                    "During {stalls} ordinary interrupt work kept running on the affected processors, which cannot happen \
+                         while a driver holds one. So nothing was blocking the processors: threads simply were not woken."
+                ),
+                "This is a timing problem below the programs; power management and the system clock are the places to look. Test with the 'High \
+                 performance' power plan, update the BIOS/UEFI and the chipset driver, and undo any 'latency tweak' that changed \
+                 the timer (bcdedit settings such as useplatformclock or disabledynamictick)."
+                    .into(),
+                *total,
+            );
         } else if culprit == "unexplained" {
-            let sev = if *n >= 3 { Severity::Medium } else { Severity::Low };
+            // Nothing to act on, so it takes a lot of them before this outranks a real finding.
+            let sev = if *n >= 3 { sev } else { sev.min(Severity::Medium) };
             cx.found.add(
                 culprit,
                 sev,
@@ -85,13 +175,18 @@ pub(super) fn tally(cx: &mut Ctx) {
                 "Check Task Manager for programs using a lot of CPU while the problem happens.".into(),
                 *total,
             );
-        } else if *n >= 5 {
+        } else if culprit == "scheduling delay with idle CPUs" {
             cx.found.add(
                 culprit,
-                Severity::Low,
-                "Scheduling delays while CPUs were idle".into(),
-                format!("{stalls}."),
-                "Usually harmless. If hitches persist, test the 'High performance' power plan (core parking can cause this).".into(),
+                sev.min(Severity::Medium),
+                "Delays with idle processors and no visible cause".into(),
+                format!(
+                    "{stalls}. A normal program thread could not run even though the processors had nothing to do, and neither \
+                     disk activity nor paging lines up with it, so what held it up is not visible in this trace."
+                ),
+                "Test the 'High performance' power plan (processor core parking can do this), and run again for longer while \
+                 reproducing the problem so a pattern can appear."
+                    .into(),
                 *total,
             );
         }
@@ -190,6 +285,23 @@ pub(super) fn flagged_moments(cx: &mut Ctx) {
     }
 }
 
+/// How bad a driver's over-long interrupt handling is.
+///
+/// "3 times over the threshold" was a count, so an hour-long run reached it for almost anything.
+/// What matters is how often it happens: once a minute of a 4 ms hold is a machine that crackles
+/// continuously, once an hour is a note. (A DPC is expected to finish well inside 100 us; see
+/// learn.microsoft.com/windows-hardware/drivers/kernel/guidelines-for-writing-dpc-routines.)
+fn exec_severity(worst: i64, over: u64, run_s: f64) -> Severity {
+    let over_per_hour = over as f64 * 3600.0 / run_s.max(1.0);
+    if worst >= ms_to_ticks(4.0) && over_per_hour >= 60.0 {
+        Severity::High
+    } else if over_per_hour >= 2.0 || worst >= ms_to_ticks(2.0) {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
+}
+
 /// Drivers whose DPC or ISR runs went over the warning threshold.
 pub(super) fn long_dpc_isr(cx: &mut Ctx) {
     let exec_warn = cx.run.exec_warn;
@@ -210,12 +322,13 @@ pub(super) fn long_dpc_isr(cx: &mut Ctx) {
     let mut drivers: Vec<_> = mods.into_iter().collect();
     drivers.sort_by_key(|(_, a)| std::cmp::Reverse(a.dpc_max.max(a.isr_max)));
 
+    let run_s = cx.run.elapsed_s.max(1.0);
     for (name, a) in &drivers {
         let worst = a.dpc_max.max(a.isr_max);
         if worst < exec_warn {
             continue;
         }
-        let sev = if worst >= ms_to_ticks(4.0) && a.over >= 3 { Severity::High } else { Severity::Medium };
+        let sev = exec_severity(worst, a.over, run_s);
         let what = cx.az.modules.describe_short(name);
         let advice = knowledge(name).map(|k| k.advice).unwrap_or(GENERIC_DRIVER_ADVICE);
         cx.found.add(
@@ -270,5 +383,57 @@ pub(super) fn periodicity(cx: &mut Ctx) {
                 POLLING_ADVICE.replacen("Something", "something software-driven", 1)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers from the two field reports in issue #15, judged against the length of the run
+    /// they came from and against the same numbers in a five-minute run.
+    #[test]
+    fn stall_severity_is_relative_to_the_run_and_to_what_a_person_can_feel() {
+        let hour = 3561.0; // the 59-minute field run
+        let short = 300.0; // five minutes
+        let ms = ms_to_ticks;
+
+        // "[HIGH] consent.exe - 1 stall, 31 ms" was the worst of the old rules: a single blip
+        // nobody felt, promoted because 31 ms is over a fixed 15 ms line.
+        assert_eq!(stall_severity(1, ms(31.6), ms(31.6), hour), Severity::Low);
+        // The same one stall inside five minutes is twelve an hour, which is a suspect. That is
+        // the rate changing, not the rule.
+        assert_eq!(stall_severity(1, ms(31.6), ms(31.6), short), Severity::Medium);
+
+        // 55 network-filter stalls of 5-13 ms in 59 minutes: once a minute. Real, worth acting
+        // on, but not a machine that is repeatedly or badly stalled.
+        assert_eq!(stall_severity(55, ms(13.52), ms(415.0), hour), Severity::Medium);
+        // The same 55 in five minutes is one every five seconds: continuous audio crackle.
+        assert_eq!(stall_severity(55, ms(13.52), ms(415.0), short), Severity::High);
+
+        // One hold long enough to be seen is serious however rarely it happens...
+        assert_eq!(stall_severity(1, ms(900.0), ms(900.0), hour), Severity::High);
+        // ...and so is anything that adds up to half a percent of the run.
+        assert_eq!(stall_severity(300, ms(60.0), ms(18_000.0), hour), Severity::High);
+    }
+
+    #[test]
+    fn a_driver_is_judged_by_how_often_its_interrupt_handling_runs_long_not_how_long_you_watched() {
+        let hour = 3561.0;
+        let ms = ms_to_ticks;
+        // The field case: 3.64 ms at worst, four times in an hour. A suspect, not a HIGH.
+        assert_eq!(exec_severity(ms(3.64), 4, hour), Severity::Medium);
+        // One 1.01 ms run in an hour is a note, not a suspect: the old rule made it MEDIUM.
+        assert_eq!(exec_severity(ms(1.01), 1, hour), Severity::Low);
+        // 4 ms or more, once a minute or more often: that is what a person hears.
+        assert_eq!(exec_severity(ms(4.2), 60, hour), Severity::High);
+        assert_eq!(exec_severity(ms(4.2), 4, hour), Severity::Medium, "the same driver, four times an hour");
+    }
+
+    #[test]
+    fn how_often_says_the_rate_only_when_there_is_a_rate_to_say() {
+        let text = how_often(55, ms_to_ticks(13.52), ms_to_ticks(415.0), 3561.0);
+        assert!(text.contains("55 stalls") && text.contains("about 56 per hour"), "{text}");
+        assert!(!how_often(1, ms_to_ticks(31.6), ms_to_ticks(31.6), 3561.0).contains("per hour"), "one stall has no rate");
     }
 }

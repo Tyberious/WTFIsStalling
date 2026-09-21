@@ -257,7 +257,7 @@ const KB: &[(&[&str], Knowledge)] = &[
     }),
     (&["hal.dll", "halmacpi"], Knowledge {
         what: "Hardware Abstraction Layer (timers/interrupt controller/firmware calls)",
-        advice: "Update BIOS and chipset drivers; check HPET/timer tweaks (bcdedit useplatformclock should be OFF) and undo 'latency tweak' utilities.",
+        advice: "Update BIOS and chipset drivers; if a 'latency tweak' guide or utility set boot timer options (bcdedit useplatformclock, useplatformtick, disabledynamictick), remove them again so Windows makes its own choice (Microsoft documents the options but no recommended value).",
     }),
     (&["intelppm", "amdppm", "processr"], Knowledge {
         what: "CPU power management driver (C-states / P-states / core parking)",
