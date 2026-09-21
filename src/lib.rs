@@ -4,6 +4,7 @@
 //! front ends over it.
 
 pub mod analyze;
+pub mod baseline;
 pub mod cpuclock;
 pub mod devices;
 pub mod disks;
@@ -19,6 +20,7 @@ pub mod pci;
 pub mod period;
 pub mod probe;
 pub mod procs;
+pub mod quiet;
 pub mod state;
 pub mod summary;
 pub mod topology;

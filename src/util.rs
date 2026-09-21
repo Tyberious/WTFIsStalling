@@ -1,9 +1,12 @@
 use std::fs::File;
 use std::io::Write;
+use std::mem::{size_of, zeroed};
+use std::ptr::null_mut;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 static LOG: Mutex<Option<File>> = Mutex::new(None);
 
@@ -68,6 +71,41 @@ pub fn file_timestamp() -> String {
         st
     };
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
+}
+
+/// "2026-09-20 00:15" (local), for showing when a saved run was made.
+pub fn local_stamp() -> String {
+    let st = unsafe {
+        let mut st = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        st
+    };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
+}
+
+/// A string value from HKEY_LOCAL_MACHINE, for the machine description lines.
+pub fn reg_str(subkey: &str, value: &str) -> Option<String> {
+    let mut buf = [0u16; 256];
+    let mut size = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(subkey).as_ptr(),
+            wide(value).as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buf.as_mut_ptr() as _,
+            &mut size,
+        )
+    };
+    (rc == 0).then(|| from_wide(&buf).trim().to_string())
+}
+
+pub fn total_ram_bytes() -> u64 {
+    let mut mem: MEMORYSTATUSEX = unsafe { zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut mem) };
+    mem.ullTotalPhys
 }
 
 #[macro_export]

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::analyze::Analyzer;
+use crate::baseline::{self, Metric, RunFacts, RunRecord, MAX_METRICS};
 use crate::cpuclock::ClockSample;
 use crate::devices::{self, DeviceMap};
 use crate::disks::{fmt_size, DiskInfo};
@@ -22,7 +23,7 @@ use crate::period;
 use crate::probe::{ProbeStats, StallKind};
 use crate::state::*;
 use crate::topology::Topology;
-use crate::util::{fmt_dur, ms_to_ticks, qpc, qpc_freq};
+use crate::util::{fmt_dur, ms_to_ticks, qpc, qpc_freq, ticks_to_ms};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Severity {
@@ -54,10 +55,16 @@ pub enum Health {
 }
 
 pub struct Finding {
+    /// The subject this finding is about ("driver rtwlane.sys", "disk 1"); the same subject in
+    /// another run carries the same key, which is how two runs are compared.
+    pub key: String,
     pub severity: Severity,
     pub title: String,
     pub evidence: Vec<String>,
     pub advice: String,
+    /// The one or two numbers that measure this finding, for comparing runs. Never printed as
+    /// prose: the evidence above says it in words already.
+    pub metrics: Vec<Metric>,
     /// Ticks of harm attributed to this subject; orders findings of equal severity.
     impact: i64,
 }
@@ -69,9 +76,13 @@ pub struct Summary {
     pub subline: String,
     /// Short "label: value" lines: duration, stall counts, worst delays.
     pub overview: Vec<String>,
+    /// "Compared with your last run": empty when there is no previous run to compare with.
+    pub comparison: Vec<String>,
     pub findings: Vec<Finding>,
     /// Supporting tables, already formatted.
     pub details: Vec<String>,
+    /// This run's numbers, for the next run to compare itself against.
+    pub record: RunRecord,
 }
 
 const WIDTH: usize = 100;
@@ -112,6 +123,16 @@ impl Summary {
         wrap(&self.subline, "      ", &mut out);
         out.push(String::new());
         out.extend(self.overview.iter().map(|l| format!("  {l}")));
+        // Right after the overview and before the findings: what changed since the last run.
+        if !self.comparison.is_empty() {
+            out.push(String::new());
+            for line in &self.comparison {
+                match line.strip_prefix("- ") {
+                    Some(bullet) => wrap(bullet, "    - ", &mut out),
+                    None => wrap(line, "  ", &mut out),
+                }
+            }
+        }
         for (i, f) in self.findings.iter().enumerate() {
             out.push(String::new());
             out.push(format!("  {}. [{}] {}", i + 1, f.severity.label(), f.title));
@@ -135,33 +156,41 @@ impl Summary {
 impl Summary {
     /// Canned results for working on the front ends without admin rights or a sick PC.
     pub fn demo(health: Health) -> Summary {
-        let finding = |severity, title: &str, evidence: &str, advice: &str| Finding {
+        let finding = |severity, key: &str, title: &str, evidence: &str, advice: &str, metrics| Finding {
+            key: key.into(),
             severity,
             title: title.into(),
             evidence: vec![evidence.into()],
             advice: advice.into(),
+            metrics,
             impact: 0,
         };
         let findings = match health {
             Health::Problem => vec![
                 finding(
                     Severity::High,
+                    "driver rtwlane.sys",
                     "rtwlane.sys  -  Wi-Fi adapter driver",
                     "Blamed for 14 stalls (worst 11.80 ms, 121 ms in total).",
                     knowledge("rtwlane.sys").map_or("", |k| k.advice),
+                    vec![Metric::count("stalls blamed", 14), Metric::ms("worst stall", 11.8)],
                 ),
                 finding(
                     Severity::Medium,
+                    "disk 1",
                     "Disk 1 (D:), WDC WD40EZAZ-00SF3B0  -  responding slowly",
                     "3 requests took longer than 200 ms (worst 840 ms). SATA hard drive, 4.0 TB, firmware 80.00A80. D: 93% full.",
                     "Check its health (SMART), free up space on D:, and reseat or replace its cable.",
+                    vec![Metric::count("slow requests", 3), Metric::ms("worst wait", 840.0)],
                 ),
             ],
             Health::Warning => vec![finding(
                 Severity::Medium,
+                "driver nvlddmkm.sys",
                 "nvlddmkm.sys  -  NVIDIA GPU driver",
                 "Its interrupt handling ran for up to 1.84 ms at a time (6 times over 1.00 ms).",
                 knowledge("nvlddmkm.sys").map_or("", |k| k.advice),
+                vec![Metric::ms("worst DPC/ISR", 1.84), Metric::count("long runs", 6)],
             )],
             _ => Vec::new(),
         };
@@ -172,13 +201,47 @@ impl Summary {
                 "No driver, program, disk or firmware problem showed up.".to_string(),
             ),
         };
+        let facts = RunFacts {
+            seconds: 312.0,
+            light: false,
+            stalls_kernel: match health {
+                Health::Problem => 14,
+                Health::Warning => 2,
+                _ => 0,
+            },
+            stalls_starve: 0,
+            worst_kernel_ms: if health == Health::Problem { 11.8 } else { 1.84 },
+            worst_sched_ms: 1.59,
+            marks: 0,
+            marks_clean: 0,
+        };
+        let record = baseline::record_of(&facts, health, &findings);
+        // A canned previous run, so the comparison block can be seen without admin rights: last
+        // time this PC was blamed on the Wi-Fi driver.
+        let previous = RunRecord {
+            unix_time: record.unix_time - 3 * 86_400,
+            machine: record.machine.clone(),
+            seconds: 300.0,
+            stalls_kernel: 14,
+            worst_kernel_ms: 11.8,
+            health: Health::Problem,
+            findings: vec![baseline::FindingRecord {
+                key: "driver rtwlane.sys".into(),
+                severity: Severity::High,
+                title: "rtwlane.sys  -  Wi-Fi adapter driver".into(),
+                metrics: vec![Metric::count("stalls blamed", 14), Metric::ms("worst stall", 11.8)],
+            }],
+            ..RunRecord::default()
+        };
         Summary {
             health,
             headline,
             subline,
             overview: vec!["Monitored:        05:12".into(), "Note:             demo data, not a real measurement".into()],
+            comparison: baseline::compare(&previous, &record),
             findings,
             details: vec![String::new(), "(demo: no details)".into()],
+            record,
         }
     }
 }
@@ -196,7 +259,22 @@ impl Findings {
                 f.evidence.push(evidence);
                 f.impact += impact;
             }
-            None => self.0.push((key.to_string(), Finding { severity, title, evidence: vec![evidence], advice, impact })),
+            None => self.0.push((
+                key.to_string(),
+                Finding { key: key.to_string(), severity, title, evidence: vec![evidence], advice, metrics: Vec::new(), impact },
+            )),
+        }
+    }
+
+    /// Attaches the number this finding is measured by when two runs are compared. The first one
+    /// attached is the one it is judged by, so the most telling number goes on first; the same
+    /// label twice keeps the larger value, and anything past the second is dropped.
+    fn measure(&mut self, key: &str, metric: Metric) {
+        let Some((_, f)) = self.0.iter_mut().find(|(k, _)| k == key) else { return };
+        match f.metrics.iter().position(|m| m.label == metric.label) {
+            Some(at) => f.metrics[at].value = f.metrics[at].value.max(metric.value),
+            None if f.metrics.len() < MAX_METRICS => f.metrics.push(metric),
+            None => {}
         }
     }
 
@@ -562,6 +640,8 @@ struct GpuFinding {
     title: String,
     evidence: String,
     advice: &'static str,
+    /// What a next run compares this against.
+    metric: Metric,
 }
 
 /// Findings and detail lines from the once-a-second GPU samples. `marks` are the moments the user
@@ -633,11 +713,13 @@ fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> Str
                     evidence.push_str(&format!(" {hits} of the {} moments you flagged happened while it was full.", marks.len()));
                 }
                 findings.push(GpuFinding {
-                    key: format!("gpu vram {}", adapter.luid),
+                    // Keyed by name: the LUID is reassigned at every boot, and runs are compared across boots.
+                    key: format!("gpu vram {}", adapter.name),
                     severity: if hits > 0 || spilled >= 1_000_000_000 { Severity::High } else { Severity::Medium },
                     title: format!("{}  -  video memory is full", adapter.name),
                     evidence,
                     advice: VRAM_ADVICE,
+                    metric: Metric::secs("seconds video memory was full", full.len() as u32),
                 });
             }
         }
@@ -679,6 +761,7 @@ fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> Str
                     title: format!("{}  -  working flat out when you felt the hitches", adapter.name),
                     evidence: format!("It was {GPU_BOUND:.0}% busy or more at {bound} of the {} moments you flagged.", at_marks.len()),
                     advice: GPU_BOUND_ADVICE,
+                    metric: Metric::flat("flagged moments with the GPU flat out", bound as u32),
                 });
             } else if waiting * 2 > at_marks.len() && peak_of(adapter) >= GPU_WORKED {
                 findings.push(GpuFinding {
@@ -690,6 +773,7 @@ fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> Str
                         at_marks.len()
                     ),
                     advice: GPU_WAITING_ADVICE,
+                    metric: Metric::flat("flagged moments with the GPU waiting", waiting as u32),
                 });
             }
         }
@@ -858,6 +942,8 @@ struct HardwareFinding {
     title: String,
     evidence: String,
     advice: &'static str,
+    /// Errors while monitoring, then the 7-day total: the first is what a next run can change.
+    metrics: Vec<Metric>,
 }
 
 /// One finding per failing component from the WHEA events Windows logged.
@@ -952,7 +1038,17 @@ fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], stalls: &[
         } else {
             evidence
         };
-        out.push(HardwareFinding { key, severity: if during { Severity::High } else { floor }, title, evidence, advice });
+        out.push(HardwareFinding {
+            key,
+            severity: if during { Severity::High } else { floor },
+            title,
+            evidence,
+            advice,
+            metrics: vec![
+                Metric::flat("errors while monitoring", times.iter().filter(|t| **t >= run_start).count() as u32),
+                Metric::logged("in the last 7 days", times.len() as u32),
+            ],
+        });
     }
     out
 }
@@ -1101,6 +1197,9 @@ impl Analyzer {
                     *total,
                 );
             }
+            // The two numbers a next run is judged by: how often, and how bad at worst.
+            found.measure(culprit, Metric::count("stalls blamed", *n));
+            found.measure(culprit, Metric::ms("worst stall", ticks_to_ms(*worst)));
         }
 
         // ---- Moments the user flagged ("I felt it") ----------------------------------------
@@ -1162,6 +1261,13 @@ impl Analyzer {
                     *worst * *n as i64,
                 );
             }
+            // Flagged moments are the person's own doing, so they never scale with run length.
+            let key = if culprit.starts_with("driver ") || culprit.starts_with("process ") || culprit.starts_with("CPU went dark") {
+                culprit.as_str()
+            } else {
+                "unexplained"
+            };
+            found.measure(key, Metric::flat("moments you flagged", *n));
         }
         if self.marks_clean > 0 {
             found.add(
@@ -1179,6 +1285,7 @@ impl Analyzer {
                     .into(),
                 0,
             );
+            found.measure("clean marks", Metric::flat("moments you flagged", self.marks_clean));
         }
 
         // ---- Hybrid CPUs: work that kept landing on the efficiency cores -------------------
@@ -1238,6 +1345,9 @@ impl Analyzer {
                 advice.into(),
                 worst * a.over.max(1) as i64,
             );
+            let key = format!("driver {name}");
+            found.measure(&key, Metric::ms("worst DPC/ISR", ticks_to_ms(worst)));
+            found.measure(&key, Metric::count("long runs", a.over as f64));
         }
 
         // ---- Paging ------------------------------------------------------------------
@@ -1267,14 +1377,17 @@ impl Analyzer {
                      shortage. It matters only if this is the program that hitches; if so, move it to a faster drive (SSD)."
                 )
             };
+            let key = format!("paging {name}");
             found.add(
-                &format!("paging {name}"),
+                &key,
                 sev,
                 format!("{name}  -  waiting for memory to be read back from disk"),
                 format!("Frozen by {} hard page faults for {} in total (longest {}).", s.count, fmt_dur(s.total), fmt_dur(s.max)),
                 advice,
                 s.total,
             );
+            found.measure(&key, Metric::secs("frozen waiting for memory", ticks_to_ms(s.total) / 1000.0));
+            found.measure(&key, Metric::ms("longest wait", ticks_to_ms(s.max)));
         }
 
         // ---- Disks -------------------------------------------------------------------
@@ -1303,6 +1416,8 @@ impl Analyzer {
             let logged = storage_log.iter().any(|e| e.disk == Some(*n));
             let advice = disk_advice(&disk, why, logged);
             found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, s.max * s.slow as i64);
+            found.measure(&key, Metric::count("slow requests", s.slow as f64));
+            found.measure(&key, Metric::ms("worst wait", ticks_to_ms(s.max)));
             for sentence in why.map(why_sentences).unwrap_or_default() {
                 found.note(&key, sentence);
             }
@@ -1339,6 +1454,10 @@ impl Analyzer {
                 };
                 found.add(&key, sev, title, text, advice, 0);
             }
+            // The 7-day look-back cannot react to a fix made today, so what happened *while
+            // monitoring* is the number two runs are compared by.
+            found.measure(&key, Metric::flat("errors while monitoring", times.iter().filter(|t| **t >= run_start_unix).count() as u32));
+            found.measure(&key, Metric::logged("in the last 7 days", times.len() as u32));
         }
 
         // ---- What the drives say about themselves ------------------------------------------------
@@ -1388,6 +1507,8 @@ impl Analyzer {
             } else {
                 found.add(&key, sev, format!("{file}  -  {what}: it hung and was reset"), text, DISPLAY_RESET_ADVICE.to_string(), 0);
             }
+            found.measure(&key, Metric::flat("resets while monitoring", times.iter().filter(|t| **t >= run_start_unix).count() as u32));
+            found.measure(&key, Metric::logged("in the last 7 days", times.len() as u32));
         }
 
         // ---- Graphics card: video memory and load ---------------------------------------------------
@@ -1396,6 +1517,7 @@ impl Analyzer {
         let gpu_lines = gpu_report.lines;
         for f in gpu_report.findings {
             found.add(&f.key, f.severity, f.title, f.evidence, f.advice.to_string(), 0);
+            found.measure(&f.key, f.metric);
         }
         // "Look at the GPU: VRAM running out..." is a guess the measurements can now retire.
         if let Some(clear) = &gpu_report.vram_clear {
@@ -1417,6 +1539,9 @@ impl Analyzer {
             let whea_times: Vec<i64> = hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).map(|e| e.unix_time).collect();
             for f in hardware_findings(&hardware_log, &pci::devices(), &stall_times, now_unix, run_start_unix) {
                 found.add(&f.key, f.severity, f.title, f.evidence, f.advice.to_string(), 0);
+                for m in f.metrics {
+                    found.measure(&f.key, m);
+                }
             }
             // "The CPU went dark" is exactly what firmware handling a hardware error looks like.
             let dark: Vec<i64> = self.incidents.iter().filter(|i| i.culprit.starts_with("CPU went dark")).map(|i| wall(i.start)).collect();
@@ -1437,6 +1562,7 @@ impl Analyzer {
 
         // ---- Crashes and sudden power loss ----------------------------------------------------------
         let shutdown_log = evlog::unexpected_shutdowns(EVENT_LOG_DAYS);
+        let crashes = shutdown_log.iter().filter(|e| e.bugcheck != 0 || !e.power_button).count();
         if let Some((sev, text)) = shutdown_finding(&shutdown_log, now_unix) {
             // A fatal hardware error already explains a crash; otherwise it stands alone.
             if !found.note("whea fatal", text.clone()) {
@@ -1448,6 +1574,7 @@ impl Analyzer {
                     SHUTDOWN_ADVICE.into(),
                     0,
                 );
+                found.measure("unexpected shutdowns", Metric::logged("crashes in the last 7 days", crashes as u32));
             }
         }
 
@@ -1509,6 +1636,8 @@ impl Analyzer {
                 THROTTLE_ADVICE.into(),
                 ms_to_ticks(1000.0) * throttled.len() as i64,
             );
+            // The clock is sampled once a second, so the count of throttled samples is seconds.
+            found.measure("throttling", Metric::secs("seconds throttled", throttled.len() as u32));
         }
 
         // Windows logs when firmware (not the OS) caps the processor. Some PCs log it at every boot,
@@ -1533,6 +1662,8 @@ impl Analyzer {
                     THROTTLE_ADVICE.into(),
                     0,
                 );
+                found.measure("throttling", Metric::flat("firmware caps while monitoring", caps_during as u32));
+                found.measure("throttling", Metric::logged("in the last 7 days", firmware_caps.len() as u32));
             }
         }
 
@@ -1646,6 +1777,13 @@ impl Analyzer {
         for line in overhead.detail_lines(events, events_lost) {
             d!("{line}");
         }
+        if self.notable_folded > 0 {
+            d!(
+                "{} of {} individual slow events were folded into roll-up lines in the event log (repeats from the same disk, driver or program).",
+                self.notable_folded,
+                self.notable_total
+            );
+        }
         if self.notable_suppressed > 0 {
             d!("{} of {} individual slow-event lines were suppressed in the event log.", self.notable_suppressed, self.notable_total);
         }
@@ -1720,7 +1858,7 @@ impl Analyzer {
         d!("WINDOWS EVENT LOG  (last {EVENT_LOG_DAYS} days)");
         d!("  storage errors (resets, retries, bad blocks): {}", storage_log.len());
         d!("  graphics driver resets: {}", display_log.len());
-        d!("  crashes / sudden power loss: {}", shutdown_log.iter().filter(|e| e.bugcheck != 0 || !e.power_button).count());
+        d!("  crashes / sudden power loss: {crashes}");
         d!("  firmware limited the processor's speed: {}", firmware_caps.len());
         d!(
             "  hardware errors (WHEA: memory, processor, PCI Express): {}",
@@ -1754,7 +1892,23 @@ impl Analyzer {
             }
         }
 
-        Summary { health, headline, subline, overview, findings, details }
+        // The numbers this run leaves behind for the next one. The comparison itself is added by
+        // `baseline::attach` once the engine knows where the report was written.
+        let record = baseline::record_of(
+            &RunFacts {
+                seconds: elapsed_s,
+                light: light.is_some(),
+                stalls_kernel: kernel_stalls as u32,
+                stalls_starve: sched_stalls as u32,
+                worst_kernel_ms: ticks_to_ms(stats.max_kernel.load(Ordering::Relaxed)),
+                worst_sched_ms: ticks_to_ms(stats.max_sched.load(Ordering::Relaxed)),
+                marks: marks_total,
+                marks_clean: self.marks_clean,
+            },
+            health,
+            &findings,
+        );
+        Summary { health, headline, subline, overview, comparison: Vec::new(), findings, details, record }
     }
 }
 
@@ -2202,6 +2356,51 @@ mod tests {
         assert!(verdict.contains("PROBLEM FOUND") && verdict.contains("rtwlane.sys"));
         assert!(lines.iter().any(|l| l.contains("What to try:")));
         assert!(lines.iter().all(|l| l.chars().count() <= WIDTH), "advice text must be wrapped");
+    }
+
+    /// The demo carries a canned previous run, so the block can be seen (and checked) without
+    /// admin rights: it sits between the overview and the findings and obeys the report width.
+    #[test]
+    fn the_comparison_sits_under_the_overview_and_stays_within_width() {
+        for health in [Health::Ok, Health::Warning, Health::Problem] {
+            let summary = Summary::demo(health);
+            assert!(!summary.comparison.is_empty(), "{health:?}: the demo shows a comparison");
+            let lines = summary.result_lines();
+            let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+            assert!(at("Monitored:") < at("COMPARED WITH YOUR LAST RUN"), "{lines:?}");
+            if health != Health::Ok {
+                assert!(at("COMPARED WITH YOUR LAST RUN") < at("What to try:"), "{lines:?}");
+            }
+            assert!(lines.iter().all(|l| l.chars().count() <= WIDTH), "the comparison must be wrapped too: {lines:?}");
+            assert!(lines.iter().any(|l| l.trim_start().starts_with("- rtwlane.sys")), "bullets keep their indent: {lines:?}");
+        }
+        // The one thing the block must never do is claim a fix after a single short run.
+        let ok = Summary::demo(Health::Ok).result_lines().join("\n");
+        assert!(ok.contains("did not show up this time") && !ok.contains("fixed"), "{ok}");
+    }
+
+    #[test]
+    fn every_finding_carries_a_number_to_compare_it_by() {
+        // Whatever the demo shows, a next run can measure it: no finding is prose only.
+        for health in [Health::Warning, Health::Problem] {
+            for f in &Summary::demo(health).findings {
+                assert!(!f.metrics.is_empty(), "{}: no metric", f.title);
+                assert!(f.metrics.len() <= MAX_METRICS);
+            }
+        }
+        // The first metric attached is the one the finding is judged by, and repeats keep the
+        // larger value rather than piling up.
+        let mut f = Findings::default();
+        f.add("disk 1", Severity::High, "Disk 1".into(), "e".into(), "a".into(), 0);
+        f.measure("disk 1", Metric::count("slow requests", 3.0));
+        f.measure("disk 1", Metric::count("slow requests", 9.0));
+        f.measure("disk 1", Metric::ms("worst wait", 840.0));
+        f.measure("disk 1", Metric::secs("dropped", 1.0));
+        f.measure("nothing here", Metric::count("ignored", 1.0));
+        let m = &f.0[0].1.metrics;
+        assert_eq!(m.len(), MAX_METRICS);
+        assert_eq!((m[0].label.as_str(), m[0].value), ("slow requests", 9.0));
+        assert_eq!(m[1].label, "worst wait");
     }
 
     #[test]

@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
@@ -19,11 +18,12 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::baseline::CompareMode;
 use crate::overhead::Overhead;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
-use crate::util::{self, from_wide, ms_to_ticks, wide};
-use crate::{analyze, cpuclock, etw, gpu, modules, overhead, probe, say, state};
+use crate::util::{self, ms_to_ticks, reg_str, wide};
+use crate::{analyze, baseline, cpuclock, etw, gpu, modules, overhead, probe, say, state};
 
 pub use crate::analyze::mark_now;
 
@@ -48,6 +48,9 @@ pub struct Config {
     /// what the GUI always uses; `Some` overrides that either way.
     pub light: Option<bool>,
     pub log: LogTarget,
+    /// Which earlier run this one compares itself with (by default: the newest one from this PC
+    /// saved next to the report).
+    pub compare: CompareMode,
     pub debug: bool,
 }
 
@@ -63,6 +66,7 @@ impl Default for Config {
             profile: true,
             light: None,
             log: LogTarget::Auto,
+            compare: CompareMode::Auto,
             debug: false,
         }
     }
@@ -114,23 +118,6 @@ pub fn relaunch_elevated(extra: &[&str]) -> bool {
         )
     };
     rc as usize > 32
-}
-
-fn reg_str(subkey: &str, value: &str) -> Option<String> {
-    let mut buf = [0u16; 256];
-    let mut size = (buf.len() * 2) as u32;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            wide(subkey).as_ptr(),
-            wide(value).as_ptr(),
-            RRF_RT_REG_SZ,
-            null_mut(),
-            buf.as_mut_ptr() as _,
-            &mut size,
-        )
-    };
-    (rc == 0).then(|| from_wide(&buf).trim().to_string())
 }
 
 fn print_system_info(ncpu: u32) {
@@ -251,7 +238,7 @@ fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     util::clock();
     let log_path = open_log(&cfg.log);
     util::start_capture();
-    let result = run_inner(cfg, stop);
+    let result = run_inner(cfg, stop, log_path.as_deref());
     if let Err(e) = &result {
         say!("ERROR: {e}");
     }
@@ -289,7 +276,7 @@ impl Drop for TimerResolution {
     }
 }
 
-fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String> {
+fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<(Summary, usize), String> {
     // Every group, not just group 0: past 64 logical CPUs Windows splits the machine up.
     let ncpu = topology().total() as u32;
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
@@ -416,7 +403,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
     let clock_samples = cpu_clock.lock().unwrap().clone();
     let gpu_log = gpu_log.lock().unwrap().clone();
     let elapsed_s = started.elapsed().as_secs_f64();
-    let summary = analyzer.summarize(RunData {
+    let mut summary = analyzer.summarize(RunData {
         elapsed_s,
         events_lost: lost,
         overhead: Overhead { monitor_100ns: overhead::current_process_cpu_100ns().unwrap_or(0), probes_100ns: probes_cpu, elapsed_s, ncpu },
@@ -427,6 +414,9 @@ fn run_inner(cfg: &Config, stop: &AtomicBool) -> Result<(Summary, usize), String
         clock: &clock_samples,
         gpu: &gpu_log,
     });
+    // Compare with the previous run and leave this run's numbers for the next one. Must happen
+    // before the result is printed, so "what changed" is part of the result everywhere.
+    baseline::attach(&mut summary, &cfg.compare, log_path);
     // Streamed order ends with the result, because on a console the bottom is what you see.
     say!("");
     for line in summary.detail_lines().iter().chain(summary.result_lines().iter()) {

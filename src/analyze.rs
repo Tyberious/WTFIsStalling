@@ -11,6 +11,7 @@ use crate::health::{self, DriveHealth};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
 use crate::procs::ProcNames;
+use crate::quiet::Quieter;
 use crate::say;
 use crate::state::*;
 use crate::topology::{topology, Topology};
@@ -71,9 +72,13 @@ pub struct Analyzer {
     pub(crate) marks_clean: u32,
     /// Start times of over-threshold DPC/ISR runs per driver, for periodicity detection.
     pub(crate) long_exec_times: HashMap<String, Vec<i64>>,
+    /// Folds repeats from one disk, driver or program into roll-up lines in the event log.
+    quiet: Quieter,
     notable_window_start: i64,
     notable_in_window: u32,
     pub(crate) notable_suppressed: u64,
+    /// Events folded into roll-up lines rather than shown one by one.
+    pub(crate) notable_folded: u64,
     pub(crate) notable_total: u64,
 }
 
@@ -118,9 +123,11 @@ impl Analyzer {
             mark_times: Vec::new(),
             marks_clean: 0,
             long_exec_times: HashMap::new(),
+            quiet: Quieter::default(),
             notable_window_start: 0,
             notable_in_window: 0,
             notable_suppressed: 0,
+            notable_folded: 0,
             notable_total: 0,
         }
     }
@@ -158,9 +165,11 @@ impl Analyzer {
             mark_times: Vec::new(),
             marks_clean: 0,
             long_exec_times: HashMap::new(),
+            quiet: Quieter::default(),
             notable_window_start: 0,
             notable_in_window: 0,
             notable_suppressed: 0,
+            notable_folded: 0,
             notable_total: 0,
         }
     }
@@ -179,7 +188,7 @@ impl Analyzer {
         while self.minor.front().is_some_and(|s| s.end < now - ms_to_ticks(MINOR_KEEP_MS)) {
             self.minor.pop_front();
         }
-        self.report_notables();
+        self.report_notables(force);
         self.process_marks(force);
         if self.pending.is_empty() {
             return;
@@ -565,7 +574,7 @@ impl Analyzer {
     }
 
     /// One-liners for individually bad events, even when no probe stalled.
-    fn report_notables(&mut self) {
+    fn report_notables(&mut self, last_call: bool) {
         let notables = std::mem::take(&mut self.shared.inner.lock().unwrap().notable);
         for n in notables {
             self.notable_total += 1;
@@ -578,6 +587,21 @@ impl Analyzer {
                 }
             }
             let now = qpc();
+            // One disk, driver or program that keeps doing the same thing gets a few full lines
+            // and then a roll-up; see `quiet`. The summary still counts every event.
+            let (subject, duration, note) = match &n {
+                Notable::LongExec(e) => {
+                    (format!("driver {}", self.modules.name(e.routine)), e.end - e.start, kind_name(e.kind).to_string())
+                }
+                Notable::SlowFault(f) => {
+                    (format!("paging {}", process_name(&self.procs.label(f.pid, f.tid))), f.end - f.start, String::new())
+                }
+                Notable::SlowIo(i) => (format!("disk {}", i.disk), i.dur, why.clone()),
+            };
+            if !self.quiet.offer(&subject, duration, &note, now) {
+                self.notable_folded += 1;
+                continue;
+            }
             if now - self.notable_window_start > ms_to_ticks(1000.0) {
                 self.notable_window_start = now;
                 self.notable_in_window = 0;
@@ -613,6 +637,23 @@ impl Analyzer {
                     self.procs.label(i.pid, i.tid)
                 ),
             }
+        }
+        let every = ms_to_ticks(Quieter::rollup_period_ms());
+        let rollups = if last_call { self.quiet.flush() } else { self.quiet.due(qpc(), every) };
+        for r in rollups {
+            let what = match r.subject.split_once(' ') {
+                Some(("disk", n)) => {
+                    let disk = n.parse().map(|n| self.disks.get(n).short()).unwrap_or_else(|_| r.subject.clone());
+                    format!("{disk}: {} more slow request{}", r.count, if r.count == 1 { "" } else { "s" })
+                }
+                Some(("driver", module)) => format!("{module}: {} more long DPC/ISR run{}", r.count, if r.count == 1 { "" } else { "s" }),
+                Some(("paging", program)) => {
+                    format!("{program}: {} more slow hard page fault{}", r.count, if r.count == 1 { "" } else { "s" })
+                }
+                _ => format!("{}: {} more", r.subject, r.count),
+            };
+            let note = if r.note.is_empty() { String::new() } else { format!("  ({})", r.note) };
+            say!("[{}] ... {what} since {}, worst {}{note}", clock().fmt(qpc()), clock().fmt(r.since), fmt_dur(r.worst));
         }
     }
 

@@ -45,6 +45,21 @@ The colored bar gives the verdict; the report underneath starts with the ranked 
 try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as
 `WTFIsStalling-<date>.txt`. The window follows the system light / dark theme.
 
+**Did it help?** Try what the report suggests, then run the tool again. The second report says what
+changed, in the RESULT block right under the overview:
+
+```
+  COMPARED WITH YOUR LAST RUN (2026-09-14 19:02, 6 day(s) ago)
+  Better: what was found last time did not show up this time.
+  Stalls: 14 -> 0.
+  Worst wake-up delay: 11.8 ms -> 0.30 ms.
+    - rtwlane.sys - Wi-Fi adapter driver: did not show up this time (last time: 14 stalls blamed).
+```
+
+There is nothing to switch on and nothing to remember: every run saves its numbers next to its report
+as `WTFIsStalling-<date>.wtfis`, and the next run on the same PC picks the most recent one (up to 30
+days old) by itself.
+
 | | |
 | --- | --- |
 | ![Cause found (dark theme)](docs/screenshot-result-dark.png) | ![Suspect found (light theme)](docs/screenshot-result-light.png) |
@@ -186,8 +201,34 @@ event log is read for the last 7 days: storage resets and retries, WHEA hardware
 errors are mapped to the device in that slot) and graphics driver resets. Drive serial numbers are
 never read, so a report is safe to post.
 
+The event log stays readable when one thing keeps going wrong (a long download to a hard drive can be
+slow hundreds of times a minute): the first few events from one disk, driver or program are shown in
+full, then they are folded into a roll-up line every 30 seconds, and only an event far worse than any
+already shown gets a line of its own. The summary still counts every one of them.
+
 Individually slow events (DPC ≥ 1 ms, hard fault ≥ 50 ms, disk request ≥ 200 ms) are logged even when no
 probe stalls.
+
+**Before and after.** Every run writes a small text file of its numbers beside the report
+(`WTFIsStalling-<date>.wtfis`): run length, stall counts, worst wake-up delays, the verdict, and for
+each finding its subject, severity and the one or two numbers that measure it (stalls blamed, worst
+DPC/ISR time, slow requests, seconds throttled...). Nothing else: no prose, no event log, and nothing
+that identifies the PC or the person. The file carries a machine id that is only a hash of the
+processor model, the board model and the amount of memory — the same three things the report header
+prints — so runs from another PC in the same folder are never mixed in; no serial number, user name or
+computer name goes into it. If the folder cannot be written, the run is unaffected and one line says
+so.
+
+The next run compares itself with the most recent of those files from the same PC, and writes the
+comparison into the RESULT block. Runs whose lengths differ by more than 25% are compared per minute
+and the report says so; a run shorter than a minute, and a change of light mode between the two runs,
+are both called out, because they make the numbers less comparable. A number has to move by more than
+20% *and* by more than a small absolute floor before it counts as a change, so ordinary run-to-run
+variation reads as "about the same". Findings that only exist because of the event log's 7-day
+look-back (hardware errors, crashes, storage resets) are compared on what happened *while monitoring*
+and are marked as unable to answer yet, and low-severity, informational findings never decide the
+overall verdict. A problem that is absent from the second run is reported as "did not show up this
+time", never as "fixed": one run cannot prove that.
 
 ## Command line
 
@@ -197,6 +238,8 @@ probe stalls.
 wtfis-cli --duration 300 --stall-ms 2 --dpc-warn-us 500
 wtfis-cli --light            # measure more gently on a weak or battery-powered PC
 wtfis-cli --no-light         # keep full measuring even there
+wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that run instead of the newest
+wtfis-cli --no-compare       # don't compare with an earlier run
 ```
 
 Run `wtfis-cli --help` for all options. Press Enter to flag a hitch, Ctrl+C to stop and print the

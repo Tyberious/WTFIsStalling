@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use wtfis::baseline::CompareMode;
 use wtfis::engine::{self, Config, LogTarget};
 
 #[derive(Parser)]
@@ -49,6 +50,13 @@ struct Args {
     /// Don't write a report file
     #[arg(long)]
     no_log: bool,
+    /// Compare this run with a particular earlier one: the .wtfis file saved next to its report
+    /// (default: the newest run from this PC in the report's folder, up to 30 days old)
+    #[arg(long, value_name = "FILE")]
+    compare: Option<String>,
+    /// Don't compare this run with an earlier one
+    #[arg(long, conflicts_with = "compare")]
+    no_compare: bool,
     /// Fail instead of asking for elevation when not running as Administrator
     #[arg(long)]
     no_elevate: bool,
@@ -144,6 +152,11 @@ fn main() {
             (true, _) => LogTarget::None,
             (false, Some(p)) => LogTarget::Path(p),
             (false, None) => LogTarget::Auto,
+        },
+        compare: match (args.no_compare, args.compare) {
+            (true, _) => CompareMode::Off,
+            (false, Some(p)) => CompareMode::Path(p),
+            (false, None) => CompareMode::Auto,
         },
         debug: args.debug,
     };
