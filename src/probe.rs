@@ -24,9 +24,9 @@ use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    CreateWaitableTimerExW, CreateWaitableTimerW, GetCurrentProcess, GetCurrentThread, GetPriorityClass, SetPriorityClass,
-    SetThreadGroupAffinity, SetThreadPriority, SetWaitableTimer, WaitForSingleObject, REALTIME_PRIORITY_CLASS, THREAD_PRIORITY_IDLE,
-    THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+    CreateWaitableTimerExW, CreateWaitableTimerW, GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, GetPriorityClass,
+    SetPriorityClass, SetThreadGroupAffinity, SetThreadPriority, SetWaitableTimer, WaitForSingleObject, REALTIME_PRIORITY_CLASS,
+    THREAD_PRIORITY_IDLE, THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
 use crate::overhead::PROBE_MS_NORMAL;
@@ -39,7 +39,7 @@ pub enum StallKind {
     Scheduler,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Stall {
     pub kind: StallKind,
     /// System-wide processor index, the same numbering ETW uses (see `topology`).
@@ -63,6 +63,51 @@ pub struct ProbeStats {
     pub max_sched: Arc<AtomicI64>,
     /// Set once the child confirms it got the real-time priority class.
     pub realtime: AtomicBool,
+    /// Which threads are doing the measuring; see `ProbeTids`.
+    pub tids: Arc<ProbeTids>,
+}
+
+/// The thread ids of the measuring threads, and the processor each is pinned to.
+///
+/// The analysis needs these to reconstruct, from the context-switch trace, what the scheduler did
+/// to a probe during a stall: a thread that was never made runnable was never woken. The parent's
+/// own scheduler-probe thread registers here directly; the real-time probes live in a child
+/// process and report theirs over the existing stdout protocol.
+///
+/// Bounded by construction: one entry per logical processor plus one, added once at start-up.
+#[derive(Default)]
+pub struct ProbeTids(std::sync::Mutex<Vec<ProbeThread>>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProbeThread {
+    pub tid: u32,
+    /// The system-wide processor index it is pinned to; `None` for the unpinned parent probe.
+    pub cpu: Option<u16>,
+}
+
+/// More probe threads than any machine has, so a garbled or hostile stdout stream cannot grow
+/// this list. 1024 logical processors is past what Windows itself supports in one system.
+const MAX_PROBE_THREADS: usize = 1100;
+
+impl ProbeTids {
+    pub fn add(&self, tid: u32, cpu: Option<u16>) {
+        if tid == 0 {
+            return;
+        }
+        let mut v = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if v.len() < MAX_PROBE_THREADS && !v.iter().any(|t| t.tid == tid) {
+            v.push(ProbeThread { tid, cpu });
+        }
+    }
+
+    pub fn all(&self) -> Vec<ProbeThread> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Entries added since `from`, for the child's reporting loop.
+    fn since(&self, from: usize) -> Vec<ProbeThread> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(from..).unwrap_or_default().to_vec()
+    }
 }
 
 /// First argument that turns either binary into the probe helper process.
@@ -74,7 +119,8 @@ const TIMER_ALL_ACCESS: u32 = 0x1F_0003;
 const INFINITE: u32 = u32::MAX;
 const WAIT_OBJECT_0: u32 = 0;
 
-fn run(
+/// Everything one probe thread needs. A struct rather than seven-plus arguments.
+struct ProbeCfg {
     kind: StallKind,
     pin: Option<Slot>,
     interval_ms: f64,
@@ -82,8 +128,14 @@ fn run(
     tx: Sender<Stall>,
     stop: Arc<AtomicBool>,
     max_slot: Arc<AtomicI64>,
-) {
+    /// Where this thread registers its own id, so the scheduler trace can be read against it.
+    tids: Arc<ProbeTids>,
+}
+
+fn run(cfg: ProbeCfg) {
+    let ProbeCfg { kind, pin, interval_ms, threshold_ms, tx, stop, max_slot, tids } = cfg;
     let cpu = pin.map(|s| s.cpu);
+    tids.add(unsafe { GetCurrentThreadId() }, cpu);
     unsafe {
         let me = GetCurrentThread();
         if let Some(slot) = pin {
@@ -143,12 +195,22 @@ fn run(
     }
 }
 
-/// Parent side: the normal-priority probe thread.
+/// Parent side: the normal-priority probe thread. Its thread id is local, so it registers itself
+/// in the shared stats directly rather than going through the child protocol.
 pub fn spawn_scheduler_probe(threshold_ms: f64, tx: Sender<Stall>, stop: Arc<AtomicBool>, stats: Arc<ProbeStats>) {
-    std::thread::Builder::new()
-        .name("probe-scheduler".into())
-        .spawn(move || run(StallKind::Scheduler, None, 4.0, threshold_ms, tx, stop, stats.max_sched.clone()))
-        .expect("spawn scheduler probe");
+    // The parent's own `ProbeStats::tids` is what the analyzer reads, so this probe writes
+    // straight into it; the reader thread below fills in the child's from its stdout.
+    let cfg = ProbeCfg {
+        kind: StallKind::Scheduler,
+        pin: None,
+        interval_ms: 4.0,
+        threshold_ms,
+        tx,
+        stop,
+        max_slot: stats.max_sched.clone(),
+        tids: stats.tids.clone(),
+    };
+    std::thread::Builder::new().name("probe-scheduler".into()).spawn(move || run(cfg)).expect("spawn scheduler probe");
 }
 
 /// The wake-up interval the child is asked for, kept inside sane bounds. A tiny interval would
@@ -160,6 +222,46 @@ pub fn sane_interval_ms(ms: f64) -> f64 {
     } else {
         PROBE_MS_NORMAL
     }
+}
+
+/// One line of the child's stdout protocol (see `child_main`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChildMsg {
+    Stall(Stall),
+    /// Keep-alive carrying the worst lateness so far.
+    Max(i64),
+    /// The priority class the child actually got.
+    Class(u32),
+    Thread(ProbeThread),
+}
+
+/// Parses one line of the child's stdout. `None` for anything not understood: the pipe carries
+/// whatever the child wrote, and a line that does not match exactly is dropped rather than
+/// guessed at. A tid is a Windows thread id (a u32) and a processor index a u16, so a number
+/// outside those ranges is a garbled line, not a probe on processor 0.
+fn parse_child_line(line: &str) -> Option<ChildMsg> {
+    let mut it = line.split(' ');
+    let tag = it.next()?;
+    let mut nums: Vec<i64> = Vec::new();
+    for word in it {
+        // Every field of every message is a number; one that is not means the line is not one of
+        // ours, and must not be silently skipped over to make the rest line up.
+        nums.push(word.parse().ok()?);
+    }
+    Some(match (tag, nums.as_slice()) {
+        ("S" | "L", [cpu, start, end]) => ChildMsg::Stall(Stall {
+            kind: StallKind::Kernel,
+            cpu: Some(u16::try_from(*cpu).ok()?),
+            start: *start,
+            end: *end,
+            minor: tag == "L",
+        }),
+        ("M", [max]) => ChildMsg::Max(*max),
+        ("C", [class]) => ChildMsg::Class(u32::try_from(*class).ok()?),
+        ("T", [tid, -1]) => ChildMsg::Thread(ProbeThread { tid: u32::try_from(*tid).ok()?, cpu: None }),
+        ("T", [tid, cpu]) => ChildMsg::Thread(ProbeThread { tid: u32::try_from(*tid).ok()?, cpu: Some(u16::try_from(*cpu).ok()?) }),
+        _ => return None,
+    })
 }
 
 /// Parent side: start the real-time child and forward what it reports.
@@ -178,20 +280,17 @@ pub fn spawn_kernel_probes(threshold_ms: f64, interval_ms: f64, tx: Sender<Stall
         .name("probe-reader".into())
         .spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let mut it = line.split(' ');
-                let tag = it.next().unwrap_or("");
-                let nums: Vec<i64> = it.filter_map(|x| x.parse().ok()).collect();
-                match (tag, nums.as_slice()) {
-                    ("S" | "L", [cpu, start, end]) => {
-                        stats.max_kernel.fetch_max(end - start, Ordering::Relaxed);
-                        let _ =
-                            tx.send(Stall { kind: StallKind::Kernel, cpu: Some(*cpu as u16), start: *start, end: *end, minor: tag == "L" });
+                match parse_child_line(&line) {
+                    Some(ChildMsg::Stall(s)) => {
+                        stats.max_kernel.fetch_max(s.end - s.start, Ordering::Relaxed);
+                        let _ = tx.send(s);
                     }
-                    ("M", [max]) => {
-                        stats.max_kernel.fetch_max(*max, Ordering::Relaxed);
+                    Some(ChildMsg::Max(max)) => {
+                        stats.max_kernel.fetch_max(max, Ordering::Relaxed);
                     }
-                    ("C", [class]) => stats.realtime.store(*class as u32 == REALTIME_PRIORITY_CLASS, Ordering::Relaxed),
-                    _ => {}
+                    Some(ChildMsg::Class(class)) => stats.realtime.store(class == REALTIME_PRIORITY_CLASS, Ordering::Relaxed),
+                    Some(ChildMsg::Thread(t)) => stats.tids.add(t.tid, t.cpu),
+                    None => {}
                 }
             }
         })
@@ -201,9 +300,15 @@ pub fn spawn_kernel_probes(threshold_ms: f64, interval_ms: f64, tx: Sender<Stall
 
 /// Child side. Exits when the parent closes our stdin (or dies).
 ///
-/// Protocol on stdout, one line each: `C <priority class>` once at the start, `S`/`L <cpu>
-/// <start> <end>` for a stall / a sub-threshold blip, `M <max>` as a keep-alive. `<cpu>` is the
+/// Protocol on stdout, one line each: `C <priority class>` once at the start, `T <tid> <cpu>`
+/// once per probe thread as it starts (`<cpu>` = -1 for an unpinned one), `S`/`L <cpu> <start>
+/// <end>` for a stall / a sub-threshold blip, `M <max>` as a keep-alive. `<cpu>` is the
 /// system-wide processor index, the same numbering ETW reports.
+///
+/// The parent matches on the tag and the shape of the numbers and ignores anything else, so a
+/// line it does not understand costs nothing. Parent and child are always the same binary (the
+/// child is this exe re-run with `--probe-child`), so there is no older child to be compatible
+/// with; the tolerance is against a garbled pipe, not against a version skew.
 ///
 /// `interval_ms` is how often each probe asks to be woken (2 ms in light mode instead of 1 ms).
 /// A stall is still measured as lateness beyond the requested wake-up, so its length means the
@@ -231,9 +336,19 @@ pub fn child_main(threshold_ms: f64, interval_ms: f64) -> ! {
     let (tx, rx) = mpsc::channel::<Stall>();
     let stop = Arc::new(AtomicBool::new(false));
     let max = Arc::new(AtomicI64::new(0));
+    let tids = Arc::new(ProbeTids::default());
     for slot in slots {
-        let (tx, stop, max) = (tx.clone(), stop.clone(), max.clone());
-        std::thread::spawn(move || run(StallKind::Kernel, Some(slot), interval_ms, threshold_ms, tx, stop, max));
+        let cfg = ProbeCfg {
+            kind: StallKind::Kernel,
+            pin: Some(slot),
+            interval_ms,
+            threshold_ms,
+            tx: tx.clone(),
+            stop: stop.clone(),
+            max_slot: max.clone(),
+            tids: tids.clone(),
+        };
+        std::thread::spawn(move || run(cfg));
     }
 
     // Reporting is the only non-probe work in this process; keep it at the bottom of the
@@ -241,7 +356,17 @@ pub fn child_main(threshold_ms: f64, interval_ms: f64) -> ! {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE) };
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "C {}", unsafe { GetPriorityClass(GetCurrentProcess()) });
+    // Each probe thread registers itself as it starts; this loop forwards whatever is new. The
+    // wait below is at most a second, so every probe is announced within a second of start-up,
+    // which is inside the probes' own 500 ms warm-up plus the first tick of analysis.
+    let mut announced = 0usize;
     loop {
+        for t in tids.since(announced) {
+            announced += 1;
+            if writeln!(out, "T {} {}", t.tid, t.cpu.map_or(-1i32, i32::from)).is_err() {
+                std::process::exit(0);
+            }
+        }
         let msg = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(s) => format!("{} {} {} {}", if s.minor { "L" } else { "S" }, s.cpu.unwrap_or(0), s.start, s.end),
             Err(_) => format!("M {}", max.load(Ordering::Relaxed)),
@@ -268,5 +393,68 @@ mod tests {
         assert_eq!(sane_interval_ms(1e9), 10.0);
         assert_eq!(sane_interval_ms(f64::NAN), PROBE_MS_NORMAL);
         assert_eq!(sane_interval_ms(f64::INFINITY), PROBE_MS_NORMAL);
+    }
+
+    #[test]
+    fn the_child_protocol_round_trips_every_message_it_can_send() {
+        assert_eq!(parse_child_line("C 256"), Some(ChildMsg::Class(REALTIME_PRIORITY_CLASS)));
+        assert_eq!(parse_child_line("M 12345"), Some(ChildMsg::Max(12_345)));
+        assert_eq!(parse_child_line("T 4242 3"), Some(ChildMsg::Thread(ProbeThread { tid: 4242, cpu: Some(3) })));
+        assert_eq!(parse_child_line("T 77 -1"), Some(ChildMsg::Thread(ProbeThread { tid: 77, cpu: None })));
+        // Exactly the line the child writes, for a machine past 255 processors.
+        let t = ProbeThread { tid: 4_294_967_295, cpu: Some(300) };
+        assert_eq!(parse_child_line(&format!("T {} {}", t.tid, t.cpu.map_or(-1i32, i32::from))), Some(ChildMsg::Thread(t)));
+        match parse_child_line("S 5 1000 2000") {
+            Some(ChildMsg::Stall(s)) => {
+                assert_eq!((s.kind, s.cpu, s.start, s.end, s.minor), (StallKind::Kernel, Some(5), 1000, 2000, false))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse_child_line("L 0 1 2"), Some(ChildMsg::Stall(s)) if s.minor));
+    }
+
+    /// The pipe carries bytes, not promises: nothing a garbled line can say may become a probe
+    /// thread, a processor number or a stall.
+    #[test]
+    fn garbage_lines_are_ignored_rather_than_guessed_at() {
+        for line in [
+            "",
+            "T",
+            "T 4242",
+            "T 4242 3 9",
+            "T -5 3",             // a negative thread id
+            "T 4242 -2",          // -1 is the only negative processor
+            "T 4242 99999",       // past any processor index
+            "T 99999999999999 3", // past a thread id
+            "T abc 3",
+            "T 4242 three",
+            "Tid 4242 3",
+            "t 4242 3",
+            "S 5 1000",
+            "S -1 1000 2000",
+            "C -3",
+            "X 1 2 3",
+            "  T 4242 3",
+            "hello world",
+            "\u{1}\u{2}\u{3}",
+        ] {
+            assert_eq!(parse_child_line(line), None, "{line:?} must be ignored");
+        }
+    }
+
+    #[test]
+    fn the_probe_thread_list_is_deduplicated_and_bounded() {
+        let tids = ProbeTids::default();
+        tids.add(0, Some(1)); // thread id 0 is not a thread
+        tids.add(10, Some(0));
+        tids.add(10, Some(7)); // the same thread twice: the first registration wins
+        tids.add(11, None);
+        assert_eq!(tids.all(), vec![ProbeThread { tid: 10, cpu: Some(0) }, ProbeThread { tid: 11, cpu: None }]);
+        assert_eq!(tids.since(1), vec![ProbeThread { tid: 11, cpu: None }]);
+        assert!(tids.since(9).is_empty(), "asking past the end is empty, not a panic");
+        for tid in 100..100_000 {
+            tids.add(tid, Some(0));
+        }
+        assert_eq!(tids.all().len(), MAX_PROBE_THREADS);
     }
 }

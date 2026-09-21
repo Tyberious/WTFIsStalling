@@ -73,6 +73,8 @@ days old) by itself.
 | Cause | How it shows up |
 | --- | --- |
 | **The whole PC stopping** (cursor and sound gone for a moment) | A kernel-level stall that holds every logical CPU at the same instant for 100 ms or more is its own kind of incident, counted once even though both probes see it. Nothing that happened to be on the CPUs is blamed for it: they were stopped too. Instead the report says how often it happens and how long it lasts, whether the processors were idle or busy, **which device interrupts stopped and which kept arriving** during it, whether the timer interrupts that wake threads stopped, and what coincided with it (a slow request to a drive, a drive that had been asleep, a page fault) — in correlation language, with the number that coincided with *nothing* said just as plainly |
+| **Whether a stalled thread was ever woken at all** | Every context switch and thread wake-up is traced, so for each stall the report reconstructs what the scheduler did to its own measuring threads: they were never made runnable until it was over (nothing woke them — the timer, the clock, firmware or power management, below Windows' scheduling and below every driver), or they were made runnable **on time** and then not given a processor (the scheduler or the platform — and when the processor had nothing else to do at all, plainly so), or they ran and had to wait for something again. The whole-PC freeze finding counts the freezes each way: "in 9 of them the measuring threads were never made runnable, in 3 they were made runnable on time and left waiting" |
+| **A program kept waiting** at a moment you flagged | At each moment you flag, and at each CPU-starvation stall, the threads that spent longest ready-but-not-running and longest blocked, per program: how long, what held the processor instead, and which program's thread woke a blocked one ("blocked for 45 ms, woken by a thread in audiodg.exe"). Only waits long enough to feel (25 ms ready, 50 ms blocked), and never a program that chose to sleep. It says how long and by what, never **which** lock or **why**, and it is capped at medium severity for exactly that reason |
 | A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file and named after the device it drives ("NVIDIA GeForce RTX 5090", "Realtek PCIe 5GbE Family Controller"), with the driver's version, date and age, and advice for the usual suspects |
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
@@ -190,7 +192,8 @@ Two independent sources, correlated on one clock (QPC):
 
 * **Kernel ETW trace.** A private real-time system-logger session records every DPC and ISR (with the
   driver routine address and duration), hard page faults, disk I/O latency, file names, thread creation
-  (for thread → process mapping) and 1 kHz CPU profile samples. Routine addresses are resolved to the loaded
+  (for thread → process mapping), 1 kHz CPU profile samples and — the expensive one — every context
+  switch and every thread wake-up. Routine addresses are resolved to the loaded
   driver; a built-in knowledge base plus each file's version resource explains what that driver is. Each
   routine's activity is also recorded as one bit per quarter-second of the run — a few hundred kilobytes
   in total, and one hash lookup per event — so that a driver waking on a steady timer can be seen even
@@ -201,7 +204,9 @@ Two independent sources, correlated on one clock (QPC):
   cheap, and none of it needs anything the tool is not already allowed to do.
 * **Latency probes.** A helper process in the REALTIME priority class runs one thread per CPU at
   priority 31, pinned, waking every millisecond (every 2 ms in light mode) and measuring how late each
-  wake-up was. Nothing but
+  wake-up was. Each probe thread reports its own thread id to the parent, which is what lets the
+  context-switch trace say whether a late wake-up was a wake-up that never came or a processor that was
+  never handed over. Nothing but
   DPCs, ISRs, code at raised IRQL, firmware (SMI) or a hypervisor can delay those threads, so a late
   wake-up *is* a kernel-level stall. A second, normal-priority probe detects plain CPU starvation.
   Every logical CPU is covered, including machines past 64 of them, where Windows splits the CPUs into
@@ -222,6 +227,14 @@ made once, before the run starts, so one report is never half of each. CPU sampl
 purpose: its interval is a system-wide Windows setting, and this tool changes nothing that could outlive
 a run. `wtfis-cli --light` turns it on by hand and `--no-light` keeps full measuring on a small or unplugged PC.
 
+**Context switches are the expensive part.** They are the highest-volume class the kernel logger has —
+tens of thousands of events a second on a busy PC — so they go into their own short ring buffer (six
+seconds of history, hard-capped at 14 MB whatever the machine does), they are **off in light mode**, and
+`wtfis-cli --no-switches` turns them off anywhere. The cost block reports how many of them arrived and at
+what rate, so the price is visible next to what it bought. If Windows could not deliver every event,
+nothing in the report rests on them at all: one missing wake-up record would turn "woken on time" into
+"never woken", so the scheduler findings are left out and the report says so.
+
 When a probe reports a stall, the analyzer waits for the trace to catch up, looks at exactly what ran
 on that CPU during that window and issues a verdict:
 
@@ -236,7 +249,11 @@ on that CPU during that window and issues a verdict:
 3. Otherwise → whichever kernel module or process the CPU samples show, but only when the DPC
    records agree that the CPU really was held (see below), and never on a handful of samples.
 4. If ordinary DPCs kept executing right through the stall → nothing was holding the CPU at all and
-   nothing is blamed: the measuring thread was not woken (timer delivery or scheduling).
+   nothing is blamed: the measuring thread was not woken. The context-switch trace then says which
+   kind of "not woken" it was — **nothing made it runnable** (the timer that wakes sleeping threads
+   did not fire: the clock, firmware or power management) or **it was made runnable on time and got
+   no processor** (the scheduler or the platform, and if the processor was idle throughout, plainly
+   so) — and the two are separate findings, because they lead to different places.
 
 **Checking before claiming.** A DPC runs at DISPATCH_LEVEL and cannot preempt code already at
 DISPATCH_LEVEL or above on the same processor, so ordinary DPCs executing *right through* a stall
@@ -325,6 +342,7 @@ time", never as "fixed": one run cannot prove that.
 wtfis-cli --duration 300 --stall-ms 2 --dpc-warn-us 500
 wtfis-cli --light            # measure more gently on a weak or battery-powered PC
 wtfis-cli --no-light         # keep full measuring even there
+wtfis-cli --no-switches      # skip the thread-switch trace (the most expensive thing measured)
 wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that run instead of the newest
 wtfis-cli --no-compare       # don't compare with an earlier run
 ```

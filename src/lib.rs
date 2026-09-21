@@ -31,5 +31,6 @@ pub mod quiet;
 pub mod reg;
 pub mod state;
 pub mod summary;
+pub mod switches;
 pub mod topology;
 pub mod util;

@@ -21,6 +21,10 @@ fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
+fn rd_i8(d: &[u8], off: usize) -> Option<i8> {
+    d.get(off).map(|b| *b as i8)
+}
+
 fn rd_u64(d: &[u8], off: usize) -> Option<u64> {
     d.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
@@ -88,12 +92,27 @@ pub(super) unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // A poisoned lock only means some other thread panicked; the event data is still sound.
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-        handle_event(shared, &mut inner, hdr.ProviderId.data1, hdr.EventDescriptor.Opcode, hdr.TimeStamp, cpu, data);
+        let at = At { guid: hdr.ProviderId.data1, opcode: hdr.EventDescriptor.Opcode, ts: hdr.TimeStamp, cpu, tid: hdr.ThreadId };
+        handle_event(shared, &mut inner, at, data);
     }));
 }
 
+/// Which event this is and where it came from. A struct rather than five more arguments: with
+/// the thread id added, `handle_event` was past what clippy allows.
+#[derive(Clone, Copy)]
+struct At {
+    /// First field of the classic provider GUID.
+    guid: u32,
+    opcode: u8,
+    ts: i64,
+    cpu: u16,
+    /// The thread the event was logged in the context of (`EVENT_HEADER::ThreadId`).
+    tid: u32,
+}
+
 /// Layouts below are the 64-bit MOF layouts of the classic NT kernel logger events.
-fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i64, cpu: u16, d: &[u8]) -> Option<()> {
+fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<()> {
+    let At { guid, opcode, ts, cpu, .. } = at;
     inner.events += 1;
     if shared.debug {
         *inner.debug_counts.entry((guid, opcode)).or_default() += 1;
@@ -272,6 +291,39 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
             let tid = rd_u32(d, 4)?;
             inner.tid_pid.insert(tid, pid);
         }
+        // CSwitch (Thread_V2, event type 36). The MOF class is a packed 64-bit layout and every
+        // field is naturally aligned, so the offsets follow straight from the declaration order:
+        //   NewThreadId u32 @0, OldThreadId u32 @4, NewThreadPriority i8 @8, OldThreadPriority i8
+        //   @9, PreviousCState u8 @10, SpareByte i8 @11 ("Not used"), OldThreadWaitReason i8 @12,
+        //   OldThreadWaitMode i8 @13, OldThreadState i8 @14, OldThreadWaitIdealProcessor i8 @15,
+        //   NewThreadWaitTime u32 @16, Reserved u32 @20.  (24 bytes)
+        // PreviousCState, SpareByte, OldThreadWaitIdealProcessor, NewThreadWaitTime and Reserved
+        // are read by nothing: the first two and the last two say nothing this tool can use, and
+        // NewThreadWaitTime has no documented unit.
+        // https://learn.microsoft.com/en-us/windows/win32/etw/cswitch
+        // https://learn.microsoft.com/en-us/windows/win32/etw/thread-v2  (type 36 = CSwitch)
+        (GUID_THREAD, 36) => {
+            // Everything up to OldThreadWaitIdealProcessor must be there; a record missing any of
+            // it cannot be placed in the timeline at all.
+            inner.push_switch(SwitchRec {
+                ts,
+                new_tid: rd_u32(d, 0)?,
+                old_tid: rd_u32(d, 4)?,
+                cpu,
+                new_prio: rd_i8(d, 8)?,
+                old_prio: rd_i8(d, 9)?,
+                old_wait_reason: rd_i8(d, 12)?,
+                old_wait_mode: rd_i8(d, 13)?,
+                old_state: rd_i8(d, 14)?,
+            });
+        }
+        // ReadyThread (Thread_V2, event type 50): TThreadId u32 @0, AdjustReason i8 @4,
+        // AdjustIncrement i8 @5, Flag i8 @6, Reserved i8 @7. (8 bytes)
+        // AdjustReason/AdjustIncrement are a priority boost, not a wait, so they are not kept.
+        // https://learn.microsoft.com/en-us/windows/win32/etw/readythread
+        (GUID_THREAD, 50) => {
+            inner.push_ready(ReadyRec { ts, tid: rd_u32(d, 0)?, by_tid: at.tid, cpu, flag: rd_i8(d, 6)? });
+        }
         _ => {}
     }
     Some(())
@@ -304,8 +356,14 @@ mod tests {
             fault_warn: 50_000,
             io_warn: 200_000,
             keep: 20_000_000,
+            switches: true,
             debug: false,
         }
+    }
+
+    /// The old positional form, so the tests below read as "this event, on this CPU, at this time".
+    fn handle(sh: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i64, cpu: u16, d: &[u8]) -> Option<()> {
+        handle_event(sh, inner, At { guid, opcode, ts, cpu, tid: 0 }, d)
     }
 
     fn exec_payload(initial_time: u64, routine: u64) -> Vec<u8> {
@@ -318,7 +376,7 @@ mod tests {
     fn dpc_duration_is_event_time_minus_initial_time() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_PERFINFO, 68, 5_000_500, 3, &exec_payload(5_000_000, 0xFFFF_F800_1234_5678));
+        handle(&sh, &mut inner, GUID_PERFINFO, 68, 5_000_500, 3, &exec_payload(5_000_000, 0xFFFF_F800_1234_5678));
         let rec = inner.execs.back().expect("DPC recorded");
         assert_eq!((rec.cpu, rec.kind, rec.end - rec.start), (3, KIND_DPC, 500));
         assert_eq!(inner.routines[&(0xFFFF_F800_1234_5678, KIND_DPC)].max, 500);
@@ -329,7 +387,7 @@ mod tests {
     fn long_isr_is_flagged_and_msi_variant_counts_as_isr() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_PERFINFO, 50, 9_002_000, 0, &exec_payload(9_000_000, 0xFFFF_F800_0000_1000));
+        handle(&sh, &mut inner, GUID_PERFINFO, 50, 9_002_000, 0, &exec_payload(9_000_000, 0xFFFF_F800_0000_1000));
         assert_eq!(inner.execs.back().unwrap().kind, KIND_ISR);
         assert!(matches!(inner.notable.as_slice(), [Notable::LongExec(_)]));
     }
@@ -338,7 +396,7 @@ mod tests {
     fn zero_initial_time_is_not_an_uptime_long_dpc() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_PERFINFO, 68, 446_000_000_000, 0, &exec_payload(0, 0xFFFF_F800_0000_1000));
+        handle(&sh, &mut inner, GUID_PERFINFO, 68, 446_000_000_000, 0, &exec_payload(0, 0xFFFF_F800_0000_1000));
         assert!(inner.execs.is_empty() && inner.routines.is_empty());
     }
 
@@ -348,9 +406,9 @@ mod tests {
         let mut inner = sh.inner.lock().unwrap();
         let mut thread = 4242u32.to_le_bytes().to_vec(); // ProcessId
         thread.extend(77u32.to_le_bytes()); // TThreadId
-        handle_event(&sh, &mut inner, GUID_THREAD, 3, 1_000, 0, &thread);
+        handle(&sh, &mut inner, GUID_THREAD, 3, 1_000, 0, &thread);
 
-        handle_event(&sh, &mut inner, GUID_PAGEFAULT, 32, 2_060_000, 0, &fault_payload(2_000_000, 0, 77, 4096));
+        handle(&sh, &mut inner, GUID_PAGEFAULT, 32, 2_060_000, 0, &fault_payload(2_000_000, 0, 77, 4096));
 
         let f = inner.faults.back().expect("fault recorded");
         assert_eq!((f.pid, f.end - f.start), (4242, 60_000));
@@ -384,13 +442,13 @@ mod tests {
         let mut inner = sh.inner.lock().unwrap();
         const BUSY: u64 = 0xffff_aaaa_0000_0010;
         // A file does slow I/O during the run; its name is not known yet.
-        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 65536, BUSY, 300_000, 9));
+        handle(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 65536, BUSY, 300_000, 9));
         assert!(inner.file_wait.contains_key(&BUSY));
         // Rundown: far more files than the cap, the busy one in the middle of them.
         let total = crate::state::FILE_NAME_CAP as u64 * 3;
         for k in 1..=total {
             let key = if k == total / 2 { BUSY } else { 0xffff_bbbb_0000_0000 + k * 16 };
-            handle_event(&sh, &mut inner, GUID_FILEIO, 36, 9_000_000, 0, &name_payload(key, r"\Device\HarddiskVolume3\x.bin"));
+            handle(&sh, &mut inner, GUID_FILEIO, 36, 9_000_000, 0, &name_payload(key, r"\Device\HarddiskVolume3\x.bin"));
         }
         assert_eq!(inner.file_names.get(BUSY), Some(r"\Device\HarddiskVolume3\x.bin"), "the file that waited keeps its name");
         assert!(inner.file_names.len() <= crate::state::FILE_NAME_CAP / 2 + 1, "idle files stop being stored: {}", inner.file_names.len());
@@ -409,8 +467,8 @@ mod tests {
     fn a_name_event_names_the_disk_requests_that_carry_the_same_key() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
-        handle_event(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(1, 65536, FILE_KEY, 300_000, 9));
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(1, 65536, FILE_KEY, 300_000, 9));
 
         let io = inner.ios.back().expect("request recorded");
         assert_eq!((io.file, io.disk, io.op), (FILE_KEY, 1, b'R'));
@@ -418,10 +476,10 @@ mod tests {
         let w = inner.file_wait[&FILE_KEY];
         assert_eq!((w.disk, w.count, w.total), (1, 1, 300_000));
         // The rundown at the end of the trace carries the same shape and a FileKey instead.
-        handle_event(&sh, &mut inner, GUID_FILEIO, 36, 200, 0, &name_payload(7, "\\Device\\HarddiskVolume3\\$Mft"));
+        handle(&sh, &mut inner, GUID_FILEIO, 36, 200, 0, &name_payload(7, "\\Device\\HarddiskVolume3\\$Mft"));
         assert_eq!(inner.file_names.get(7), Some("\\Device\\HarddiskVolume3\\$Mft"));
         // Repeating the same name (which the kernel does) must not throw the tally away.
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 300, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 300, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
         assert_eq!(inner.file_wait[&FILE_KEY].count, 1);
     }
 
@@ -431,13 +489,13 @@ mod tests {
     fn a_recycled_file_object_does_not_inherit_the_old_files_waiting() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_FILEIO, 32, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\big.log"));
-        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 4096, FILE_KEY, 900_000, 9));
+        handle(&sh, &mut inner, GUID_FILEIO, 32, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\big.log"));
+        handle(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 4096, FILE_KEY, 900_000, 9));
         assert_eq!(inner.file_wait[&FILE_KEY].total, 900_000);
 
-        handle_event(&sh, &mut inner, GUID_FILEIO, 32, 6_000, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\other.dat"));
+        handle(&sh, &mut inner, GUID_FILEIO, 32, 6_000, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\other.dat"));
         assert!(!inner.file_wait.contains_key(&FILE_KEY), "the old tally went with the old name");
-        handle_event(&sh, &mut inner, GUID_DISKIO, 11, 7_000, 0, &io_payload(1, 4096, FILE_KEY, 10, 9));
+        handle(&sh, &mut inner, GUID_DISKIO, 11, 7_000, 0, &io_payload(1, 4096, FILE_KEY, 10, 9));
         assert_eq!(inner.file_wait[&FILE_KEY].total, 10, "the new file starts from zero");
         assert_eq!(inner.file_names.get(FILE_KEY), Some("\\Device\\HarddiskVolume3\\other.dat"));
     }
@@ -448,9 +506,9 @@ mod tests {
         let mut inner = sh.inner.lock().unwrap();
         let mut thread = 42u32.to_le_bytes().to_vec();
         thread.extend(7u32.to_le_bytes());
-        handle_event(&sh, &mut inner, GUID_THREAD, 3, 10, 0, &thread);
+        handle(&sh, &mut inner, GUID_THREAD, 3, 10, 0, &thread);
         for i in 0..3 {
-            handle_event(&sh, &mut inner, GUID_PAGEFAULT, 32, 1_000 + i * 100, 0, &fault_payload(1_000, FILE_KEY, 7, 4096));
+            handle(&sh, &mut inner, GUID_PAGEFAULT, 32, 1_000 + i * 100, 0, &fault_payload(1_000, FILE_KEY, 7, 4096));
         }
         let w = inner.fault_file[&(42, FILE_KEY)];
         assert_eq!((w.count, w.max), (3, 200));
@@ -464,7 +522,7 @@ mod tests {
         let mut inner = sh.inner.lock().unwrap();
         let mut flush = vec![0u8; 28];
         flush[8..16].copy_from_slice(&400_000u64.to_le_bytes());
-        handle_event(&sh, &mut inner, GUID_DISKIO, 14, 9_000, 0, &flush);
+        handle(&sh, &mut inner, GUID_DISKIO, 14, 9_000, 0, &flush);
         assert_eq!(inner.ios.back().unwrap().file, 0);
         assert!(inner.file_wait.is_empty(), "a zero file object is never a map key");
     }
@@ -473,22 +531,22 @@ mod tests {
     fn garbage_and_truncated_name_events_are_ignored() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[]);
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[0xFF; 7]); // no room for the key
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &1u64.to_le_bytes()); // key, no name
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[]);
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &[0xFF; 7]); // no room for the key
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &1u64.to_le_bytes()); // key, no name
         assert!(inner.file_names.is_empty(), "nothing usable in any of those");
         // A payload that ends mid-character: keep the characters that are whole, read no further.
         let mut odd = 2u64.to_le_bytes().to_vec();
         odd.extend([b'a', 0, b'b', 0, b'c']);
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &odd);
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &odd);
         assert_eq!(inner.file_names.get(2), Some("ab"));
         // A name longer than any real path is cut, not stored whole.
         let mut huge = 3u64.to_le_bytes().to_vec();
         huge.extend("x".repeat(5000).encode_utf16().flat_map(u16::to_le_bytes));
-        handle_event(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &huge);
+        handle(&sh, &mut inner, GUID_FILEIO, 0, 1, 0, &huge);
         assert_eq!(inner.file_names.get(3).map(str::len), Some(MAX_PATH_CHARS));
         // A payload cut short after the file object still yields the request, just unnamed.
-        handle_event(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(0, 0, 5, 1, 0)[..20]);
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &io_payload(0, 0, 5, 1, 0)[..20]);
         assert!(inner.ios.is_empty());
     }
 
@@ -545,8 +603,96 @@ mod tests {
     fn truncated_payloads_are_ignored() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, GUID_PERFINFO, 68, 10, 0, &[1, 2, 3]);
-        handle_event(&sh, &mut inner, GUID_DISKIO, 10, 10, 0, &[0; 20]);
+        handle(&sh, &mut inner, GUID_PERFINFO, 68, 10, 0, &[1, 2, 3]);
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 10, 0, &[0; 20]);
         assert!(inner.execs.is_empty() && inner.ios.is_empty());
+    }
+
+    /// The documented 24-byte CSwitch payload, built field by field from the MOF declaration.
+    fn cswitch_payload(new_tid: u32, old_tid: u32, new_prio: i8, old_prio: i8, reason: i8, mode: i8, state: i8) -> Vec<u8> {
+        let mut d = vec![0u8; 24];
+        d[0..4].copy_from_slice(&new_tid.to_le_bytes());
+        d[4..8].copy_from_slice(&old_tid.to_le_bytes());
+        d[8] = new_prio as u8;
+        d[9] = old_prio as u8;
+        d[10] = 3; // PreviousCState
+        d[11] = 0x7f; // SpareByte: "Not used"
+        d[12] = reason as u8;
+        d[13] = mode as u8;
+        d[14] = state as u8;
+        d[15] = 5; // OldThreadWaitIdealProcessor
+        d[16..20].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // NewThreadWaitTime: unit unknown, unread
+        d[20..24].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // Reserved
+        d
+    }
+
+    fn ready_payload(tid: u32, flag: i8) -> Vec<u8> {
+        let mut d = vec![0u8; 8];
+        d[0..4].copy_from_slice(&tid.to_le_bytes());
+        d[4] = 2; // AdjustReason
+        d[5] = 16; // AdjustIncrement
+        d[6] = flag as u8;
+        d
+    }
+
+    #[test]
+    fn a_context_switch_is_read_at_the_documented_offsets() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        // Priority 31 (a real-time probe) switched in; the thread it displaced went Waiting(5)
+        // for reason WrQueue(15) in UserMode(1) from priority -4.
+        handle(&sh, &mut inner, GUID_THREAD, 36, 7_000, 3, &cswitch_payload(4242, 77, 31, -4, 15, 1, 5));
+        let r = *inner.switches.back().expect("switch recorded");
+        assert_eq!(
+            r,
+            SwitchRec {
+                ts: 7_000,
+                new_tid: 4242,
+                old_tid: 77,
+                cpu: 3,
+                new_prio: 31,
+                old_prio: -4,
+                old_wait_reason: 15,
+                old_wait_mode: 1,
+                old_state: 5,
+            }
+        );
+        assert_eq!(inner.switch_events, 1);
+    }
+
+    #[test]
+    fn a_ready_event_carries_the_thread_readied_and_the_context_it_happened_in() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 900, cpu: 2, tid: 88 }, &ready_payload(4242, 0));
+        assert_eq!(*inner.readies.back().unwrap(), ReadyRec { ts: 900, tid: 4242, by_tid: 88, cpu: 2, flag: 0 });
+        assert_eq!(inner.readies.back().unwrap().waker(), Some(88));
+        // Readied from a DPC: the thread on the processor did not do it, and is not named.
+        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 950, cpu: 2, tid: 88 }, &ready_payload(4242, 1));
+        assert_eq!(inner.readies.back().unwrap().waker(), None);
+        assert_eq!(inner.ready_events, 2);
+    }
+
+    #[test]
+    fn truncated_and_garbage_switch_payloads_record_nothing() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        let full = cswitch_payload(1, 2, 8, 8, 0, 0, 5);
+        for cut in [0usize, 4, 8, 13, 14] {
+            handle(&sh, &mut inner, GUID_THREAD, 36, 10, 0, &full[..cut]);
+        }
+        handle(&sh, &mut inner, GUID_THREAD, 50, 10, 0, &[]);
+        handle(&sh, &mut inner, GUID_THREAD, 50, 10, 0, &[0xFF; 6]); // no room for Flag at offset 6
+        assert!(inner.switches.is_empty() && inner.readies.is_empty(), "nothing usable in any of those");
+        // OldThreadState at offset 14 is the last byte read, so 15 bytes is enough and the
+        // NewThreadWaitTime and Reserved tail that follows is never needed.
+        handle(&sh, &mut inner, GUID_THREAD, 36, 11, 0, &full[..15]);
+        assert_eq!(inner.switches.len(), 1);
+        assert_eq!(inner.switches.back().unwrap().old_state, 5);
+        // All-0xFF is a valid (if nonsensical) record; it must be stored, not panic. The i8
+        // fields read as -1, which no classifier may treat as a real state.
+        handle(&sh, &mut inner, GUID_THREAD, 36, 12, 0, &[0xFF; 24]);
+        let r = inner.switches.back().unwrap();
+        assert_eq!((r.old_state, r.old_wait_reason, r.new_prio), (-1, -1, -1));
     }
 }

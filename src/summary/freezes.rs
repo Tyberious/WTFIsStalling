@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use crate::analyze::{FreezeFacts, IncidentClass};
 use crate::diskwait::Role;
 use crate::intr::Flow;
+use crate::switches::Verdict;
 use crate::util::{fmt_dur, plural, ticks_to_ms};
 
 use super::ctx::Ctx;
@@ -95,6 +96,58 @@ pub(super) fn whole_pc(cx: &mut Ctx) {
             )
         });
     }
+    // The one measurement that says whether the threads were held up or simply never woken. This
+    // is what the field logs in issue #15 could not answer: every probe on every processor waking
+    // late by the same amount is the same picture either way, and only the scheduler trace
+    // separates them.
+    // ...and only when every event arrived; see `Ctx::scheduler_usable`.
+    let judged: Vec<Verdict> =
+        if cx.scheduler_usable() { facts.iter().filter_map(|(_, f)| f.probes.overall()).collect() } else { Vec::new() };
+    let count = |v: Verdict| judged.iter().filter(|j| **j == v).count();
+    let (not_woken, queued, blocked) = (count(Verdict::NotWoken), count(Verdict::Queued), count(Verdict::Blocked));
+    let on_idle = facts.iter().map(|(_, f)| f.probes.on_idle_cpu).sum::<usize>();
+    if !judged.is_empty() {
+        let j = judged.len();
+        let mut said = Vec::new();
+        if not_woken > 0 {
+            said.push(format!(
+                "in {not_woken} of them the measuring threads were never made runnable at all until the freeze ended: nothing woke \
+                 them. That looks like the timer that wakes sleeping threads failing to fire, which points at the clock, the firmware or power \
+                 management - below Windows' own scheduling, and below every driver"
+            ));
+        }
+        if queued > 0 {
+            let idle = if on_idle > 0 { ", on a processor that had nothing else to do at all" } else { "" };
+            // A DPC or ISR runs on top of whatever thread is there and no thread switch records
+            // it, so "woken and not run" only points below the drivers when none was seen holding.
+            let held = facts.iter().filter(|(_, f)| f.probes.overall() == Some(Verdict::Queued) && f.holding.is_some()).count();
+            let means = if held >= queued {
+                "No thread outranks them, so interrupt-level work kept them off, which fits the driver seen holding the processors"
+            } else if held > 0 {
+                "No thread outranks them, so interrupt-level work or the platform kept them off: in some of these a driver was \
+                 seen holding the processors, in the others nothing was"
+            } else {
+                "No thread outranks them and no driver was seen holding the processors, so that points at the platform (firmware, \
+                 power management) or at interrupt-level work this trace cannot see, rather than at another program"
+            };
+            said.push(format!(
+                "in {queued} of them the measuring threads WERE made runnable on time and were then left waiting{idle}. {means}"
+            ));
+        }
+        if blocked > 0 {
+            said.push(format!(
+                "in {blocked} of them the measuring threads were woken on time, ran, and then had to wait for something else, so \
+                 that wait is the freeze"
+            ));
+        }
+        evidence.push(format!(
+            "What happened to this tool's own measuring threads, from the context-switch trace ({j} of the {n} freeze{} could be \
+             judged): {}.",
+            plural(n as u64),
+            said.join("; ")
+        ));
+    }
+
     let kept_running = facts.iter().filter(|(_, f)| f.dpcs_kept_running).count();
     if kept_running > 0 {
         evidence.push(format!(
@@ -223,7 +276,19 @@ pub(super) fn whole_pc(cx: &mut Ctx) {
     for more in evidence {
         cx.found.note(FREEZE_KEY, more);
     }
-    // Per hour rather than a raw count, so a 5-minute run and an hour-long one compare.
+    // When it is the wake-ups that are failing, the order of attack narrows: the layers that own
+    // the clock come first. Appended rather than replacing, so the general plan still follows.
+    if not_woken > queued + blocked {
+        cx.found.advise(
+            FREEZE_KEY,
+            "Because nothing was waking sleeping threads, start with the layers that own the clock: in the BIOS/UEFI update it, load \
+             defaults, and try switching off C-states / 'global C-state control' / ErP; in Windows, Control Panel > Power Options > \
+             High performance. Those are also the settings a 'latency tweak' guide most often changes.",
+        );
+    }
+    // Per hour rather than a raw count, so a 5-minute run and an hour-long one compare. Only two
+    // metrics are kept per finding (`MAX_METRICS`), so how many freezes had no wake-up is left to
+    // the evidence above rather than taking the place of one of these.
     cx.found.measure(FREEZE_KEY, Metric::flat("freezes per hour", per_hour));
     cx.found.measure(FREEZE_KEY, Metric::ms("worst freeze", ticks_to_ms(worst)));
 }

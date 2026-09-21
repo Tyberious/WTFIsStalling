@@ -46,6 +46,9 @@ pub(super) struct Ctx<'a> {
     /// Per-disk latency totals, by disk number.
     pub disk_stats: Vec<(u32, LatStat)>,
     pub events: u64,
+    /// Context switches plus thread wake-ups over the whole run; `None` when they were not being
+    /// traced (light mode, `--no-switches`, or Windows refusing the flags).
+    pub switch_events: Option<u64>,
     pub debug_counts: Vec<((u32, u8), u64)>,
     pub debug_rejected: Vec<(i64, i64)>,
     pub named_files: usize,
@@ -82,6 +85,19 @@ pub(super) struct Ctx<'a> {
     pub platform_lines: Vec<String>,
 }
 
+impl Ctx<'_> {
+    /// May anything be concluded from the context-switch trace?
+    ///
+    /// Only if it was recorded at all AND Windows handed over every event. Everything read from
+    /// these two classes is a chain - readied, then switched in, then switched out - and one
+    /// missing `ReadyThread` turns "woken on time" into "never woken", which is the opposite
+    /// conclusion. Unlike counting DPCs, there is no safe way to be approximately right here, so
+    /// any loss at all disqualifies the run's scheduler findings rather than shading them.
+    pub fn scheduler_usable(&self) -> bool {
+        self.switch_events.is_some() && self.run.events_lost == 0
+    }
+}
+
 impl<'a> Ctx<'a> {
     pub fn new(az: &'a mut Analyzer, run: RunData<'a>) -> Ctx<'a> {
         let elapsed_s = run.elapsed_s;
@@ -93,6 +109,8 @@ impl<'a> Ctx<'a> {
         let faults = inner.faults_by_pid.clone();
         let disks = inner.disks.clone();
         let events = inner.events;
+        // Priced together: they are enabled by one decision and arrive at comparable rates.
+        let switch_events = az.shared.switches.then(|| inner.switch_events + inner.ready_events);
         let debug_counts: Vec<_> = inner.debug_counts.iter().map(|(k, v)| (*k, *v)).collect();
         let debug_rejected = inner.debug_rejected.clone();
         // Files the trace named. Anything it never named is dropped here rather than carried
@@ -137,6 +155,7 @@ impl<'a> Ctx<'a> {
             faults,
             disk_stats,
             events,
+            switch_events,
             debug_counts,
             debug_rejected,
             named_files,

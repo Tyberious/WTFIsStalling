@@ -44,6 +44,10 @@ pub struct Config {
     pub fault_warn_ms: f64,
     pub io_warn_ms: f64,
     pub profile: bool,
+    /// Trace context switches and thread wake-ups, which is what says whether a stalled thread
+    /// was never woken or was woken and not run. This is the highest-volume class the kernel
+    /// logger has, so it is off in light mode whatever this says.
+    pub switches: bool,
     /// Measure with the lighter settings (2 ms probes, slower CPU sampling). `None` lets the
     /// tool decide before the run from the CPU count and whether the PC is on battery, which is
     /// what the GUI always uses; `Some` overrides that either way.
@@ -65,6 +69,7 @@ impl Default for Config {
             fault_warn_ms: 50.0,
             io_warn_ms: 200.0,
             profile: true,
+            switches: true,
             light: None,
             log: LogTarget::Auto,
             compare: CompareMode::Auto,
@@ -305,9 +310,15 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     }
 
     util::status("Starting kernel trace...");
-    let session = etw::Session::start(cfg.profile)?;
+    // Context switches cost far more than everything else in this session put together, and light
+    // mode exists to cost the PC less; asking for them there would undo the point of it.
+    let want_switches = cfg.switches && light_reason.is_none();
+    let session = etw::Session::start(cfg.profile, want_switches)?;
     if !session.profile && cfg.profile {
         say!("warning: CPU sampling could not be enabled; process attribution and firmware/SMI detection are off.");
+    }
+    if want_switches && !session.switches {
+        say!("warning: Windows would not trace context switches; the report cannot say whether a stalled thread was woken.");
     }
     let _timer_resolution = TimerResolution::raise();
     // Light mode deliberately leaves CPU sampling alone: its interval is a system-wide Windows
@@ -317,13 +328,25 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         say!("Light mode: on, because {why}. The probes check every {probe_ms:.0} ms instead of 1 ms, so measuring costs this PC");
         say!("            less. Stalls shorter than about {probe_ms:.0} ms can be missed.");
     }
+    if session.switches {
+        say!("Switches: tracing every thread switch, which is what tells 'nothing woke it' apart from 'it was woken and not run'.");
+        say!("          It is the most expensive thing this tool records: tens of thousands of events a second on a busy PC. The");
+        say!("          DETAILS block reports what it actually cost; 'wtfis-cli --no-switches' turns it off.");
+    } else if cfg.switches && light_reason.is_some() {
+        say!("Switches: not traced in light mode (it is the most expensive thing this tool records), so the report cannot say");
+        say!("          whether a stalled thread was never woken or was woken and not given a processor.");
+    }
 
     let shared = Arc::new(state::Shared {
-        inner: Mutex::new(state::Inner::default()),
+        inner: Mutex::new({
+            let (switch_cap, ready_cap) = state::switch_caps(ncpu as usize);
+            state::Inner { switch_cap, ready_cap, ..Default::default() }
+        }),
         exec_warn: ms_to_ticks(cfg.dpc_warn_us / 1000.0),
         fault_warn: ms_to_ticks(cfg.fault_warn_ms),
         io_warn: ms_to_ticks(cfg.io_warn_ms),
         keep: ms_to_ticks(20_000.0),
+        switches: session.switches,
         debug: cfg.debug,
     });
     let consumer = etw::spawn_consumer(shared.clone());
@@ -346,7 +369,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     // very CPU starvation they describe.
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
 
-    let mut analyzer = analyze::Analyzer::new(shared.clone(), rx, modules, session.profile);
+    let mut analyzer = analyze::Analyzer::new(shared.clone(), rx, modules, session.profile, probe_stats.tids.clone());
     say!(
         "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
         analyzer.modules.len(),

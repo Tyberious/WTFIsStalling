@@ -36,6 +36,12 @@ struct Args {
     /// Don't sample the CPU (loses process attribution and firmware/SMI detection)
     #[arg(long)]
     no_profile: bool,
+    /// Don't trace thread switches. They are the most expensive thing this tool records (tens of
+    /// thousands of events a second on a busy PC), and without them the report cannot say whether
+    /// a stalled thread was never woken or was woken and given no processor. Already off in
+    /// --light mode
+    #[arg(long)]
+    no_switches: bool,
     /// Measure more gently: probe every 2 ms and sample the CPU half as often, so the tool costs
     /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
     /// PC with 4 logical CPUs or fewer, or one running on battery
@@ -142,6 +148,7 @@ fn main() {
         fault_warn_ms: args.fault_warn_ms,
         io_warn_ms: args.io_warn_ms,
         profile: !args.no_profile,
+        switches: !args.no_switches,
         // Neither flag: decide from the machine itself, exactly as the GUI does.
         light: match (args.light, args.no_light) {
             (true, _) => Some(true),

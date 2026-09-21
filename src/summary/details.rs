@@ -111,8 +111,17 @@ pub(super) fn tables(cx: &mut Ctx) {
     }
     d!("");
     d!("THIS TOOL'S OWN COST  (what the measuring itself used)");
-    for line in overhead.detail_lines(events, events_lost) {
+    for line in overhead.detail_lines(events, events_lost, cx.switch_events) {
         d!("{line}");
+    }
+    if cx.switch_events.is_some() && !cx.scheduler_usable() {
+        d!("Because some kernel events were lost, nothing in this report rests on the thread-switch trace: what it says about \
+             whether a stalled thread was woken, and about which programs were kept waiting, is left out rather than guessed at.");
+    }
+    let uncovered = cx.az.switch_uncovered.load(std::sync::atomic::Ordering::Relaxed);
+    if uncovered > 0 && cx.scheduler_usable() {
+        let of = cx.az.switch_gathers.load(std::sync::atomic::Ordering::Relaxed);
+        d!("For {uncovered} of the {of} moments looked at, the thread-switch history did not reach back far enough (it holds a few              seconds, less on a PC switching threads very fast, and nothing from before the run began), so those say nothing about              whether a stalled thread was woken or which programs were kept waiting.");
     }
     if cx.az.notable_folded > 0 {
         d!(

@@ -74,10 +74,19 @@ fn how_often(n: u32, worst: i64, total: i64, run_s: f64) -> String {
 pub(super) fn tally(cx: &mut Ctx) {
     let run_s = cx.run.elapsed_s;
     let mut tally: HashMap<String, (u32, i64, i64)> = HashMap::new();
+    // A verdict that rests on the context-switch trace has to fall back to the vaguer one when
+    // that trace cannot be trusted; see `Ctx::scheduler_usable`.
+    let usable = cx.scheduler_usable();
     for i in cx.az.incidents.iter().filter(|i| !i.marked && i.class != IncidentClass::Freeze) {
+        let culprit = match i.culprit.as_str() {
+            "not woken (nothing woke the thread)" | "not woken (ready, but given no processor)" if !usable => {
+                "not woken (timers or scheduling)"
+            }
+            other => other,
+        };
         // Keyed without the process ID: a browser runs a dozen processes, and four findings for
         // "msedge.exe" are one finding said four times.
-        let t = tally.entry(stable_key(&i.culprit)).or_default();
+        let t = tally.entry(stable_key(culprit)).or_default();
         t.0 += 1;
         t.1 += i.dur;
         t.2 = t.2.max(i.dur);
@@ -139,13 +148,33 @@ pub(super) fn tally(cx: &mut Ctx) {
                 *total,
             );
         } else if culprit.starts_with("not woken") {
+            // Three flavors of the same shape, told apart by the context-switch trace: nothing
+            // woke the thread at all, it was woken and left without a processor, or the trace
+            // could not say which. The remedies overlap but the first sentence must not.
+            let (title, what) = match culprit.as_str() {
+                "not woken (nothing woke the thread)" => (
+                    "Sleeping threads were not woken on time",
+                    "and nothing made the measuring thread runnable until it was over: the timer that wakes sleeping threads did \
+                     not fire. That is below Windows' scheduling and below every driver.",
+                ),
+                "not woken (ready, but given no processor)" => (
+                    "Threads were ready to run and got no processor",
+                    "and the measuring thread WAS made runnable on time and then was not given a processor. No thread outranks it \
+                     and no processor was held at interrupt level, so this points at the scheduler or the platform rather than \
+                     another program.",
+                ),
+                _ => (
+                    "Threads were not woken on time, with no processor held",
+                    "so nothing was blocking the processors: threads simply were not woken, by timer delivery or by scheduling.",
+                ),
+            };
             cx.found.add(
                 culprit,
                 sev,
-                "Threads were not woken on time, with no processor held".into(),
+                title.into(),
                 format!(
-                    "During {stalls} ordinary interrupt work kept running on the affected processors, which cannot happen \
-                         while a driver holds one. So nothing was blocking the processors: threads simply were not woken."
+                    "During {stalls} ordinary interrupt work kept running on the affected processors, which cannot happen while a \
+                     driver holds one, {what}"
                 ),
                 "This is a timing problem below the programs; power management and the system clock are the places to look. Test with the 'High \
                  performance' power plan, update the BIOS/UEFI and the chipset driver, and undo any 'latency tweak' that changed \
@@ -282,6 +311,93 @@ pub(super) fn flagged_moments(cx: &mut Ctx) {
             0,
         );
         cx.found.measure("clean marks", Metric::flat("moments you flagged", cx.az.marks_clean));
+    }
+}
+
+/// A wait this long is what turns a hitch into something you see: at 60 frames a second it is
+/// six frames, and it is well past the point where a click feels like it landed late.
+const BAD_READY_MS: f64 = 100.0;
+/// The same idea for a thread that was blocked, where waiting is normal and only a long one
+/// stands out.
+const BAD_BLOCKED_MS: f64 = 250.0;
+
+/// Programs that were kept waiting at the moments the user flagged, and when a normal-priority
+/// thread could not get a processor.
+///
+/// This section never names a cause. It says what happened to a program: it was ready to run and
+/// did not get a processor (and what held that processor instead), or it was blocked and which
+/// program's thread eventually woke it. Which lock, and why, is not in these events and is not
+/// claimed. Severity is capped at Medium for exactly that reason: a symptom with no culprit must
+/// not set the banner for the whole report.
+pub(super) fn one_program_waits(cx: &mut Ctx) {
+    if cx.az.wait_moments == 0 || !cx.scheduler_usable() {
+        return;
+    }
+    let moments = cx.az.wait_moments;
+    let mut rows: Vec<(String, crate::analyze::ProgramWait)> =
+        cx.az.program_waits.iter().map(|(name, w)| (name.clone(), w.clone())).collect();
+    rows.sort_by_key(|(name, w)| (std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
+    // A report that lists twenty waiting programs says nothing; the worst few say it all.
+    for (name, w) in rows.iter().take(4) {
+        let key = format!("waiting {name}");
+        let when = format!("at {} of the {moments} moment{} this report examined closely", w.moments, plural(u64::from(moments)));
+        let severity =
+            if w.ready >= ms_to_ticks(BAD_READY_MS) || w.blocked >= ms_to_ticks(BAD_BLOCKED_MS) { Severity::Medium } else { Severity::Low };
+        let (evidence, advice) = if w.ready >= w.blocked {
+            let (because, advice) = match (&w.instead, w.instead_idle) {
+                (_, true) => (
+                    " while the processor it was waiting for had nothing else to do at all. That is not other programs competing \
+                     for it: something was not handing the processor over."
+                        .to_string(),
+                    "Nothing was competing for the processor, so closing programs will not help. Set Control Panel > Power Options \
+                     to High performance, update the BIOS/UEFI and load its defaults, and if Core Isolation (Memory integrity) or \
+                     Hyper-V is on, test once with it off. Then monitor again and compare."
+                        .to_string(),
+                ),
+                (Some(other), _) => (format!(" while {} held that processor.", crate::procs::process_name(other)), process_advice(other)),
+                (None, _) => (
+                    " while something this trace could not name held that processor.".to_string(),
+                    "Monitor again for longer while reproducing the hitch: with more of these moments the report can name what \
+                     keeps taking the processor."
+                        .to_string(),
+                ),
+            };
+            (format!("One of its threads was ready to run and got no processor for {} {when}{because}", fmt_dur(w.ready),), advice)
+        } else {
+            let why = crate::switches::wait_reason_name(w.blocked_reason).map(|r| format!(" ({r})")).unwrap_or_default();
+            let by = match &w.woken_by {
+                Some(other) => format!(" It was eventually woken by a thread in {}.", crate::procs::process_name(other)),
+                None => String::new(),
+            };
+            (
+                format!(
+                    "One of its threads was blocked for {} {when}{why}.{by} What it was waiting for is not in this trace: this says \
+                     how long, not why.",
+                    fmt_dur(w.blocked)
+                ),
+                "Look at the other findings in this report for something that fits: a drive responding slowly, paging, or a driver \
+                 holding a processor. If none of them do, monitor for longer while reproducing the hitch."
+                    .to_string(),
+            )
+        };
+        // The title stays short (some `process_title` descriptions are a line on their own, and
+        // the RESULT block does not wrap titles); what the program IS goes in the evidence
+        // underneath, which is also where the audience rule is honored for Windows components.
+        cx.found.add(&key, severity, format!("{name}  -  was held up"), evidence, advice, w.ready.max(w.blocked));
+        let what = process_title(name);
+        if !what.ends_with("-  program") {
+            cx.found.note(&key, format!("What {name} is: {}.", what.replacen("  -  ", "", 1)));
+        }
+        // Both numbers when both were measured, so the next run can say which one moved.
+        if w.ready > 0 {
+            cx.found.measure(&key, Metric::ms("longest wait for a processor", ticks_to_ms(w.ready)));
+        }
+        if w.blocked > 0 {
+            cx.found.measure(&key, Metric::ms("longest block", ticks_to_ms(w.blocked)));
+        }
+    }
+    if rows.len() > 4 {
+        cx.details.push(format!("  ({} more program(s) were kept waiting; the four worst are in the result above)", rows.len() - 4));
     }
 }
 

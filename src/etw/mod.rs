@@ -20,9 +20,10 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_FLAG_DISK_FILE_IO,
-    EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS,
-    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_FLAG_CSWITCH,
+    EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DISPATCHER, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT,
+    EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -48,6 +49,8 @@ const ERROR_ALREADY_EXISTS: u32 = 183;
 pub struct Session {
     handle: CONTROLTRACE_HANDLE,
     pub profile: bool,
+    /// Whether context switches and thread wake-ups are actually being traced.
+    pub switches: bool,
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -105,6 +108,21 @@ fn try_start(flags: u32) -> Result<CONTROLTRACE_HANDLE, u32> {
         (*p).Wnode.Guid = SESSION_GUID;
         (*p).LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
         (*p).EnableFlags = flags;
+        // Buffer settings, all from
+        // learn.microsoft.com/windows/win32/api/evntrace/ns-evntrace-event_trace_properties:
+        // * BufferSize is in KB, 4 to 16384 (1024 before Windows 8). 256 KB is the documented
+        //   size for "a diagnostic trace with hundreds of megabytes of data per second", where
+        //   "a huge buffer size ... can reduce CPU overhead" - which is what this session is once
+        //   context switches are on.
+        // * "Beyond this limit, the session discards incoming events": MaximumBuffers is the one
+        //   lever against losing events at a peak, and 320 x 256 KB = 80 MB is already far above
+        //   the ~5 MB/s a busy 8-CPU machine produces with CSwitch and ReadyThread enabled. Left
+        //   as it is deliberately: the fix for a run that still loses events is the run saying so
+        //   (it does, in the tool's own cost block) and --no-switches, not reserving more of the
+        //   user's memory by default.
+        // * FlushTimer is in seconds and 1 is its documented minimum. Higher "will reduce CPU
+        //   overhead", but the analyzer holds every incident until the trace has caught up past
+        //   its end, so a higher value would delay every verdict by that many seconds.
         (*p).BufferSize = 256; // KB
         (*p).MinimumBuffers = 64;
         (*p).MaximumBuffers = 320;
@@ -120,7 +138,7 @@ fn try_start(flags: u32) -> Result<CONTROLTRACE_HANDLE, u32> {
 }
 
 impl Session {
-    pub fn start(want_profile: bool) -> Result<Session, String> {
+    pub fn start(want_profile: bool, want_switches: bool) -> Result<Session, String> {
         let core = EVENT_TRACE_FLAG_PROCESS
             | EVENT_TRACE_FLAG_THREAD
             | EVENT_TRACE_FLAG_DISK_IO
@@ -140,8 +158,24 @@ impl Session {
             attempts.insert(0, (core | EVENT_TRACE_FLAG_PROFILE, true));
             attempts.insert(0, (base | EVENT_TRACE_FLAG_PROFILE, true));
         }
+        // CSWITCH (0x10) turns on the Thread provider's CSwitch events and DISPATCHER (0x800) its
+        // ReadyThread events; both are EnableFlags of this same system logger, so they need no
+        // second session. Microsoft's own warning about them is on the CSwitch class page: "These
+        // events produce a high volume of events" - which is why they are off in light mode and
+        // behind --no-switches.
+        // https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties
+        // https://learn.microsoft.com/en-us/windows/win32/etw/cswitch
+        let sched = EVENT_TRACE_FLAG_CSWITCH | EVENT_TRACE_FLAG_DISPATCHER;
+        let mut attempts: Vec<(u32, bool, bool)> = attempts.into_iter().map(|(f, p)| (f, p, false)).collect();
+        if want_switches {
+            // Tried first with the scheduler flags on; the same list without them is the fallback,
+            // so a Windows that refuses them still yields everything else.
+            let mut with: Vec<(u32, bool, bool)> = attempts.iter().map(|(f, p, _)| (f | sched, *p, true)).collect();
+            with.append(&mut attempts);
+            attempts = with;
+        }
         let mut last = 0;
-        for (flags, with_profile) in attempts {
+        for (flags, with_profile, with_switches) in attempts {
             let mut r = try_start(flags);
             if matches!(r, Err(ERROR_ALREADY_EXISTS)) {
                 // Left over from a previous run that was killed; take it over.
@@ -149,7 +183,14 @@ impl Session {
                 r = try_start(flags);
             }
             match r {
-                Ok(handle) => return Ok(Session { handle, profile: with_profile, stopped: std::sync::atomic::AtomicBool::new(false) }),
+                Ok(handle) => {
+                    return Ok(Session {
+                        handle,
+                        profile: with_profile,
+                        switches: with_switches,
+                        stopped: std::sync::atomic::AtomicBool::new(false),
+                    })
+                }
                 Err(rc) => last = rc,
             }
         }

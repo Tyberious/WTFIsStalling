@@ -64,6 +64,63 @@ pub struct SampleRec {
     pub ip: u64,
 }
 
+/// One context switch (Thread provider, event type 36, `CSwitch`). Only the fields the analysis
+/// uses are kept, so the record stays 24 bytes: this is the highest-volume class in the kernel
+/// logger and the ring holds hundreds of thousands of them.
+///
+/// `NewThreadWaitTime` is deliberately NOT stored: Microsoft documents it only as "Wait time for
+/// the new thread" and gives no unit, and a number whose unit is unknown cannot be reported.
+/// https://learn.microsoft.com/en-us/windows/win32/etw/cswitch
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchRec {
+    pub ts: i64,
+    /// Thread switched ON to this processor (0 is the idle thread).
+    pub new_tid: u32,
+    /// Thread switched OFF it.
+    pub old_tid: u32,
+    pub cpu: u16,
+    pub new_prio: i8,
+    pub old_prio: i8,
+    /// `OldThreadWaitReason`, a KWAIT_REASON; see `switches::wait_reason_name`.
+    pub old_wait_reason: i8,
+    /// `OldThreadWaitMode`: 0 KernelMode, 1 UserMode.
+    pub old_wait_mode: i8,
+    /// `OldThreadState`: 0 Initialized, 1 Ready, 2 Running, 3 Standby, 4 Terminated, 5 Waiting,
+    /// 6 Transition, 7 DeferredReady.
+    pub old_state: i8,
+}
+
+/// One "this thread has been made runnable" event (Thread provider, event type 50,
+/// `ReadyThread`). https://learn.microsoft.com/en-us/windows/win32/etw/readythread
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadyRec {
+    pub ts: i64,
+    /// `TThreadId`: "The thread identifier of the thread being readied for execution."
+    pub tid: u32,
+    /// The event header's thread, i.e. whoever was running when the readying happened. Only
+    /// meaningful when `Flag & 1` is clear; see `ReadyRec::waker`.
+    pub by_tid: u32,
+    pub cpu: u16,
+    /// `Flag`: 0x1 readied from a DPC, 0x2 kernel stack swapped out, 0x4 address space swapped out.
+    pub flag: i8,
+}
+
+/// `Flag` bit 0x1: "The thread has been readied from DPC (deferred procedure call)."
+pub const READY_FROM_DPC: i8 = 0x1;
+
+impl ReadyRec {
+    /// The thread that woke this one, when that can be said at all.
+    ///
+    /// The readying thread is not a documented field of the MOF class: it is the thread the event
+    /// was logged in the context of, which is what Windows Performance Analyzer shows as
+    /// "ReadyingThreadId". When the thread was readied from a DPC the processor was not running
+    /// that thread on anyone's behalf, and Microsoft's own `Flag` documentation is why this is
+    /// checked rather than guessed.
+    pub fn waker(&self) -> Option<u32> {
+        (self.flag & READY_FROM_DPC == 0 && self.by_tid != 0 && self.by_tid != self.tid).then_some(self.by_tid)
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct RoutineStat {
     pub count: u64,
@@ -229,6 +286,21 @@ pub struct Inner {
     pub samples: VecDeque<SampleRec>,
     pub tid_pid: HashMap<u32, u32>,
 
+    /// Context switches and thread wake-ups, kept only for `SWITCH_KEEP_MS` (see there).
+    pub switches: VecDeque<SwitchRec>,
+    pub readies: VecDeque<ReadyRec>,
+    /// How many of each arrived over the whole run, so the report can price them.
+    pub switch_events: u64,
+    pub ready_events: u64,
+    /// Set when the hard count cap threw records away, i.e. the ring no longer covers the window
+    /// it is supposed to. The analysis then says so instead of drawing a conclusion.
+    pub switches_overflowed: bool,
+    /// Trace time of the newest record the count cap threw away, from either ring.
+    pub ring_lost_until: Option<i64>,
+    /// Count caps for the two rings, from `switch_caps`; 0 means "use the floor".
+    pub switch_cap: usize,
+    pub ready_cap: usize,
+
     pub routines: HashMap<(u64, u8), RoutineStat>,
     /// Whole-run activity per DPC/ISR routine in `BEAT_MS` buckets, so a driver that wakes every
     /// few seconds for a moment can be seen even though the ring buffers above only reach 20 s
@@ -264,12 +336,90 @@ pub struct Shared {
     pub io_warn: i64,
     /// How much history the ring buffers keep.
     pub keep: i64,
+    /// Whether context switches and thread wake-ups are being recorded at all. Off in light mode
+    /// and under `--no-switches`; when off the session never asks for the events, so this only
+    /// guards the bookkeeping.
+    pub switches: bool,
     pub debug: bool,
 }
 
+/// How far back the context-switch rings reach, in ms of TRACE time.
+///
+/// What has to fit: a flagged moment looks 3 s back and 0.3 s forward, and is only analyzed once
+/// the trace has caught up past its end, so 3.3 s of history has to still be there at that point.
+/// A whole-PC freeze is ~1 s and is analyzed within ~0.4 s of its end. 6 s is that worst case
+/// with most of it again as headroom, and no more: this is the highest-volume class in the
+/// kernel logger and every extra second is megabytes.
+pub const SWITCH_KEEP_MS: f64 = 6000.0;
+
+/// Hard count caps, so a machine switching far faster than expected cannot grow the rings without
+/// limit before the time-based pruning next runs. These are the floor; `switch_caps` scales them
+/// with the processor count, because the rate does.
+pub const SWITCH_CAP: usize = 300_000;
+pub const READY_CAP: usize = 300_000;
+
+/// Records per logical CPU the rings may hold. MEASURED, not estimated: a 32-thread desktop doing
+/// ordinary work produced 141,000 context switches and 75,000 wake-ups per second (the tool's own
+/// 1 kHz probes on every CPU are about half of that), i.e. 4,400 and 2,400 per CPU per second, or
+/// 26,000 and 14,000 per CPU over the 6 s window. With the fixed 300,000 cap that machine kept 2 s
+/// of history and no flagged moment could ever be analyzed. 40,000 / 24,000 leaves headroom.
+const SWITCHES_PER_CPU: usize = 40_000;
+const READIES_PER_CPU: usize = 24_000;
+/// ...and a ceiling, so a 256-CPU server cannot ask for a quarter of a gigabyte: 2.5 M + 1.5 M
+/// records of 24 bytes is 96 MB worst case. Past this the window is simply shorter, and
+/// `switches_cover` says so per incident.
+const SWITCH_CAP_MAX: usize = 2_500_000;
+const READY_CAP_MAX: usize = 1_500_000;
+
+/// (switch cap, ready cap) for a machine with `ncpu` logical CPUs.
+pub fn switch_caps(ncpu: usize) -> (usize, usize) {
+    ((ncpu * SWITCHES_PER_CPU).clamp(SWITCH_CAP, SWITCH_CAP_MAX), (ncpu * READIES_PER_CPU).clamp(READY_CAP, READY_CAP_MAX))
+}
+
 impl Inner {
+    /// O(1) per event: push, then drop from the front if the cap is exceeded.
+    pub fn push_switch(&mut self, r: SwitchRec) {
+        self.switch_events += 1;
+        self.switches.push_back(r);
+        if self.switches.len() > self.switch_cap.max(SWITCH_CAP) {
+            let lost = self.switches.pop_front().map(|r| r.ts);
+            self.ring_lost_until = self.ring_lost_until.max(lost);
+            self.switches_overflowed = true;
+        }
+    }
+
+    pub fn push_ready(&mut self, r: ReadyRec) {
+        self.ready_events += 1;
+        self.readies.push_back(r);
+        if self.readies.len() > self.ready_cap.max(READY_CAP) {
+            let lost = self.readies.pop_front().map(|r| r.ts);
+            self.ring_lost_until = self.ring_lost_until.max(lost);
+            self.switches_overflowed = true;
+        }
+    }
+
+    /// Do the switch rings honestly reach back to `from`? Not if they were never filled, if the
+    /// count cap threw away a record from `from` or later, or if their (short) history no longer
+    /// covers it. Nothing may be read out of them otherwise: a missing wake-up record reverses a
+    /// conclusion.
+    ///
+    /// The cap only ever drops the OLDEST record, so everything after `ring_lost_until` is whole.
+    /// (Any overflow used to disqualify the rest of the run, which on a 32-CPU PC was all of it.)
+    pub fn switches_cover(&self, from: i64) -> bool {
+        self.ring_lost_until.is_none_or(|lost| lost < from)
+            && self.switches.front().is_some_and(|r| r.ts <= from)
+            && !self.readies.is_empty()
+    }
+
     pub fn prune(&mut self, keep: i64) {
         let cutoff = self.latest_ts - keep;
+        let switch_cutoff = self.latest_ts - crate::util::ms_to_ticks(SWITCH_KEEP_MS);
+        while self.switches.front().is_some_and(|r| r.ts < switch_cutoff) {
+            self.switches.pop_front();
+        }
+        while self.readies.front().is_some_and(|r| r.ts < switch_cutoff) {
+            self.readies.pop_front();
+        }
         while self.execs.front().is_some_and(|r| r.end < cutoff) {
             self.execs.pop_front();
         }
@@ -307,5 +457,100 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.buckets(), vec![0, 1, 63, 64, 4000, BEAT_BUCKETS - 1], "merging is a union, not a sum");
         assert_eq!(Beats::default().buckets(), Vec::<usize>::new());
+    }
+
+    fn sw(ts: i64, new_tid: u32) -> SwitchRec {
+        SwitchRec { ts, new_tid, old_tid: 0, cpu: 0, new_prio: 8, old_prio: 8, old_wait_reason: 0, old_wait_mode: 0, old_state: 5 }
+    }
+
+    /// The memory bounds stated next to the caps are only true if the records are this size.
+    #[test]
+    fn switch_records_stay_small_enough_for_the_stated_memory_bound() {
+        assert_eq!(std::mem::size_of::<SwitchRec>(), 24);
+        assert_eq!(std::mem::size_of::<ReadyRec>(), 24);
+        const { assert!((SWITCH_CAP_MAX + READY_CAP_MAX) * 24 <= 96 << 20, "the two rings must stay under 96 MB") };
+    }
+
+    #[test]
+    fn the_caps_follow_the_processor_count_between_a_floor_and_a_ceiling() {
+        assert_eq!(switch_caps(4), (SWITCH_CAP, READY_CAP), "a small PC keeps the floor");
+        assert_eq!(switch_caps(32), (1_280_000, 768_000));
+        // The rate measured on that 32-thread PC, over the whole 6 s window, has to fit.
+        assert!(switch_caps(32).0 >= 141_000 * 6 && switch_caps(32).1 >= 75_000 * 6);
+        assert_eq!(switch_caps(1024), (SWITCH_CAP_MAX, READY_CAP_MAX));
+        let mut inner = Inner { switch_cap: SWITCH_CAP + 5, ..Inner::default() };
+        for i in 0..(SWITCH_CAP as i64 + 5) {
+            inner.push_switch(sw(i, 1));
+        }
+        assert!(!inner.switches_overflowed, "the configured cap is the one that counts");
+    }
+
+    #[test]
+    fn the_switch_rings_wrap_keep_order_and_admit_when_they_dropped_something() {
+        let mut inner = Inner::default();
+        for i in 0..(SWITCH_CAP as i64 + 10) {
+            inner.push_switch(sw(i, i as u32));
+        }
+        assert_eq!(inner.switches.len(), SWITCH_CAP);
+        assert_eq!(inner.switch_events, SWITCH_CAP as u64 + 10);
+        assert_eq!(inner.switches.front().unwrap().ts, 10, "the oldest went first");
+        assert_eq!(inner.switches.back().unwrap().ts, SWITCH_CAP as i64 + 9);
+        assert!(inner.switches.iter().zip(inner.switches.iter().skip(1)).all(|(a, b)| a.ts < b.ts), "still in order");
+        assert!(inner.switches_overflowed, "dropping records has to be admitted, not hidden");
+        assert_eq!(inner.ring_lost_until, Some(9));
+
+        let mut small = Inner::default();
+        small.push_switch(sw(1, 7));
+        small.push_ready(ReadyRec { ts: 2, tid: 7, by_tid: 9, cpu: 0, flag: 0 });
+        assert!(!small.switches_overflowed);
+        assert_eq!((small.switch_events, small.ready_events), (1, 1));
+    }
+
+    /// The switch rings keep far less history than the other ring buffers, and pruning must not
+    /// touch the longer-lived ones early (or leave the short ones long).
+    #[test]
+    fn pruning_uses_the_short_window_for_switches_and_the_long_one_for_everything_else() {
+        let mut inner = Inner::default();
+        let long_ago = -crate::util::ms_to_ticks(10_000.0);
+        inner.push_switch(sw(long_ago, 1));
+        inner.push_switch(sw(-crate::util::ms_to_ticks(1000.0), 2));
+        inner.push_ready(ReadyRec { ts: long_ago, tid: 1, by_tid: 0, cpu: 0, flag: 0 });
+        inner.samples.push_back(SampleRec { ts: long_ago, cpu: 0, tid: 1, ip: 0 });
+        inner.latest_ts = 0;
+        inner.prune(crate::util::ms_to_ticks(20_000.0));
+        assert_eq!(inner.switches.len(), 1, "only the record older than 6 s went");
+        assert_eq!(inner.switches.front().unwrap().new_tid, 2);
+        assert!(inner.readies.is_empty());
+        assert_eq!(inner.samples.len(), 1, "20 s of samples are still kept");
+    }
+
+    /// The rings only reach a few seconds back, so whether they cover a window has to be asked
+    /// before anything is read out of them.
+    #[test]
+    fn the_rings_admit_when_they_do_not_cover_a_window() {
+        let mut inner = Inner::default();
+        assert!(!inner.switches_cover(0), "nothing recorded covers nothing");
+        inner.push_switch(sw(100, 7));
+        assert!(!inner.switches_cover(100), "switches without wake-ups cannot answer anything");
+        inner.push_ready(ReadyRec { ts: 110, tid: 7, by_tid: 0, cpu: 0, flag: 0 });
+        assert!(inner.switches_cover(100) && inner.switches_cover(500));
+        assert!(!inner.switches_cover(99), "one tick before the oldest record is not covered");
+        // The cap drops the oldest record only, so a window that starts after the last dropped
+        // record is whole, and one that starts at or before it is not.
+        inner.ring_lost_until = Some(99);
+        assert!(inner.switches_cover(100));
+        inner.ring_lost_until = Some(100);
+        assert!(!inner.switches_cover(100), "a record from inside the window was thrown away");
+    }
+
+    /// A DPC readies threads on nobody's behalf; Microsoft documents `Flag` 0x1 for exactly that.
+    #[test]
+    fn a_waker_is_only_named_when_there_really_was_one() {
+        let r = |by_tid, flag| ReadyRec { ts: 0, tid: 100, by_tid, cpu: 0, flag };
+        assert_eq!(r(55, 0).waker(), Some(55));
+        assert_eq!(r(55, READY_FROM_DPC).waker(), None, "readied from a DPC: no waking thread");
+        assert_eq!(r(55, 0x2).waker(), Some(55), "a swapped-out kernel stack says nothing about the waker");
+        assert_eq!(r(0, 0).waker(), None);
+        assert_eq!(r(100, 0).waker(), None, "a thread does not wake itself");
     }
 }

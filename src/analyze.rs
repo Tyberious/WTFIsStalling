@@ -12,11 +12,12 @@ use crate::files::{self, DosMap};
 use crate::health::{self, DriveHealth};
 use crate::intr::{self, Flow, Reference};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
-use crate::probe::{Stall, StallKind};
+use crate::probe::{ProbeTids, Stall, StallKind};
 use crate::procs::{process_name, ProcNames};
 use crate::quiet::Quieter;
 use crate::say;
 use crate::state::*;
+use crate::switches::{self, ProbeVerdict, ProbeWindow, RanInstead};
 use crate::topology::{topology, Topology};
 use crate::util::{clock, fmt_dur, ms_to_ticks, plural, qpc, ticks_to_ms};
 
@@ -95,6 +96,29 @@ pub(crate) struct FreezeFacts {
     /// A driver whose own DPC/ISR code really did cover the stall on most CPUs, if any.
     pub(crate) holding: Option<(String, usize)>,
     pub(crate) coincided: Option<Coincided>,
+    /// What the scheduler did to the measuring threads: were they woken at all? See `switches`.
+    pub(crate) probes: ProbeVerdict,
+}
+
+/// One program that was kept waiting at a moment that mattered, merged over every such moment.
+///
+/// Nothing here says WHY. A wait reason is a kind of wait and a waker is the thread that
+/// signalled: neither names a lock or a culprit, and the report must not either.
+#[derive(Clone, Debug, Default)]
+pub struct ProgramWait {
+    /// The process label of whatever held the processor during the longest ready-wait.
+    pub instead: Option<String>,
+    /// That processor had nothing else to do, which is a different problem entirely.
+    pub instead_idle: bool,
+    /// Longest stretch one of this program's threads was runnable and did not get a processor.
+    pub ready: i64,
+    /// Longest stretch one of them was blocked, start and end both inside the window.
+    pub blocked: i64,
+    pub blocked_reason: i8,
+    /// The program whose thread ended that block.
+    pub woken_by: Option<String>,
+    /// How many of the examined moments this program was kept waiting at.
+    pub moments: u32,
 }
 
 /// A storage event that overlapped a freeze. Never a cause, only a coincidence.
@@ -176,6 +200,12 @@ pub struct Analyzer {
     pub(crate) health_at_start: HashMap<u32, DriveHealth>,
     started: i64,
     profile: bool,
+    /// The threads doing the measuring, so the switch trace can be read against them.
+    probe_tids: Arc<ProbeTids>,
+    /// Programs kept waiting at flagged moments and CPU-starvation stalls, by program name.
+    pub(crate) program_waits: HashMap<String, ProgramWait>,
+    /// How many moments the program waits above were gathered from, so shares can be stated.
+    pub(crate) wait_moments: u32,
     pub(crate) incidents: Vec<IncidentSummary>,
     /// Recent wake-up delays under the stall threshold, newest last.
     minor: VecDeque<Stall>,
@@ -195,6 +225,9 @@ pub struct Analyzer {
     /// Events folded into roll-up lines rather than shown one by one.
     pub(crate) notable_folded: u64,
     pub(crate) notable_total: u64,
+    /// Flagged moments the thread-switch rings did not reach back far enough to explain.
+    pub(crate) switch_uncovered: std::sync::atomic::AtomicU32,
+    pub(crate) switch_gathers: std::sync::atomic::AtomicU32,
 }
 
 /// Everything ETW recorded around one incident, copied out so the lock is held briefly.
@@ -211,6 +244,14 @@ struct Evidence {
     ref_execs: Vec<ExecRec>,
     ref_seconds: f64,
     etw_caught_up: bool,
+    /// Context switches and wake-ups covering the window, in timestamp order. Empty when the
+    /// session is not tracing them (light mode, `--no-switches`, or Windows refusing).
+    switches: Vec<SwitchRec>,
+    readies: Vec<ReadyRec>,
+    /// The switch rings really do cover this window: they are being recorded, they were not
+    /// overflowed, and their (short) history still reaches back past `from`. When this is false
+    /// nothing may be concluded from them.
+    switches_cover: bool,
 }
 
 const BASELINE_MS: f64 = 500.0;
@@ -246,7 +287,7 @@ struct CpuStall {
 }
 
 impl Analyzer {
-    pub fn new(shared: Arc<Shared>, rx: Receiver<Stall>, modules: ModuleMap, profile: bool) -> Analyzer {
+    pub fn new(shared: Arc<Shared>, rx: Receiver<Stall>, modules: ModuleMap, profile: bool, probe_tids: Arc<ProbeTids>) -> Analyzer {
         MARKS.lock().unwrap().clear(); // anything flagged before this run started is not about this run
         let mut disks = DiskMap::new();
         let health_at_start = disks.present().into_iter().map(|n| (n, health::read(n, disks.get(n).bus))).collect();
@@ -264,6 +305,9 @@ impl Analyzer {
             health_at_start,
             started: qpc(),
             profile,
+            probe_tids,
+            program_waits: HashMap::new(),
+            wait_moments: 0,
             incidents: Vec::new(),
             minor: VecDeque::new(),
             marks_pending: Vec::new(),
@@ -277,6 +321,8 @@ impl Analyzer {
             notable_suppressed: 0,
             notable_folded: 0,
             notable_total: 0,
+            switch_uncovered: Default::default(),
+            switch_gathers: Default::default(),
         }
     }
 
@@ -285,6 +331,7 @@ impl Analyzer {
     /// need `self.modules`/`self.procs` and hand-built `Evidence` values.
     #[cfg(test)]
     pub fn for_test(modules: ModuleMap, procs: ProcNames, profile: bool) -> Analyzer {
+        let probe_tids = Arc::new(ProbeTids::default());
         let (_tx, rx) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner::default()),
@@ -292,6 +339,7 @@ impl Analyzer {
             fault_warn: ms_to_ticks(50.0),
             io_warn: ms_to_ticks(200.0),
             keep: ms_to_ticks(20_000.0),
+            switches: true,
             debug: false,
         });
         Analyzer {
@@ -308,6 +356,9 @@ impl Analyzer {
             health_at_start: HashMap::new(),
             started: qpc(),
             profile,
+            probe_tids,
+            program_waits: HashMap::new(),
+            wait_moments: 0,
             incidents: Vec::new(),
             minor: VecDeque::new(),
             marks_pending: Vec::new(),
@@ -321,6 +372,8 @@ impl Analyzer {
             notable_suppressed: 0,
             notable_folded: 0,
             notable_total: 0,
+            switch_uncovered: Default::default(),
+            switch_gathers: Default::default(),
         }
     }
 
@@ -420,7 +473,36 @@ impl Analyzer {
             }
         }
         let usable_ref = from - ref_from >= ms_to_ticks(REF_MIN_MS);
+        // The switch rings hold only a few seconds. They cover this window when they are being
+        // filled at all, nothing was thrown away by the count cap, and the oldest record still
+        // held is no newer than the start of what is being asked about. `wide_from` is the
+        // earliest instant any caller looks at.
+        //
+        // The extra lead is so that "which thread was already on this processor when the wait
+        // began" can be answered: that needs the last switch AT OR BEFORE the window, which on an
+        // idle processor could be much older. It does not need to be long, because this tool's own
+        // probe threads switch in on every processor every 1-2 ms for as long as a run lasts, so
+        // no processor goes a quarter of a second without a switch record while it is measuring.
+        let switch_from = wide_from.min(from) - ms_to_ticks(250.0);
+        let switches_cover = self.shared.switches && inner.switches_cover(switch_from);
+        if self.shared.switches {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.switch_gathers.fetch_add(1, Relaxed);
+            if !switches_cover {
+                self.switch_uncovered.fetch_add(1, Relaxed);
+            }
+        }
+        let switches: Vec<SwitchRec> = if switches_cover {
+            inner.switches.iter().filter(|r| r.ts >= switch_from && r.ts <= to).copied().collect()
+        } else {
+            Vec::new()
+        };
+        let readies: Vec<ReadyRec> =
+            if switches_cover { inner.readies.iter().filter(|r| r.ts >= switch_from && r.ts <= to).copied().collect() } else { Vec::new() };
         Evidence {
+            switches,
+            readies,
+            switches_cover,
             execs: inner.execs.iter().filter(|e| e.end >= from && e.start <= to).copied().collect(),
             faults: inner.faults.iter().filter(|f| f.end >= wide_from && f.start <= to).copied().collect(),
             ios: inner.ios.iter().filter(|i| i.end >= wide_from && i.end - i.dur <= to).copied().collect(),
@@ -493,26 +575,199 @@ impl Analyzer {
             say!("    event seen twice, counted once.");
         }
 
+        // What the scheduler did to the measuring threads themselves. This is the one thing that
+        // separates "nothing woke them" (a timer/clock/platform problem) from "they were woken
+        // and not given a processor" (a scheduler or platform one), which the field logs in
+        // issue #15 could not tell apart.
+        let probes = self.judge_probes(&all, &ev);
+        self.print_probes(&probes, class);
+
         let mut freeze = None;
         let mut on_cpu = None;
         let culprit = match class {
             IncidentClass::Freeze => {
-                let (culprit, facts) = self.verdict_freeze(kernel, &ev, ncpu, start, end);
+                let (culprit, mut facts) = self.verdict_freeze(kernel, &ev, ncpu, start, end);
+                facts.probes = probes.clone();
                 freeze = Some(facts);
                 culprit
             }
             IncidentClass::Kernel => {
-                let (culprit, who) = self.verdict_kernel(kernel, &ev);
+                let (culprit, who) = self.verdict_kernel(kernel, &ev, &probes);
                 on_cpu = who;
                 culprit
             }
-            IncidentClass::Starvation => self.verdict_sched(&ev, start, end),
+            IncidentClass::Starvation => self.verdict_sched(&ev, start, end, &probes),
         };
         self.print_io_context(&ev);
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
+        // A normal-priority thread that could not get a processor is exactly the position an app
+        // or a game is in, so the same window is worth asking who else was kept waiting.
+        if class == IncidentClass::Starvation {
+            self.collect_waits(start - ms_to_ticks(100.0), end);
+        }
         self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, on_cpu, freeze });
+    }
+
+    /// One `ProbeWindow` per late wake-up in this cluster, and the outcome of each.
+    ///
+    /// A stall record says which processor was late and when; the probe thread on that processor
+    /// is looked up in the list the probes registered themselves in. A stall whose thread is not
+    /// known (the scheduler probe before it has registered, a processor the child never started a
+    /// probe for) is left out rather than guessed at.
+    fn judge_probes(&self, stalls: &[Stall], ev: &Evidence) -> ProbeVerdict {
+        if !ev.switches_cover {
+            return ProbeVerdict::default();
+        }
+        let threads = self.probe_tids.all();
+        let mut windows = Vec::new();
+        for s in stalls {
+            let found = match s.cpu {
+                Some(cpu) => threads.iter().find(|t| t.cpu == Some(cpu)),
+                // The unpinned scheduler probe is the only probe thread with no processor.
+                None => threads.iter().find(|t| t.cpu.is_none()),
+            };
+            if let Some(t) = found {
+                windows.push(ProbeWindow { tid: t.tid, cpu: t.cpu, start: s.start, end: s.end });
+            }
+        }
+        switches::judge_probes(&ev.switches, &ev.readies, &windows)
+    }
+
+    /// The three-way answer, in the event log, in plain words.
+    fn print_probes(&mut self, v: &ProbeVerdict, class: IncidentClass) {
+        if v.empty() {
+            return;
+        }
+        let n = v.judged();
+        // "1 of the 8 measuring threads was" / "7 of the 8 measuring threads were".
+        let threads = |k: usize| format!("{k} of the {n} measuring thread{} {}", plural(n as u64), if k == 1 { "was" } else { "were" });
+        if v.late > 0 {
+            say!(
+                "    SCHEDULER: {} never made runnable until {} into it: nothing woke {}. The timer that wakes",
+                threads(v.late),
+                fmt_dur(v.worst_delay),
+                if v.late == 1 { "it" } else { "them" }
+            );
+            say!("               them did not fire, which is the clock, the firmware or power management - below the scheduler.");
+        }
+        if v.queued > 0 {
+            let idle = v.on_idle_cpu;
+            say!("    SCHEDULER: {} made runnable on time and then did not get a processor.", threads(v.queued));
+            // Facts only. What kept the thread off its processor is the VERDICT's business: a DPC
+            // or ISR runs on top of whatever thread was there (the idle thread included) and no
+            // context switch records it, so this block alone cannot tell a driver from the platform.
+            if idle > 0 {
+                say!("               On {idle} of those no other thread took the processor: its record shows only the idle thread.");
+            }
+            for (tid, prio, held) in v.instead.iter().take(3) {
+                let who = self.procs.label(self.pid_of(*tid), *tid);
+                say!("               Thread on that processor meanwhile: {who} (priority {prio}) for {}", fmt_dur(*held));
+            }
+            if class != IncidentClass::Starvation {
+                say!("               No thread outranks a measuring thread, so what kept it off is interrupt-level work (a DPC or");
+                say!("               ISR, which no thread switch records) or the platform. The verdict below says which, if it can.");
+            }
+        }
+        if v.blocked > 0 {
+            let reasons: Vec<&str> = v.reasons.iter().filter_map(|r| switches::wait_reason_name(*r)).collect();
+            let why = if reasons.is_empty() { String::new() } else { format!(" ({})", reasons.join("; ")) };
+            say!(
+                "    SCHEDULER: {} woken on time, ran, and then had to wait again{why}, so this is that wait, not a held processor.",
+                threads(v.blocked)
+            );
+        }
+        if class == IncidentClass::Freeze && v.late == n && n > 0 {
+            say!("               No measuring thread anywhere on this PC was woken: whatever stopped is common to every processor.");
+        }
+    }
+
+    /// The switch and wake-up records covering `[from, to]`, or `None` when the rings cannot
+    /// honestly cover that window (not being recorded, or the count cap threw records away).
+    /// Same test as `gather`, and the same 250 ms lead for "who was already on this processor".
+    fn gather_switches(&self, from: i64, to: i64) -> Option<(Vec<SwitchRec>, Vec<ReadyRec>)> {
+        if !self.shared.switches {
+            return None;
+        }
+        let inner = self.shared.inner.lock().unwrap();
+        let start = from - ms_to_ticks(250.0);
+        if !inner.switches_cover(start) {
+            return None;
+        }
+        Some((
+            inner.switches.iter().filter(|r| r.ts >= start && r.ts <= to).copied().collect(),
+            inner.readies.iter().filter(|r| r.ts >= start && r.ts <= to).copied().collect(),
+        ))
+    }
+
+    fn pid_of(&self, tid: u32) -> u32 {
+        self.shared.inner.lock().unwrap().tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN)
+    }
+
+    /// Who else was kept waiting in this window, merged into `program_waits` by program name.
+    ///
+    /// Only waits long enough for a person to notice, and only for programs: the idle thread and
+    /// this tool's own two processes are dropped. Nothing here is a culprit.
+    /// The window is its own, not the one the DPC/sample evidence was gathered over: a flagged
+    /// moment reaches three seconds back and a little past the mark, while the evidence around it
+    /// is cut to the worst interruption inside that. Both are right for what they answer.
+    fn collect_waits(&mut self, from: i64, to: i64) {
+        let Some((sw, rd)) = self.gather_switches(from, to) else { return };
+        self.wait_moments += 1;
+        let rows = switches::waits(&sw, &rd, from, to);
+        let ready_floor = ms_to_ticks(switches::FELT_READY_MS);
+        let blocked_floor = ms_to_ticks(switches::FELT_BLOCKED_MS);
+        let blocked_ceiling = ms_to_ticks(switches::MAX_BLOCKED_MS);
+        let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+        // Every program named in one window is counted once, however many of its threads waited.
+        let mut seen: HashSet<String> = HashSet::new();
+        for w in rows {
+            let ready = if w.ready >= ready_floor { w.ready } else { 0 };
+            let long_enough = w.blocked >= blocked_floor && w.blocked <= blocked_ceiling;
+            let blocked = if long_enough && !switches::voluntary_wait(w.blocked_reason) { w.blocked } else { 0 };
+            if ready == 0 && blocked == 0 {
+                continue;
+            }
+            let pid = self.pid_of(w.tid);
+            if pid == 0 || pid == PID_UNKNOWN {
+                continue; // the idle thread, or a thread that ended before it could be named
+            }
+            let label = self.procs.label(pid, w.tid);
+            let name = process_name(&label);
+            if own.as_ref().is_some_and(|own| name.to_lowercase().starts_with(own)) {
+                continue; // the tool measuring itself
+            }
+            let instead =
+                if ready > 0 { switches::held_by(&sw, w.ready_cpu, w.ready_from, w.ready_to, w.tid) } else { RanInstead::Unknown };
+            let (instead_name, instead_idle) = match instead {
+                RanInstead::Idle => (None, true),
+                RanInstead::Thread { tid, .. } => {
+                    let pid = self.pid_of(tid);
+                    ((pid != PID_UNKNOWN).then(|| process_name(&self.procs.label(pid, tid))), false)
+                }
+                RanInstead::Unknown => (None, false),
+            };
+            let woken_by = w.woken_by.and_then(|tid| {
+                let pid = self.pid_of(tid);
+                (pid != PID_UNKNOWN && pid != 0).then(|| process_name(&self.procs.label(pid, tid)))
+            });
+            let fresh = seen.insert(name.clone());
+            let e = self.program_waits.entry(name).or_default();
+            if fresh {
+                e.moments += 1;
+            }
+            if ready > e.ready {
+                e.ready = ready;
+                e.instead = instead_name;
+                e.instead_idle = instead_idle;
+            }
+            if blocked > e.blocked {
+                e.blocked = blocked;
+                e.blocked_reason = w.blocked_reason;
+                e.woken_by = woken_by;
+            }
+        }
     }
 
     /// "4" on an ordinary PC; "4 (E-core)" where the cores are not all the same. Nothing is
@@ -605,8 +860,14 @@ impl Analyzer {
         );
         let lead = start - ms_to_ticks(0.5);
         let ev = self.gather(lead, end, from, lead - ms_to_ticks(REF_MS), caught_up);
-        let (culprit, on_cpu) = self.verdict_kernel(&cluster, &ev);
+        let probes = self.judge_probes(&cluster, &ev);
+        self.print_probes(&probes, IncidentClass::Kernel);
+        let (culprit, on_cpu) = self.verdict_kernel(&cluster, &ev, &probes);
         self.print_io_context(&ev);
+        // The whole window the person flagged, not just the worst interruption in it: a hitch
+        // someone feels is usually a program waiting, not a processor being held.
+        self.collect_waits(from, to);
+        self.print_waits();
         let mut cpus: Vec<u16> = cluster.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
@@ -620,6 +881,27 @@ impl Analyzer {
             on_cpu,
             freeze: None,
         });
+    }
+
+    /// The three worst programs kept waiting, for the event-log entry of a flagged moment.
+    fn print_waits(&mut self) {
+        let mut rows: Vec<(String, ProgramWait)> = self.program_waits.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        rows.sort_by_key(|(name, w)| (std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
+        for (name, w) in rows.iter().take(3) {
+            if w.ready > 0 {
+                let instead = if w.instead_idle {
+                    " while the processor had nothing else to do".to_string()
+                } else {
+                    w.instead.as_ref().map(|i| format!(" while {i} held the processor")).unwrap_or_default()
+                };
+                say!("    Kept waiting: {name} was ready to run but got no processor for {}{instead}", fmt_dur(w.ready));
+            }
+            if w.blocked > 0 {
+                let why = switches::wait_reason_name(w.blocked_reason).map(|r| format!(" ({r})")).unwrap_or_default();
+                let by = w.woken_by.as_ref().map(|b| format!(", woken by {b}")).unwrap_or_default();
+                say!("    Kept waiting: {name} was blocked for {}{why}{by}", fmt_dur(w.blocked));
+            }
+        }
     }
 
     /// The one place a file path turns into report text: NT device path -> drive letter, then
@@ -736,7 +1018,7 @@ impl Analyzer {
 
     /// Returns the culprit, and the program that held the CPU through the stall when one clearly
     /// did. See `IncidentSummary::on_cpu`.
-    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> (String, Option<String>) {
+    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence, probes: &ProbeVerdict) -> (String, Option<String>) {
         let look = self.look(stalls, ev);
         let cpus = look.per_cpu.len();
         // Ordinary DPCs running right through the stall on most of the stalled CPUs means no CPU
@@ -781,9 +1063,25 @@ impl Analyzer {
             say!("    VERDICT: no CPU was held. Ordinary DPCs kept executing on the stalled CPU(s) right through this, which cannot");
             say!("             happen at raised IRQL, so the measuring thread was simply not woken: timer delivery or scheduling.");
             say!("             Whatever the CPU samples landed in was interrupted too, and is not the cause.");
-            "not woken (timers or scheduling)".to_string()
+            // The scheduler trace says which of the two it was, when it can.
+            not_woken_culprit(probes, "not woken (timers or scheduling)")
         } else {
-            say!("    VERDICT: no clear culprit in the trace (DPC/ISR covered at most {:.0}% of the stall)", look.best_coverage * 100.0);
+            // "covered at most 99%" next to "no clear culprit" reads as a contradiction unless it
+            // says the rest: one processor was covered and most of the stalled ones were not.
+            let covered = look.per_cpu.iter().filter(|c| c.coverage >= COVER_RULE).count();
+            if covered > 0 && look.per_cpu.len() > 1 {
+                say!(
+                    "    VERDICT: no clear culprit in the trace (DPC/ISR code explains {covered} of the {} stalled CPUs, up to {:.0}% of \
+                     the stall there, and not the rest)",
+                    look.per_cpu.len(),
+                    look.best_coverage * 100.0
+                );
+            } else {
+                say!(
+                    "    VERDICT: no clear culprit in the trace (DPC/ISR covered at most {:.0}% of the stall)",
+                    look.best_coverage * 100.0
+                );
+            }
             "unexplained".to_string()
         };
 
@@ -962,7 +1260,7 @@ impl Analyzer {
         (silent, continued, intr::flow(&timer_reference, timer_in, stall_s).map(|(f, _)| f))
     }
 
-    fn verdict_sched(&mut self, ev: &Evidence, start: i64, end: i64) -> String {
+    fn verdict_sched(&mut self, ev: &Evidence, start: i64, end: i64, probes: &ProbeVerdict) -> String {
         let all: Vec<&(SampleRec, u32)> = ev.samples.iter().collect();
         let (procs, mods) = self.sample_breakdown(&all);
         let idle = procs.iter().find(|(p, _)| p == "Idle").map(|(_, s)| *s).unwrap_or(0.0);
@@ -1005,11 +1303,10 @@ impl Analyzer {
             }
         } else {
             say!(
-                "    VERDICT: the CPUs were {:.0}% idle and nothing in this trace explains the delay. The cause is not visible",
+                "    VERDICT: the CPUs were {:.0}% idle. It is not CPU load, and no disk request or page fault lines up with it.",
                 idle * 100.0
             );
-            say!("             yet: it is not CPU load, and no disk request or page fault lines up with it.");
-            "scheduling delay with idle CPUs".to_string()
+            not_woken_culprit(probes, "scheduling delay with idle CPUs")
         };
         self.print_on_cpu(&busy, &mods);
         culprit
@@ -1256,6 +1553,20 @@ impl Analyzer {
     }
 }
 
+/// The culprit for a stall where no processor was held, sharpened by the scheduler trace.
+///
+/// Without context switches all that can be said is "the thread was not woken, for one of two
+/// reasons"; with them the two are told apart, and they lead to different places. `fallback` is
+/// what the caller would have said on its own, and is what comes back when the measuring threads
+/// disagree or nothing could be reconstructed.
+pub(crate) fn not_woken_culprit(probes: &ProbeVerdict, fallback: &str) -> String {
+    match probes.overall() {
+        Some(switches::Verdict::NotWoken) => "not woken (nothing woke the thread)".to_string(),
+        Some(switches::Verdict::Queued) => "not woken (ready, but given no processor)".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
 fn span_of(stalls: &[Stall]) -> (i64, i64) {
     (stalls.iter().map(|s| s.start).min().unwrap_or(0), stalls.iter().map(|s| s.end).max().unwrap_or(0))
 }
@@ -1396,7 +1707,16 @@ mod tests {
             ref_execs: Vec::new(),
             ref_seconds: 0.0,
             etw_caught_up: true,
+            switches: Vec::new(),
+            readies: Vec::new(),
+            switches_cover: false,
         }
+    }
+
+    /// No context-switch trace, so the scheduler can say nothing: the verdicts below are the
+    /// ones this tool reaches from DPC/ISR and CPU samples alone.
+    fn no_probes() -> ProbeVerdict {
+        ProbeVerdict::default()
     }
 
     const MOD_A: u64 = KERNEL_SPACE + 0x1_0000;
@@ -1409,7 +1729,7 @@ mod tests {
         let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![dpc(0, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver nvlddmkm.sys");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "driver nvlddmkm.sys");
     }
 
     #[test]
@@ -1419,7 +1739,7 @@ mod tests {
         let s = stall(0, 0.0, 100.0);
         // Same DPC, same size, but it ran on CPU 1 while the probe stalled on CPU 0.
         let ev = evidence(vec![dpc(1, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1429,7 +1749,7 @@ mod tests {
         let s = stall(0, 0.0, 100.0);
         // 34% covered: just below the 35% rule-1 threshold.
         let ev = evidence(vec![dpc(0, 0.0, 34.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1441,7 +1761,7 @@ mod tests {
         // window. Neither driver's own code reaches the 35% bar, and the two must not be added
         // together into one: the honest answer is that nothing explains the stall.
         let ev = evidence(vec![dpc(0, 0.0, 20.0, MOD_A + 0x10), isr(0, 0.0, 20.0, MOD_B + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     /// The dilution bug from the verdict audit: on a multi-CPU cluster, coverage used to be
@@ -1454,12 +1774,12 @@ mod tests {
         // of the cluster and now correctly reads as "it held both of them".
         let stalls = [stall(0, 0.0, 10.0), stall(1, 0.0, 10.0)];
         let ev = evidence(vec![dpc(0, 0.0, 9.0, MOD_A + 0x10), dpc(1, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&stalls, &ev).0, "driver nvlddmkm.sys");
+        assert_eq!(az.verdict_kernel(&stalls, &ev, &no_probes()).0, "driver nvlddmkm.sys");
 
         // Holding ONE of eight CPUs is not an explanation for an eight-CPU event.
         let stalls: Vec<Stall> = (0..8).map(|c| stall(c, 0.0, 10.0)).collect();
         let ev = evidence(vec![dpc(3, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&stalls, &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&stalls, &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1470,12 +1790,12 @@ mod tests {
         let ev = evidence(vec![], vec![], baseline);
 
         let mut profiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
-        let v = profiled.verdict_kernel(&[s], &ev);
+        let v = profiled.verdict_kernel(&[s], &ev, &no_probes());
         assert!(v.0.starts_with("CPU went dark"), "expected 'CPU went dark...', got {v:?}");
 
         // Same evidence, but sampling wasn't enabled: it must not claim the CPU went dark.
         let mut unprofiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
-        assert_eq!(unprofiled.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(unprofiled.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     /// From the field logs: "the CPU went dark, Windows itself was frozen out" printed for a
@@ -1491,7 +1811,7 @@ mod tests {
         let execs: Vec<ExecRec> = (0..800).map(|i| dpc(0, i as f64, 0.01, MOD_A + 0x10)).collect();
         let ev = evidence(execs, vec![], baseline);
         let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), true);
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "not woken (timers or scheduling)");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "not woken (timers or scheduling)");
     }
 
     #[test]
@@ -1502,7 +1822,7 @@ mod tests {
         let s = stall(0, 0.0, 2.0);
         let ev = evidence(vec![], vec![], baseline);
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1519,7 +1839,7 @@ mod tests {
             sample(0, 50.0, USER_IP, 300),
         ];
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver rtwlane.sys");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "driver rtwlane.sys");
     }
 
     /// The behavior that was right and has to survive: one core held for 8 ms with a network
@@ -1533,7 +1853,7 @@ mod tests {
         let mut samples: Vec<(SampleRec, u32)> = (0..9).map(|i| sample(5, i as f64, MOD_B + 0x10, 4)).collect();
         samples.push(sample(5, 9.0, USER_IP, 4));
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver NETIO.SYS");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "driver NETIO.SYS");
     }
 
     #[test]
@@ -1549,7 +1869,7 @@ mod tests {
             sample(0, 50.0, USER_IP, 300),
         ];
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "process game.exe (200)");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "process game.exe (200)");
     }
 
     /// A share of nearly nothing is not evidence. Two samples in a stall cannot name a culprit.
@@ -1559,7 +1879,7 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![], vec![sample(0, 10.0, USER_IP, 200), sample(0, 20.0, USER_IP, 200)], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1567,7 +1887,7 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "unexplained");
     }
 
     #[test]
@@ -1589,14 +1909,14 @@ mod tests {
     fn sched_without_profiling_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(500, "app.exe")]), false);
         let ev = evidence(vec![], vec![sample(0, 1.0, USER_IP, 500)], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "CPU starvation (unattributed)");
     }
 
     #[test]
     fn sched_with_no_samples_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let ev = evidence(vec![], vec![], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "CPU starvation (unattributed)");
     }
 
     #[test]
@@ -1606,7 +1926,7 @@ mod tests {
         let mut samples: Vec<(SampleRec, u32)> = (0..8).map(|i| sample(0, i as f64, USER_IP, 500)).collect();
         samples.extend((0..2).map(|i| sample(0, i as f64, USER_IP, 0))); // Idle: 2/10 = 20% < 25%
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0)), "process app.exe (500)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "process app.exe (500)");
     }
 
     /// A late wake-up with idle CPUs is not "a scheduling quirk, ignore it": when a disk request
@@ -1622,10 +1942,10 @@ mod tests {
             s
         };
         let mut ev = evidence(vec![], idle_samples(), HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0)), "scheduling delay with idle CPUs");
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "scheduling delay with idle CPUs");
 
         ev.ios = vec![IoRec { end: ms(1883.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0 }];
-        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0)), "disk 5");
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "disk 5");
     }
 
     // --- the twin merge --------------------------------------------------------------------

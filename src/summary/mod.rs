@@ -576,6 +576,8 @@ impl Analyzer {
     /// * `storage::slow_disks` introduces "disk <n>" as a slow disk. `storage::event_log` and
     ///   `storage::drive_health` note on that key and only fall back to creating it (with a
     ///   different title) when the disk was not slow, so they must run after it.
+    /// * `stalls::one_program_waits` introduces its own "waiting <program>" keys and notes on
+    ///   nothing, so its only constraint is the group it runs under.
     /// * `hardware::whea` notes on the "CPU went dark ..." keys, which only exist if the two
     ///   stall sections have run.
     /// * `hardware::unexpected_shutdowns` notes on "whea fatal", so `hardware::whea` goes first:
@@ -620,6 +622,7 @@ impl Analyzer {
         cx.found.in_group(Group::OneProgram);
         gpu::driver_resets(&mut cx);
         gpu::graphics(&mut cx);
+        stalls::one_program_waits(&mut cx);
         cx.found.in_group(Group::Health);
         hardware::whea(&mut cx);
         hardware::unexpected_shutdowns(&mut cx);
@@ -739,11 +742,9 @@ mod tests {
     fn the_tools_own_cost_is_reported_and_never_flips_the_banner() {
         use crate::modules::ModuleMap;
         use crate::procs::ProcNames;
-        use std::sync::atomic::{AtomicBool, AtomicI64};
-        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
-        let stats =
-            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
         let run = |overhead, light, lost| {
             let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
             az.shared.inner.lock().unwrap().events = 90_000;
@@ -791,8 +792,7 @@ mod tests {
         use crate::analyze::IncidentSummary;
         use crate::modules::ModuleMap;
         use crate::procs::ProcNames;
-        use std::sync::atomic::{AtomicBool, AtomicI64};
-        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let flagged = |culprit: &str| IncidentSummary {
@@ -809,8 +809,7 @@ mod tests {
         az.incidents.push(flagged("unexplained"));
         az.incidents.push(flagged("driver nvlddmkm.sys"));
         az.marks_total = 3;
-        let stats =
-            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
         let summary = az.summarize(RunData {
             elapsed_s: 60.0,
             events_lost: 0,
@@ -838,8 +837,7 @@ mod tests {
         use crate::analyze::IncidentSummary;
         use crate::modules::ModuleMap;
         use crate::procs::ProcNames;
-        use std::sync::atomic::{AtomicBool, AtomicI64};
-        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let freq = crate::util::qpc_freq();
@@ -861,8 +859,7 @@ mod tests {
         for k in 0..6 {
             az.incidents.push(stall("driver NETIO.SYS", 60 * k));
         }
-        let stats =
-            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
         let summary = az.summarize(RunData {
             elapsed_s: 400.0,
             events_lost: 0,
@@ -882,6 +879,184 @@ mod tests {
         assert!(netio.evidence.iter().any(|e| e.contains("keep time")), "{:?}", netio.evidence);
         assert!(netio.advice.contains("something software-driven runs on a timer"), "{}", netio.advice);
         assert!(netio.advice.contains("iCUE") && netio.advice.contains("HWiNFO"), "product names keep their case: {}", netio.advice);
+    }
+
+    /// Deliverable 2: at the moments the user flagged, who was kept waiting, by what, and who
+    /// woke them - said without ever naming a cause, and without telling anyone to close Windows.
+    #[test]
+    fn programs_kept_waiting_are_reported_without_naming_a_culprit() {
+        use crate::analyze::ProgramWait;
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::AtomicBool;
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        az.wait_moments = 3;
+        // A game queued behind an RGB utility; the advice has to be about the RGB utility.
+        az.program_waits.insert(
+            "game.exe".into(),
+            ProgramWait { ready: ms_to_ticks(180.0), instead: Some("iCUE.exe".into()), moments: 3, ..ProgramWait::default() },
+        );
+        // Part of Windows, blocked and woken by another part of Windows.
+        az.program_waits.insert(
+            "svchost.exe".into(),
+            ProgramWait {
+                blocked: ms_to_ticks(300.0),
+                blocked_reason: 13, // WrUserRequest
+                woken_by: Some("audiodg.exe".into()),
+                moments: 2,
+                ..ProgramWait::default()
+            },
+        );
+        // Ready and waiting on a processor with nothing else to do: not contention at all.
+        az.program_waits
+            .insert("dwm.exe".into(), ProgramWait { ready: ms_to_ticks(120.0), instead_idle: true, moments: 1, ..ProgramWait::default() });
+        // Just over the "you can feel it" floor: a lead, not a suspect.
+        az.program_waits.insert("notepad.exe".into(), ProgramWait { ready: ms_to_ticks(30.0), moments: 1, ..ProgramWait::default() });
+
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
+        let summary = az.summarize(RunData {
+            elapsed_s: 400.0,
+            events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+        });
+        let f = |key: &str| summary.findings.iter().find(|f| f.key == key).unwrap_or_else(|| panic!("no finding for {key}"));
+
+        let game = f("waiting game.exe");
+        assert_eq!((game.group, game.severity), (Group::OneProgram, Severity::Medium));
+        assert!(game.evidence[0].contains("ready to run and got no processor for 180"), "{:?}", game.evidence);
+        assert!(game.evidence[0].contains("at 3 of the 3 moments"), "{:?}", game.evidence);
+        assert!(game.evidence[0].contains("while iCUE.exe held that processor"), "{:?}", game.evidence);
+        assert!(game.metrics.iter().any(|m| m.label == "longest wait for a processor"), "{:?}", game.metrics);
+
+        let sv = f("waiting svchost.exe");
+        assert!(sv.evidence[0].contains("blocked for 300"), "{:?}", sv.evidence);
+        assert!(sv.evidence[0].contains("woken by a thread in audiodg.exe"), "{:?}", sv.evidence);
+        assert!(sv.evidence[0].contains("not in this trace"), "it says how long, never why: {:?}", sv.evidence);
+
+        let dwm = f("waiting dwm.exe");
+        assert!(dwm.evidence[0].contains("nothing else to do at all"), "{:?}", dwm.evidence);
+        assert!(dwm.advice.contains("closing programs will not help"), "{}", dwm.advice);
+
+        assert_eq!(f("waiting notepad.exe").severity, Severity::Low, "30 ms is a lead, not a suspect");
+
+        for key in ["waiting game.exe", "waiting svchost.exe", "waiting dwm.exe", "waiting notepad.exe"] {
+            let f = f(key);
+            assert!(f.severity < Severity::High, "{key}: a symptom with no culprit must never set the banner");
+            // The audience rule: nothing here may read as blame, or as "close this bit of Windows".
+            let text = format!("{} {} {}", f.title, f.evidence.join(" "), f.advice);
+            for forbidden in ["blame", "culprit", "caused by", "responsible for"] {
+                assert!(!text.to_lowercase().contains(forbidden), "{key} says '{forbidden}': {text}");
+            }
+        }
+        // svchost and dwm are Windows; neither may be described as a program to close, and the
+        // report says as much where a reader will see it.
+        for key in ["waiting svchost.exe", "waiting dwm.exe"] {
+            let f = f(key);
+            assert!(!f.advice.to_lowercase().contains("close this program"), "{}", f.advice);
+            assert!(f.evidence.iter().any(|e| e.contains("part of Windows")), "{:?}", f.evidence);
+        }
+        assert!(!f("waiting game.exe").evidence.iter().any(|e| e.starts_with("What game.exe is")), "nothing to say about a plain app");
+        assert!(summary.result_lines().iter().all(|l| l.chars().count() <= WIDTH), "{:?}", summary.result_lines());
+    }
+
+    /// Everything read from the thread-switch trace is a chain, so a gap in it can flip a
+    /// conclusion rather than blur it. When events were lost, or switches were never traced at
+    /// all, none of it may reach the report.
+    #[test]
+    fn a_trace_with_gaps_produces_no_scheduler_findings_at_all() {
+        use crate::analyze::{FreezeFacts, IncidentSummary, ProgramWait};
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use crate::switches::ProbeVerdict;
+        use std::sync::atomic::AtomicBool;
+
+        // `lost` events, and whether switches were traced at all.
+        let report = |lost: u32, traced: bool| {
+            let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+            az.shared = std::sync::Arc::new(crate::state::Shared {
+                inner: std::sync::Mutex::new(crate::state::Inner::default()),
+                exec_warn: ms_to_ticks(1.0),
+                fault_warn: ms_to_ticks(50.0),
+                io_warn: ms_to_ticks(200.0),
+                keep: ms_to_ticks(20_000.0),
+                switches: traced,
+                debug: false,
+            });
+            az.wait_moments = 1;
+            az.program_waits.insert("game.exe".into(), ProgramWait { ready: ms_to_ticks(180.0), moments: 1, ..ProgramWait::default() });
+            az.incidents.push(IncidentSummary {
+                class: IncidentClass::Freeze,
+                start: qpc() - 60 * crate::util::qpc_freq(),
+                dur: ms_to_ticks(900.0),
+                culprit: "whole-PC freeze".into(),
+                marked: false,
+                cpus: (0..8).collect(),
+                on_cpu: None,
+                freeze: Some(FreezeFacts {
+                    cpus: 8,
+                    ncpu: 8,
+                    probes: ProbeVerdict { late: 8, ..ProbeVerdict::default() },
+                    ..FreezeFacts::default()
+                }),
+            });
+            // A short stall whose verdict came out of the switch trace.
+            az.incidents.push(IncidentSummary {
+                class: IncidentClass::Kernel,
+                start: qpc() - 30 * crate::util::qpc_freq(),
+                dur: ms_to_ticks(20.0),
+                culprit: "not woken (nothing woke the thread)".into(),
+                marked: false,
+                cpus: vec![1],
+                on_cpu: None,
+                freeze: None,
+            });
+            let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
+            az.summarize(RunData {
+                elapsed_s: 300.0,
+                events_lost: lost,
+                overhead: Overhead::default(),
+                light: None,
+                stats: &stats,
+                exec_warn: ms_to_ticks(1.0),
+                io_warn: ms_to_ticks(200.0),
+                clock: &[],
+                gpu: &GpuLog::default(),
+            })
+        };
+
+        // Everything arrived: the scheduler has its say.
+        let good = report(0, true);
+        let freeze_said = |s: &Summary| s.findings.iter().find(|f| f.key == "whole-PC freeze").unwrap().evidence.join(" ");
+        assert!(freeze_said(&good).contains("never made runnable"), "{}", freeze_said(&good));
+        assert!(good.findings.iter().any(|f| f.key == "waiting game.exe"));
+        assert!(good.findings.iter().any(|f| f.key == "not woken (nothing woke the thread)"), "{:?}", keys(&good));
+
+        // Events lost, or switches never traced: the same data, and none of it is used.
+        for summary in [report(17, true), report(0, false)] {
+            assert!(!freeze_said(&summary).contains("never made runnable"), "{}", freeze_said(&summary));
+            assert!(!freeze_said(&summary).contains("measuring threads"), "{}", freeze_said(&summary));
+            assert!(!summary.findings.iter().any(|f| f.key.starts_with("waiting ")), "{:?}", keys(&summary));
+            // The stall still counts, under the vaguer verdict it would have had without the trace.
+            assert!(!summary.findings.iter().any(|f| f.key.contains("nothing woke the thread")), "{:?}", keys(&summary));
+            let generic = summary.findings.iter().find(|f| f.key == "not woken (timers or scheduling)").expect("still counted");
+            assert!(generic.evidence[0].contains("1 stall"), "{:?}", generic.evidence);
+        }
+        // ...and a run that lost events says so where its own cost is reported.
+        assert!(
+            report(17, true).detail_lines().iter().any(|l| l.contains("nothing in this report rests on the thread-switch trace")),
+            "a suppressed measurement has to be admitted"
+        );
+    }
+
+    fn keys(s: &Summary) -> Vec<&str> {
+        s.findings.iter().map(|f| f.key.as_str()).collect()
     }
 
     /// The first screen has to read as a plan: the verdict, then how many problems of each kind
@@ -1029,8 +1204,8 @@ mod tests {
         use crate::intr::Flow;
         use crate::modules::ModuleMap;
         use crate::procs::ProcNames;
-        use std::sync::atomic::{AtomicBool, AtomicI64};
-        use std::sync::Arc;
+        use crate::switches::ProbeVerdict;
+        use std::sync::atomic::AtomicBool;
 
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(32468, "SignalRgb.exe")]), true);
         let freq = crate::util::qpc_freq();
@@ -1060,6 +1235,14 @@ mod tests {
                     dpcs_kept_running: true,
                     holding: None,
                     coincided,
+                    // The answer the field logs could not give: in nine of the twelve, all eight
+                    // measuring threads were never made runnable (nothing woke them); in three
+                    // they were made runnable on time and left on an idle processor.
+                    probes: if i < 9 {
+                        ProbeVerdict { late: 8, worst_delay: ms_to_ticks(890.0), ..ProbeVerdict::default() }
+                    } else {
+                        ProbeVerdict { queued: 8, on_idle_cpu: 8, ..ProbeVerdict::default() }
+                    },
                 }),
             });
         }
@@ -1088,8 +1271,7 @@ mod tests {
             freeze: None,
         });
 
-        let stats =
-            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
         az.shared.inner.lock().unwrap().events = 37_917_537;
         let summary = az.summarize(RunData {
             elapsed_s: 3561.0,
@@ -1112,6 +1294,13 @@ mod tests {
         assert!(said.contains("8 of the 12 freezes coincided with a slow request"), "{said}");
         assert!(said.contains("4 of the 12 freezes coincided with nothing at all"), "both numbers: {said}");
         assert!(said.contains("Wdf01000.sys stopped completely in 8 of 12"), "{said}");
+        // The one thing the field logs in issue #15 could not say, now said, with both shapes and
+        // both counts, and in words that name a layer rather than a bystander.
+        assert!(said.contains("measuring threads were never made runnable"), "{said}");
+        assert!(said.contains("in 9 of them") && said.contains("in 3 of them"), "both numbers: {said}");
+        assert!(said.contains("the timer that wakes sleeping threads failing to fire"), "{said}");
+        assert!(said.contains("nothing else to do"), "the idle-processor half: {said}");
+        assert!(freeze.advice.contains("C-states"), "the order of attack narrows: {}", freeze.advice);
         assert!(said.contains("What is NOT explained"), "{said}");
         assert!(said.contains("Context, not blame") && said.contains("SignalRgb.exe"), "named, never blamed: {said}");
         // No bystander is a finding of its own, and nothing anywhere claims raised IRQL.
