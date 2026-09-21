@@ -53,6 +53,9 @@ pub(super) struct Ctx<'a> {
 
     // ---- this run in wall-clock terms
     pub now_unix: i64,
+    /// QPC at the instant `now_unix` was read: the anchor for turning a stall's QPC time into wall-clock
+    /// time. Read together, because the sections in between can block for seconds (a sleeping drive).
+    pub now_qpc: i64,
     pub run_start_unix: i64,
     pub storage_log: Vec<StorageEvent>,
 
@@ -111,7 +114,7 @@ impl<'a> Ctx<'a> {
             }
         }
 
-        let now_unix = unix_now();
+        let (now_unix, now_qpc) = (unix_now(), crate::util::qpc());
         let run_start_unix = now_unix - elapsed_s as i64 - 2;
         let storage_log = evlog::storage_events(EVENT_LOG_DAYS);
         let mut disk_stats: Vec<(u32, LatStat)> = disks.into_iter().collect();
@@ -131,6 +134,7 @@ impl<'a> Ctx<'a> {
             file_waits,
             fault_files,
             now_unix,
+            now_qpc,
             run_start_unix,
             storage_log,
             tally: Vec::new(),

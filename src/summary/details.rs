@@ -118,6 +118,10 @@ pub(super) fn tables(cx: &mut Ctx) {
     if cx.az.notable_suppressed > 0 {
         d!("{} of {} individual slow-event lines were suppressed in the event log.", cx.az.notable_suppressed, cx.az.notable_total);
     }
+    let dropped = cx.az.shared.inner.lock().unwrap_or_else(|e| e.into_inner()).notable_dropped;
+    if dropped > 0 {
+        d!("{dropped} more slow events arrived while this tool itself was held up and are missing from the event log (the totals above include them).");
+    }
     if !tally.is_empty() {
         d!("");
         d!("WHO CAUSED THE STALLS");

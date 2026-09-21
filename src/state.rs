@@ -176,6 +176,9 @@ pub struct Inner {
     pub faults_by_pid: HashMap<u32, LatStat>,
     pub disks: HashMap<u32, LatStat>,
     pub notable: Vec<Notable>,
+    /// Notable events that arrived while `notable` was full: the analyzer was itself held up,
+    /// which is exactly when there is most to report. Counted so the report can say so.
+    pub notable_dropped: u64,
 
     /// File names, and the whole run's waiting totaled per file. The ring buffers above only
     /// reach 20 s back, so these are what the summary's file tables are built from.

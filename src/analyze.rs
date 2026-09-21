@@ -802,7 +802,7 @@ mod tests {
         }
         assert_eq!(az.file_label(10).as_deref(), Some("C:\\pagefile.sys"));
         assert_eq!(az.file_label(11).as_deref(), Some("C:\\Users\\...\\(a .docx file)"));
-        assert_eq!(az.file_label(12).as_deref(), Some("\\Device\\HarddiskVolume9\\...\\thing.bin"));
+        assert_eq!(az.file_label(12).as_deref(), Some("\\Device\\HarddiskVolume9\\...\\(a .bin file)"));
         assert_eq!(az.file_label(0), None, "no file object: nothing to say");
         assert_eq!(az.file_label(999), None, "the trace never named it: nothing to say");
     }

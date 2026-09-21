@@ -255,6 +255,8 @@ fn add_wait<K: Copy + Eq + std::hash::Hash>(m: &mut std::collections::HashMap<K,
 fn push_notable(inner: &mut Inner, n: Notable) {
     if inner.notable.len() < 2000 {
         inner.notable.push(n);
+    } else {
+        inner.notable_dropped += 1;
     }
 }
 

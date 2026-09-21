@@ -12,6 +12,7 @@ use crate::evlog;
 use crate::files;
 use crate::health::{self, DriveHealth};
 use crate::procs::known_worker;
+use crate::procs::process_name;
 use crate::state::LatStat;
 use crate::util::{fmt_dur, ms_to_ticks, plural, ticks_to_ms};
 
@@ -118,8 +119,12 @@ fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool, hint
     }
     let full = disk.nearly_full();
     if !full.is_empty() {
-        let letters = full.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" and ");
-        advice.push_str(&format!("{letters} is nearly full, which by itself makes drives slow: free up space. "));
+        let letters: Vec<String> = full.iter().map(|l| format!("{l}:")).collect();
+        let (list, verb) = match letters.split_last() {
+            Some((last, rest)) if !rest.is_empty() => (format!("{} and {last}", rest.join(", ")), "are"),
+            _ => (letters.join(""), "is"),
+        };
+        advice.push_str(&format!("{list} {verb} nearly full, which by itself makes drives slow: free up space. "));
     }
     if logged_errors {
         advice.push_str(
@@ -345,7 +350,8 @@ pub(super) fn paging(cx: &mut Ctx) {
     let fault_files = std::mem::take(&mut cx.fault_files);
     let mut faults_named: HashMap<String, LatStat> = HashMap::new();
     for (pid, st) in faults {
-        let e = faults_named.entry(cx.az.procs.label(pid, 0)).or_default();
+        // Per program, not per process: see `stalls::tally`.
+        let e = faults_named.entry(process_name(&cx.az.procs.label(pid, 0))).or_default();
         e.count += st.count;
         e.total += st.total;
         e.max = e.max.max(st.max);

@@ -5,7 +5,7 @@ use crate::cpuclock::ClockSample;
 use crate::evlog::{self, HardwareEvent, HardwareKind, UnexpectedShutdown};
 use crate::pci::{self, PciDevice};
 use crate::topology::Topology;
-use crate::util::{ms_to_ticks, plural, qpc, qpc_freq};
+use crate::util::{ms_to_ticks, plural, qpc_freq};
 
 use super::ctx::{when_text, Ctx, EVENT_LOG_DAYS};
 use super::{Metric, Severity};
@@ -273,8 +273,8 @@ pub(super) fn whea(cx: &mut Ctx) {
     let (now_unix, run_start_unix) = (cx.now_unix, cx.run_start_unix);
     let hardware_log = evlog::hardware_events(EVENT_LOG_DAYS);
     if !hardware_log.is_empty() {
-        // QPC -> wall clock, anchored at "now"; good to well under the 2 s matching window.
-        let (qpc_now, freq) = (qpc(), qpc_freq());
+        // QPC -> wall clock, anchored at the instant both clocks were read in `Ctx::new`.
+        let (qpc_now, freq) = (cx.now_qpc, qpc_freq());
         let wall = |ticks: i64| now_unix - (qpc_now - ticks) / freq;
         let stall_times: Vec<i64> = cx.az.incidents.iter().map(|i| wall(i.start)).collect();
         let whea_times: Vec<i64> = hardware_log.iter().filter(|e| e.kind != HardwareKind::Other).map(|e| e.unix_time).collect();

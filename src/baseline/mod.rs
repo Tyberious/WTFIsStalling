@@ -335,6 +335,11 @@ fn fnv1a(s: &str) -> u64 {
 /// model, the board model and the amount of memory. Deliberately nothing that identifies a
 /// person or a machine - no serial numbers, no user name, no computer name - and hashed so that
 /// even those model names do not appear in the file.
+///
+/// Two PCs of the same model with the same RAM share an id, on purpose. Mixing in something unique
+/// (the Windows MachineGuid) would make this a stable pseudonym for one PC inside a file people may
+/// pass around with their report; a wrong baseline between twin PCs sharing one folder is the
+/// smaller harm, and the comparison block prints the baseline's date so it can be noticed.
 pub fn machine_id() -> String {
     let bios = "HARDWARE\\DESCRIPTION\\System\\BIOS";
     let get = |key: &str, value: &str| crate::reg::hklm_str(key, value).unwrap_or_default();

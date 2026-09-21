@@ -150,14 +150,23 @@ pub fn compare(prev: &RunRecord, now: &RunRecord) -> Vec<String> {
                         ),
                     ));
                 }
-                let change = moves.first().map_or(Change::Same, |(c, _)| *c);
+                // The same subject can be measured by different numbers in two runs (a disk that was
+                // slow last time and logged errors this time). With nothing in common to compare, the
+                // rating is what is left; calling that "about the same" would hide a real change.
+                let change = match moves.first() {
+                    Some((c, _)) => *c,
+                    None if n.severity > o.severity => Change::Worse,
+                    None if n.severity < o.severity => Change::Better,
+                    None => Change::Same,
+                };
                 let word = match change {
                     Change::Better => "better",
                     Change::Worse => "worse",
+                    _ if moves.is_empty() => "still here",
                     _ => "about the same",
                 };
                 let numbers = if moves.is_empty() {
-                    "still here".to_string()
+                    "it shows up differently this time, so there are no like-for-like numbers".to_string()
                 } else {
                     moves.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join(", ")
                 };

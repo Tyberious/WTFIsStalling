@@ -1,6 +1,7 @@
 //! Who or what stalled the machine: the tally of blamed culprits, the moments the user flagged,
 //! drivers whose DPC/ISR runs went long, and whether any of it keeps time.
 
+use crate::baseline::stable_key;
 use std::collections::HashMap;
 
 use crate::modules::knowledge;
@@ -35,7 +36,9 @@ fn secs(ticks: &[i64]) -> Vec<f64> {
 pub(super) fn tally(cx: &mut Ctx) {
     let mut tally: HashMap<String, (u32, i64, i64)> = HashMap::new();
     for i in cx.az.incidents.iter().filter(|i| !i.marked) {
-        let t = tally.entry(i.culprit.clone()).or_default();
+        // Keyed without the process ID: a browser runs a dozen processes, and four findings for
+        // "msedge.exe" are one finding said four times.
+        let t = tally.entry(stable_key(&i.culprit)).or_default();
         t.0 += 1;
         t.1 += i.dur;
         t.2 = t.2.max(i.dur);
@@ -103,7 +106,7 @@ pub(super) fn tally(cx: &mut Ctx) {
 pub(super) fn flagged_moments(cx: &mut Ctx) {
     let mut marked: HashMap<String, (u32, i64)> = HashMap::new();
     for i in cx.az.incidents.iter().filter(|i| i.marked) {
-        let m = marked.entry(i.culprit.clone()).or_default();
+        let m = marked.entry(stable_key(&i.culprit)).or_default();
         m.0 += 1;
         m.1 = m.1.max(i.dur);
     }
@@ -243,7 +246,7 @@ pub(super) fn periodicity(cx: &mut Ctx) {
     let mut periodic_noted = false;
     let culprits: Vec<String> = tally.iter().map(|(c, _)| c.clone()).collect();
     for culprit in culprits {
-        let times: Vec<i64> = cx.az.incidents.iter().filter(|i| !i.marked && i.culprit == culprit).map(|i| i.start).collect();
+        let times: Vec<i64> = cx.az.incidents.iter().filter(|i| !i.marked && stable_key(&i.culprit) == culprit).map(|i| i.start).collect();
         if let Some(p) = period::detect(&secs(&times)) {
             periodic_noted |= cx.found.note(&culprit, format!("The stalls keep time. {}", p.describe()));
         }
@@ -263,7 +266,8 @@ pub(super) fn periodicity(cx: &mut Ctx) {
             f.advice = format!(
                 "{} Because it repeats on a timer: {}",
                 f.advice,
-                POLLING_ADVICE.to_lowercase().replacen("something", "something software-driven", 1)
+                // Only the first word changes; lowercasing the lot turned "iCUE, HWiNFO" into "icue, hwinfo".
+                POLLING_ADVICE.replacen("Something", "something software-driven", 1)
             );
         }
     }

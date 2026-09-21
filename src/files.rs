@@ -168,7 +168,11 @@ fn shorten(prefix: &str, dirs: &[&str], file: &str) -> String {
 
 /// The only way a file path may reach the report. See the privacy note at the top of this file.
 pub fn public_path(path: &str) -> String {
-    let path = path.trim_end_matches('\0').trim();
+    // Everything below reasons about backslash-separated components. A path written with forward
+    // slashes would otherwise arrive as ONE component, be taken for a file in a volume root, and be
+    // printed whole: user name, folders and all.
+    let normalized = path.trim_end_matches('\0').trim().replace('/', "\\");
+    let path = normalized.as_str();
     if path.is_empty() {
         return String::new();
     }
@@ -201,42 +205,21 @@ pub fn public_path(path: &str) -> String {
     }
 }
 
-/// File types whose names describe a program, not a person: safe to show from a personal folder,
-/// and the ones worth showing ("the game's .pak on the hard drive").
-const PROGRAM_EXTS: &[&str] = &[
-    "exe",
-    "dll",
-    "sys",
-    "bin",
-    "dat",
-    "db",
-    "sqlite",
-    "log",
-    "tmp",
-    "cache",
-    "idx",
-    "pdb",
-    "msi",
-    "cab",
-    "etl",
-    "ini",
-    "cfg",
-    "json",
-    "xml",
-    "lock",
-    "part",
-    "crdownload",
-    "!qb",
-    "iso",
-    "vhd",
-    "vhdx",
-    "vmdk",
-];
+/// File types whose NAMES describe a program, not a person, wherever they sit: safe to show from
+/// a personal folder, and the ones worth showing ("the game's .pak on the hard drive"). Kept short
+/// on purpose. Data formats (.xml, .json, .db, .log, .dat, .ini, .iso, .vhd) and partial downloads
+/// are not here: "Medical records.xml" and the title of what someone is downloading are personal,
+/// whatever the extension. Under AppData every name is shown anyway; that is program data.
+const PROGRAM_EXTS: &[&str] = &["exe", "dll", "sys", "msi", "cab", "pdb", "etl"];
 
 /// What to show for a file in a personal location: its name when that names a program's data,
 /// otherwise only what kind of file it was.
 fn personal_name(file: &str, program_data: bool) -> String {
-    let ext = file.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.is_empty() && e.len() <= 12);
+    // "notes.txt:password" is an alternate data stream: the part after the colon is free text.
+    let file = file.split(':').next().unwrap_or(file);
+    // Letters and digits only, so nothing but a file type can ride along in the placeholder.
+    let ext =
+        file.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()));
     let program_type = ext.is_some_and(|e| PROGRAM_EXTS.iter().any(|p| p.eq_ignore_ascii_case(e))) || is_game_asset(file);
     if program_data || program_type {
         return file.to_string();
@@ -342,6 +325,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_holes_a_review_found_stay_closed() {
+        // Forward slashes used to arrive as one component and be printed whole.
+        let shown = public_path("C:/Users/Jane/Documents/secret.pdf");
+        assert_eq!(shown, r"C:\Users\...\(a .pdf file)");
+        assert!(!public_path(r"\Device\HarddiskVolume3/Users/Jane/x.docx").to_lowercase().contains("jane"));
+        // Data formats are personal too, whatever the extension.
+        for name in ["Medical records.xml", "passwords.db", "chat.log", "budget.json", "diary.dat", "backup.iso"] {
+            let shown = public_path(&format!(r"C:\Users\Jane\Documents\{name}"));
+            assert!(shown.starts_with(r"C:\Users\...\(a .") && !shown.contains(&name[..4]), "{name} -> {shown}");
+        }
+        // Text after an alternate-data-stream colon must not ride along in the placeholder.
+        assert_eq!(public_path(r"D:\Personal\notes.txt:JaneDoePassword"), r"D:\...\(a .txt file)");
+        assert_eq!(public_path(r"D:\Personal\odd.na me"), r"D:\...\(a file)");
+    }
+
+    #[test]
     fn personal_file_names_are_not_shown_unless_they_name_program_data() {
         // The name of a personal document says as much as its folder.
         assert_eq!(public_path(r"C:\Users\Jane Doe\Documents\Taxes\TaxReturn_JaneDoe.pdf"), r"C:\Users\...\(a .pdf file)");
@@ -350,7 +349,9 @@ mod tests {
         // Program data is what the report is for, and names no one.
         assert_eq!(public_path(r"C:\Users\Jane Doe\AppData\Local\Game\Saved\shadercache.bin"), r"C:\Users\...\shadercache.bin");
         assert_eq!(public_path(r"C:\Users\Jane Doe\AppData\Roaming\App\profile.xyz"), r"C:\Users\...\profile.xyz");
-        assert_eq!(public_path(r"E:\Downloads\linux.iso.!qB"), r"E:\...\linux.iso.!qB");
+        // What someone is downloading is theirs to keep quiet about.
+        assert_eq!(public_path(r"E:\Downloads\Some.Film.2026.mkv.!qB"), r"E:\...\(a file)");
+        assert_eq!(public_path(r"E:\Downloads\setup.exe"), r"E:\...\setup.exe");
         assert_eq!(public_path(r"E:\MyGames\Thing\data.pak"), r"E:\...\data.pak");
         for shown in [public_path(r"C:\Users\Jane Doe\Desktop\x.docx"), public_path(r"C:\users\JANE DOE\x.docx")] {
             assert!(!shown.to_lowercase().contains("jane"), "{shown}");

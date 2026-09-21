@@ -563,6 +563,57 @@ mod tests {
         assert!(titles.iter().any(|t| t.starts_with("nvlddmkm.sys")), "{titles:?}");
     }
 
+    /// From a field report: four "msedge.exe" findings (one per process ID), and periodic-stall
+    /// advice that came out as "icue, armoury crate, hwinfo".
+    #[test]
+    fn one_program_is_one_finding_and_product_names_keep_their_case() {
+        use crate::analyze::IncidentSummary;
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        let freq = crate::util::qpc_freq();
+        let t0 = qpc() - 400 * freq;
+        let stall = |culprit: &str, at_s: i64| IncidentSummary {
+            kind: StallKind::Scheduler,
+            start: t0 + at_s * freq,
+            dur: ms_to_ticks(30.0),
+            culprit: culprit.to_string(),
+            marked: false,
+            cpus: Vec::new(),
+        };
+        for (i, pid) in [42216, 42980, 2308, 18996].into_iter().enumerate() {
+            az.incidents.push(stall(&format!("process msedge.exe ({pid})"), 300 + i as i64));
+        }
+        // A driver blamed every 60 s exactly, so the periodic advice is appended to its finding.
+        for k in 0..6 {
+            az.incidents.push(stall("driver NETIO.SYS", 60 * k));
+        }
+        let stats =
+            ProbeStats { max_kernel: Arc::new(AtomicI64::new(0)), max_sched: Arc::new(AtomicI64::new(0)), realtime: AtomicBool::new(true) };
+        let summary = az.summarize(RunData {
+            elapsed_s: 400.0,
+            events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+        });
+        let edge: Vec<&Finding> = summary.findings.iter().filter(|f| f.title.starts_with("msedge.exe")).collect();
+        assert_eq!(edge.len(), 1, "one finding for the program, not one per process");
+        assert!(edge[0].evidence[0].contains("4 stalls"), "{:?}", edge[0].evidence);
+
+        let netio = summary.findings.iter().find(|f| f.title.starts_with("NETIO.SYS")).expect("driver finding");
+        assert!(netio.evidence.iter().any(|e| e.contains("keep time")), "{:?}", netio.evidence);
+        assert!(netio.advice.contains("something software-driven runs on a timer"), "{}", netio.advice);
+        assert!(netio.advice.contains("iCUE") && netio.advice.contains("HWiNFO"), "product names keep their case: {}", netio.advice);
+    }
+
     #[test]
     fn result_block_leads_with_the_verdict_and_stays_within_width() {
         let lines = Summary::demo(Health::Problem).result_lines();
