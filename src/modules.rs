@@ -62,6 +62,32 @@ impl ModuleMap {
         self.mods.is_empty()
     }
 
+    /// File names of every loaded kernel module, e.g. `ndis.sys`, `HWiNFO_x64_215.sys`.
+    ///
+    /// Note for anyone testing this: at medium integrity Windows hides kernel addresses, so a
+    /// non-elevated process gets an empty or useless list. The tool itself runs elevated.
+    pub fn file_names(&self) -> Vec<String> {
+        self.mods.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// Whether a loaded driver's own version resource says Microsoft wrote it.
+    ///
+    /// The version resource rather than the code signature: `WinVerifyTrust` would mean a new
+    /// windows-sys feature and revocation checks (disk, and potentially network) in the middle of a
+    /// measuring run, and it answers "who signed this" rather than "who wrote this". `CompanyName`
+    /// is what Microsoft's own vulnerable-driver blocklist keys on. Unknown when the file has no
+    /// readable version resource, which is itself unusual for an in-box driver.
+    pub fn is_microsoft(&mut self, name: &str) -> Option<bool> {
+        let company = self.company(name)?;
+        Some(company.to_ascii_lowercase().starts_with("microsoft"))
+    }
+
+    /// `CompanyName` from a loaded driver's version resource.
+    pub fn company(&mut self, name: &str) -> Option<String> {
+        let path = self.mods.iter().find(|m| m.name.eq_ignore_ascii_case(name)).map(|m| dos_path(&m.path))?;
+        version_field(&path, "CompanyName")
+    }
+
     pub fn refresh(&mut self) {
         self.last_refresh = Instant::now();
         let mut len = 1u32 << 18;
@@ -148,20 +174,28 @@ impl ModuleMap {
     }
 }
 
-fn dos_path(nt: &str) -> String {
+/// A driver's binary path as the kernel or an `ImagePath` registry value spells it, turned into
+/// something that can be opened: `\SystemRoot\...`, `\??\C:\...`, a bare `\...` and the relative
+/// `System32\drivers\x.sys` form all occur in practice.
+pub fn dos_path(nt: &str) -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let nt = nt.trim().trim_matches('"');
     if let Some(rest) = nt.strip_prefix("\\SystemRoot\\") {
         format!("{root}\\{rest}")
     } else if let Some(rest) = nt.strip_prefix("\\??\\") {
         rest.to_string()
     } else if nt.starts_with('\\') {
         format!("{}{nt}", &root[..2])
-    } else {
+    } else if nt.len() > 1 && nt.as_bytes()[1] == b':' {
         nt.to_string()
+    } else {
+        // "System32\DRIVERS\pacer.sys" - the form a service's ImagePath uses most often.
+        format!("{root}\\{nt}")
     }
 }
 
-fn version_strings(path: &str) -> Option<String> {
+/// Named strings from a file's version resource, in the order asked for.
+fn version_fields(path: &str, fields: &[&str]) -> Option<Vec<Option<String>>> {
     unsafe {
         let w = wide(path);
         let mut dummy = 0u32;
@@ -179,20 +213,34 @@ fn version_strings(path: &str) -> Option<String> {
             return None;
         }
         let tr = std::slice::from_raw_parts(p as *const u16, 2);
-        let query = |field: &str| -> Option<String> {
-            let q = wide(&format!("\\StringFileInfo\\{:04x}{:04x}\\{field}", tr[0], tr[1]));
-            let mut p: *mut c_void = null_mut();
-            let mut len = 0u32;
-            if VerQueryValueW(buf.as_ptr() as _, q.as_ptr(), &mut p, &mut len) == 0 || len == 0 {
-                return None;
-            }
-            let s = from_wide(std::slice::from_raw_parts(p as *const u16, len as usize));
-            (!s.trim().is_empty()).then(|| s.trim().to_string())
-        };
-        match (query("CompanyName"), query("FileDescription")) {
-            (Some(c), Some(d)) => Some(format!("{d} ({c})")),
-            (c, d) => d.or(c),
-        }
+        let out = fields
+            .iter()
+            .map(|field| {
+                let q = wide(&format!("\\StringFileInfo\\{:04x}{:04x}\\{field}", tr[0], tr[1]));
+                let mut p: *mut c_void = null_mut();
+                let mut len = 0u32;
+                if VerQueryValueW(buf.as_ptr() as _, q.as_ptr(), &mut p, &mut len) == 0 || len == 0 {
+                    return None;
+                }
+                let s = from_wide(std::slice::from_raw_parts(p as *const u16, len as usize));
+                (!s.trim().is_empty()).then(|| s.trim().to_string())
+            })
+            .collect();
+        Some(out)
+    }
+}
+
+/// One named string from a file's version resource. Used for files that are not loaded modules
+/// (a network filter driver's binary, say), so it takes a path rather than a module name.
+pub fn version_field(path: &str, field: &str) -> Option<String> {
+    version_fields(path, &[field])?.into_iter().next().flatten()
+}
+
+fn version_strings(path: &str) -> Option<String> {
+    let v = version_fields(path, &["CompanyName", "FileDescription"])?;
+    match (v[0].clone(), v[1].clone()) {
+        (Some(c), Some(d)) => Some(format!("{d} ({c})")),
+        (c, d) => d.or(c),
     }
 }
 
@@ -267,10 +315,6 @@ const KB: &[(&[&str], Knowledge)] = &[
         what: "Antivirus / file-system filter driver",
         advice: "Add exclusions for games/projects, test with real-time protection temporarily off, and never run two antivirus products at once.",
     }),
-    (&["winring0", "rtcore", "asio", "asupio", "gdrv", "gpcidrv", "corsairllaccess", "cpuz", "hwinfo", "ntiolib", "eneio", "ene.sys", "inpout", "amdryzenmaster", "lghub", "iocbios", "msio", "glckio", "aida"], Knowledge {
-        what: "Hardware monitoring / RGB / overclocking utility driver (polls sensors over SMBus/EC)",
-        advice: "A very common cause of periodic hitches. Fully exit (not just minimize) RGB and monitoring tools: iCUE, Armoury Crate, Aura, RGB Fusion, MSI Center, Afterburner/RTSS, HWiNFO, NZXT CAM, Ryzen Master, etc. and retest.",
-    }),
     (&["bthport", "bthusb", "bthenum", "ibtusb", "rtkbt", "btha2dp", "bthhfenum"], Knowledge {
         what: "Bluetooth driver",
         advice: "Update the Bluetooth driver; test with Bluetooth turned off (it shares the radio with Wi-Fi on most cards).",
@@ -289,7 +333,28 @@ const KB: &[(&[&str], Knowledge)] = &[
     }),
 ];
 
+/// The drivers that RGB / fan / monitoring / overclocking utilities install to reach motherboard
+/// chips directly. The file names live in `hwaccess`, where every one is tied to a published
+/// source; this is only what the report says about them when one is blamed for a stall.
+const HARDWARE_ACCESS: Knowledge = Knowledge {
+    what: "Driver of a utility that talks to the motherboard hardware directly (sensors, fans, lighting)",
+    advice: "A very common cause of periodic hitches. Fully exit it (not just minimize it) and monitor again; if you run \
+             several tools of this kind, do them one at a time. The report lists which ones are running on this PC under \
+             'worth knowing'.",
+};
+
+/// `PawnIO.sys` is the sandboxed replacement LibreHardwareMonitor, FanControl and OpenRGB moved to
+/// in 2025. Telling someone to undo that would be telling them to go back to the raw one.
+const SANDBOXED_ACCESS: Knowledge = Knowledge {
+    what: "Sandboxed hardware-access driver (PawnIO), used by current monitoring and fan-control tools",
+    advice: "This is the safer, sandboxed driver those tools moved to, so it is not something to remove. If it keeps \
+             appearing, exit the monitoring or fan-control program using it and monitor again.",
+};
+
 pub fn knowledge(name: &str) -> Option<&'static Knowledge> {
+    if let Some(tool) = crate::hwaccess::lookup(name) {
+        return Some(if tool.sandboxed { &SANDBOXED_ACCESS } else { &HARDWARE_ACCESS });
+    }
     let lower = name.to_ascii_lowercase();
     KB.iter().find(|(prefixes, _)| prefixes.iter().any(|p| lower.starts_with(p))).map(|(_, k)| k)
 }
@@ -303,8 +368,20 @@ mod tests {
         assert_eq!(knowledge("nvlddmkm.sys").unwrap().what, "NVIDIA GPU driver");
         assert_eq!(knowledge("USBXHCI.SYS").unwrap().what, "USB controller / device stack");
         assert!(knowledge("Netwtw14.sys").unwrap().what.contains("Wi-Fi"));
-        assert!(knowledge("WinRing0x64.sys").unwrap().what.contains("monitoring"));
         assert!(knowledge("totally_unknown.sys").is_none());
+    }
+
+    /// The hardware-access table decides these, so the advice follows a renamed or suffixed file
+    /// that no prefix list would have caught - and never tells anyone to undo the sandboxed one.
+    #[test]
+    fn hardware_access_drivers_get_their_advice_from_the_sourced_table() {
+        for file in ["WinRing0x64.sys", "AsIO3.sys", "HWiNFO_x64_215.sys", "FanControl.sys", "kerneld.x64"] {
+            let k = knowledge(file).unwrap_or_else(|| panic!("{file}"));
+            assert!(k.what.contains("motherboard hardware directly"), "{file}: {}", k.what);
+            assert!(k.advice.contains("Fully exit"), "{file}");
+        }
+        let safe = knowledge("PawnIO.sys").unwrap();
+        assert!(safe.what.contains("Sandboxed") && safe.advice.contains("not something to remove"), "{}", safe.advice);
     }
 
     #[test]
@@ -312,5 +389,8 @@ mod tests {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         assert_eq!(dos_path(r"\SystemRoot\system32\drivers\ndis.sys"), format!(r"{root}\system32\drivers\ndis.sys"));
         assert_eq!(dos_path(r"\??\C:\Program Files\x\y.sys"), r"C:\Program Files\x\y.sys");
+        // The relative form a service's ImagePath uses, and a plain absolute path.
+        assert_eq!(dos_path(r"System32\drivers\pacer.sys"), format!(r"{root}\System32\drivers\pacer.sys"));
+        assert_eq!(dos_path(r#""C:\Program Files\Tool\helper.sys""#), r"C:\Program Files\Tool\helper.sys");
     }
 }

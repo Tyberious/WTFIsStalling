@@ -25,6 +25,13 @@ fn rd_u64(d: &[u8], off: usize) -> Option<u64> {
     d.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+/// One bucket of the per-routine activity map in QPC ticks, worked out once.
+fn beat_ticks() -> i64 {
+    use std::sync::OnceLock;
+    static TICKS: OnceLock<i64> = OnceLock::new();
+    *TICKS.get_or_init(|| crate::util::ms_to_ticks(BEAT_MS).max(1))
+}
+
 /// Longest file path the kernel can hand us that is worth keeping (NTFS allows 32767 with the
 /// \\?\ prefix, but nothing that long belongs in a report).
 const MAX_PATH_CHARS: usize = 320;
@@ -108,7 +115,19 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
             let tid = rd_u32(d, 8)?;
             inner.samples.push_back(SampleRec { ts, cpu, tid, ip });
         }
-        // ISR-MSI (50), ThreadedDPC / ISR / DPC / TimerDPC (66-69): InitialTime, Routine, ...
+        // DPC/ISR executions. Payload starts InitialTime (u64) then Routine (a pointer, so 8 bytes
+        // on x64); only those two are read, because Microsoft publishes no byte offsets for any of
+        // these classes and the documented ISR class's `Reserved` field carries contradictory
+        // qualifiers. Anything past offset 16 would need a UserDataLength check.
+        //
+        // Opcodes 66-69 are documented on https://learn.microsoft.com/en-us/windows/win32/etw/perfinfo
+        //   66 Threaded DPC (Learn spells the type name "ThreadDPC"), 67 ISR, 68 DPC, 69 DPC timer.
+        // Opcode 50 is NOT documented by Microsoft: there is no ISR-MSI class on Learn and 50 is
+        // absent from the PerfInfo opcode table. It is treated as an ISR here on the strength of
+        // Geoff Chappell's hook-id table, which lists 0x0F32 = PERFINFO_LOG_TYPE_MSI_INTERRUPT for
+        // Windows 7 and later - reputable reverse engineering, not a primary source:
+        // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntwmi/wmi_trace_packet/hookid.htm
+        // The sanity bounds below are what guards against that assumption being wrong.
         (GUID_PERFINFO, 50 | 66..=69) => {
             let start = rd_u64(d, 0)? as i64;
             let routine = rd_u64(d, 8)?;
@@ -127,6 +146,19 @@ fn handle_event(shared: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i
             };
             let r = ExecRec { cpu, kind, start, end: ts, routine };
             inner.execs.push_back(r);
+            // O(1): work out the bucket, then set one bit. See `state::Beats`.
+            if inner.beat_t0 == 0 {
+                inner.beat_t0 = ts;
+            }
+            let bucket = (ts - inner.beat_t0) / beat_ticks();
+            if (0..BEAT_BUCKETS as i64).contains(&bucket) {
+                let room = inner.beats.len() < BEAT_ROUTINES;
+                if let Some(beats) = inner.beats.get_mut(&routine) {
+                    beats.set(bucket as usize);
+                } else if room {
+                    inner.beats.entry(routine).or_default().set(bucket as usize);
+                }
+            }
             let st = inner.routines.entry((routine, kind)).or_default();
             st.count += 1;
             st.total += dur;

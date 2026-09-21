@@ -8,7 +8,7 @@ use crate::analyze::Analyzer;
 use crate::devices::DeviceMap;
 use crate::evlog::{self, DisplayReset, HardwareEvent, StorageEvent};
 use crate::files;
-use crate::state::{LatStat, RoutineStat};
+use crate::state::{Beats, LatStat, RoutineStat};
 use crate::util::{plural, unix_now};
 
 use super::stalls::DriverAgg;
@@ -40,6 +40,8 @@ pub(super) struct Ctx<'a> {
 
     // ---- copied out of the shared ETW state once, while the lock is held
     pub routines: HashMap<(u64, u8), RoutineStat>,
+    /// Whole-run activity per DPC/ISR routine, in quarter-second buckets. See `state::Beats`.
+    pub beats: HashMap<u64, Beats>,
     pub faults: HashMap<u32, LatStat>,
     /// Per-disk latency totals, by disk number.
     pub disk_stats: Vec<(u32, LatStat)>,
@@ -75,13 +77,19 @@ pub(super) struct Ctx<'a> {
     pub throttled_secs: usize,
     pub device_map: DeviceMap,
     pub today: (i32, u32, u32),
+    /// DETAILS tables built by the `platform` section (hardware-access drivers, network filters,
+    /// devices on legacy interrupts), printed by `details::tables`.
+    pub platform_lines: Vec<String>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(az: &'a mut Analyzer, run: RunData<'a>) -> Ctx<'a> {
         let elapsed_s = run.elapsed_s;
-        let inner = az.shared.inner.lock().unwrap();
+        let mut inner = az.shared.inner.lock().unwrap();
         let routines = inner.routines.clone();
+        // Taken rather than cloned: the run is over, and the bitmaps are the one thing here big
+        // enough (a few hundred KB) to be worth not copying.
+        let beats = std::mem::take(&mut inner.beats);
         let faults = inner.faults_by_pid.clone();
         let disks = inner.disks.clone();
         let events = inner.events;
@@ -125,6 +133,7 @@ impl<'a> Ctx<'a> {
             found: Findings::default(),
             details: Vec::new(),
             routines,
+            beats,
             faults,
             disk_stats,
             events,
@@ -150,6 +159,7 @@ impl<'a> Ctx<'a> {
             throttled_secs: 0,
             device_map: DeviceMap::default(),
             today: (0, 0, 0),
+            platform_lines: Vec::new(),
         }
     }
 }

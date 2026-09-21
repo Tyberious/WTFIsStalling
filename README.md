@@ -78,7 +78,11 @@ days old) by itself.
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
 | **CPU throttling** (heat or power limits) | Busy cores running well under their rated speed, or Windows reporting a performance cap, and whether stalls coincide; backed up by the "firmware limited the processor's speed" event when Windows logged one |
 | **Stalls concentrated on the efficiency cores** of a hybrid processor (P-cores / E-cores) | Each stall says which kind of core it hit. When they pile up on the E-cores, a low-severity finding says so and lists what Windows documents as sending a program there (Task Manager's "Efficiency mode"; on battery, background and out-of-view work) |
-| Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s" |
+| Something **polling on a timer** (RGB / monitoring / vendor utilities) | Stalls or long interrupt runs that repeat at a steady interval: "repeats about every 10.0 s". Also *below* the stall threshold: every driver's interrupt activity is recorded in quarter-second buckets across the whole run, so a third-party driver that wakes every few seconds for a moment — too briefly to stall anything — is still reported as keeping time |
+| **Utilities that talk to the motherboard hardware directly** (RGB, fan, monitoring, overclocking) | The kernel drivers they install are matched against a table where every row carries a published source — Microsoft's vulnerable-driver blocklist, a CVE record, a vendor advisory or an upstream project's own source tree — and the report names the product ("SignalRGB (SignalIo.sys)"), not just the file. Low severity by itself, because several of these at once is the normal case; attached as **context** to a whole-PC freeze, a "CPU went dark" or a periodic finding, where it makes "fully exit these one at a time" name the products actually installed. The mechanism is explained from primary sources only: an I/O write can be turned into a firmware interrupt that stops **every** processor core, which Microsoft describes as "latency spikes of 100 microseconds or more" and says Windows cannot intervene in. The report says plainly that it cannot prove that happened — reading the processor's own counter needs a kernel driver, and this tool ships none |
+| **Which program a driver was working for** | A driver runs because something asked it to, and the CPU samples inside a stall say who. When one program held the processor through most of a driver's stalls, the finding says so ("its stalls happened while iCUE.exe was on the processor, in 9 of the 11 of them") — worded so that Windows' own components are never described as something to close |
+| **Network filter drivers from other vendors** (VPNs, "network optimizers", security products) | Windows runs a filter's code inside its own networking files, so a stall in `NETIO.SYS` or `ndis.sys` can be another vendor's doing. The installed NDIS lightweight filters are read from the registry and the ones written by someone other than Microsoft are named on such a finding — and when they are all Microsoft's, that rules a whole class of software out |
+| **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
@@ -187,7 +191,14 @@ Two independent sources, correlated on one clock (QPC):
 * **Kernel ETW trace.** A private real-time system-logger session records every DPC and ISR (with the
   driver routine address and duration), hard page faults, disk I/O latency, file names, thread creation
   (for thread → process mapping) and 1 kHz CPU profile samples. Routine addresses are resolved to the loaded
-  driver; a built-in knowledge base plus each file's version resource explains what that driver is.
+  driver; a built-in knowledge base plus each file's version resource explains what that driver is. Each
+  routine's activity is also recorded as one bit per quarter-second of the run — a few hundred kilobytes
+  in total, and one hash lookup per event — so that a driver waking on a steady timer can be seen even
+  when nothing it does is long enough to stall anything.
+* **The machine itself, read once at the end.** Loaded kernel modules (for the hardware-access driver
+  table), the installed NDIS network filters and their binaries (registry only), and every present PCI
+  device's allocated interrupt resources and PCI device properties (cfgmgr32). All read-only, all
+  cheap, and none of it needs anything the tool is not already allowed to do.
 * **Latency probes.** A helper process in the REALTIME priority class runs one thread per CPU at
   priority 31, pinned, waking every millisecond (every 2 ms in light mode) and measuring how late each
   wake-up was. Nothing but
@@ -385,9 +396,16 @@ policy the project commits to.)*
 ## Contributing
 
 Yes please. The most valuable contributions need no kernel knowledge at all: **teach the tool about
-more drivers** (see `KB` in [`src/modules.rs`](src/modules.rs)) and **send reports from real problem
-machines**. See [CONTRIBUTING.md](CONTRIBUTING.md).
+more drivers** (see `KB` in [`src/modules.rs`](src/modules.rs), and the sourced hardware-access table
+in [`src/hwaccess.rs`](src/hwaccess.rs) — every row there needs a citable source) and **send reports
+from real problem machines**. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE).
+
+Part of the hardware-access driver knowledge base in [`src/hwaccess.rs`](src/hwaccess.rs) is derived
+from the Apache-2.0 licensed [LOLDrivers](https://github.com/magicsword-io/LOLDrivers) dataset (names
+and products only; no hashes and no binaries). See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and
+[`licenses/Apache-2.0.txt`](licenses/Apache-2.0.txt).

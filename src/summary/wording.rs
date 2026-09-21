@@ -82,6 +82,24 @@ pub(super) fn process_advice(label: &str) -> String {
     }
 }
 
+/// How the report names the program a driver was working for.
+///
+/// `None` when naming it would say nothing: "Idle" is the processor having nothing to do, and
+/// "System" is where Windows runs the work of every driver, so "running for System" is true of
+/// almost any driver and tells a reader nothing at all. A process that no longer exists is no
+/// better. Windows' own service hosts ARE named, but marked, so nothing reads as "close it".
+pub(super) fn on_behalf_of(label: &str) -> Option<String> {
+    let name = process_name(label);
+    let lower = name.to_lowercase();
+    if name.starts_with("System") || lower.starts_with("idle") || lower.starts_with("unknown") || lower.starts_with("pid ") {
+        return None;
+    }
+    Some(match known_worker(&name) {
+        Some(w) if w.windows => format!("{name} (part of Windows)"),
+        _ => name,
+    })
+}
+
 /// Says which device each blamed driver belongs to, and how old the driver is.
 pub(super) fn devices_behind_drivers(cx: &mut Ctx) {
     let device_map = DeviceMap::load();
@@ -177,5 +195,18 @@ mod tests {
         assert_eq!(process_title("game.exe (4242)"), "game.exe  -  program");
         assert!(process_advice("game.exe (4242)").starts_with("Close this program"));
         assert!(process_advice("steam.exe (77)").contains("Pause the download"));
+    }
+
+    #[test]
+    fn the_program_a_driver_worked_for_is_only_named_when_that_says_something() {
+        assert_eq!(on_behalf_of("iCUE.exe (4242)").as_deref(), Some("iCUE.exe"));
+        assert_eq!(on_behalf_of("svchost.exe (900)").as_deref(), Some("svchost.exe (part of Windows)"));
+        assert_eq!(on_behalf_of("MsMpEng.exe (99)").as_deref(), Some("MsMpEng.exe (part of Windows)"));
+        // Saying "running for System" is true of nearly every driver, so it is not said.
+        assert_eq!(on_behalf_of("System (kernel threads)"), None);
+        assert_eq!(on_behalf_of("System (4)"), None);
+        assert_eq!(on_behalf_of("Idle"), None);
+        assert_eq!(on_behalf_of("unknown (exited thread)"), None);
+        assert_eq!(on_behalf_of("pid 1234 (exited)"), None);
     }
 }

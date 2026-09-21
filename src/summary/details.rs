@@ -204,6 +204,7 @@ pub(super) fn tables(cx: &mut Ctx) {
             }
         }
     }
+    details.extend(std::mem::take(&mut cx.platform_lines));
     if !gpu_lines.is_empty() {
         d!("");
         d!("GRAPHICS  (sampled once a second)");

@@ -159,6 +159,63 @@ pub enum Notable {
     SlowIo(IoRec),
 }
 
+/// How wide one bucket of the per-routine activity map is. Small enough that a 1 s beat is still
+/// four buckets apart, and it matches `period::BURST_S`, so a burst of DPCs lands in one bucket
+/// exactly as the periodicity detector would have collapsed it anyway.
+pub const BEAT_MS: f64 = 250.0;
+/// One hour of buckets. Past that, a beat that is going to be visible has been visible for a while.
+pub const BEAT_BUCKETS: usize = 14_400;
+const BEAT_WORDS: usize = BEAT_BUCKETS / 64;
+/// Distinct routines tracked, first come first served. 1.8 KB each, so this is the memory bound:
+/// under 350 KB however long the run is and however many drivers the PC has.
+pub const BEAT_ROUTINES: usize = 192;
+
+/// Which buckets one DPC/ISR routine was active in, one bit each.
+pub struct Beats(Box<[u64; BEAT_WORDS]>);
+
+impl Beats {
+    fn new() -> Beats {
+        Beats(Box::new([0u64; BEAT_WORDS]))
+    }
+
+    pub fn set(&mut self, bucket: usize) {
+        if let Some(word) = self.0.get_mut(bucket / 64) {
+            *word |= 1 << (bucket % 64);
+        }
+    }
+
+    /// The bucket indexes that were active, in order.
+    pub fn buckets(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, word) in self.0.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                out.push(i * 64 + b);
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Merges another routine's buckets in, for rolling several routines up into one driver.
+    pub fn merge(&mut self, other: &Beats) {
+        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
+            *a |= *b;
+        }
+    }
+}
+
+impl Default for Beats {
+    fn default() -> Beats {
+        Beats::new()
+    }
+}
+
 #[derive(Default)]
 pub struct Inner {
     /// Newest ETW timestamp seen; tells the analyzer how far the (buffered) trace has caught up.
@@ -173,6 +230,13 @@ pub struct Inner {
     pub tid_pid: HashMap<u32, u32>,
 
     pub routines: HashMap<(u64, u8), RoutineStat>,
+    /// Whole-run activity per DPC/ISR routine in `BEAT_MS` buckets, so a driver that wakes every
+    /// few seconds for a moment can be seen even though the ring buffers above only reach 20 s
+    /// back and nothing it does is long enough to stall anything. One bit per bucket: the ETW
+    /// callback does a hash lookup and sets a bit, and the memory is capped by `BEAT_ROUTINES`.
+    pub beats: HashMap<u64, Beats>,
+    /// ETW timestamp of the first DPC/ISR seen, which bucket 0 starts at.
+    pub beat_t0: i64,
     pub faults_by_pid: HashMap<u32, LatStat>,
     pub disks: HashMap<u32, LatStat>,
     pub notable: Vec<Notable>,
@@ -219,5 +283,29 @@ impl Inner {
             self.samples.pop_front();
         }
         self.last_prune = self.latest_ts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beats_record_buckets_and_merge() {
+        let mut a = Beats::default();
+        for b in [0usize, 63, 64, 4000, BEAT_BUCKETS - 1] {
+            a.set(b);
+        }
+        a.set(BEAT_BUCKETS); // out of range: dropped, never a panic
+        a.set(BEAT_BUCKETS * 9);
+        assert_eq!(a.buckets(), vec![0, 63, 64, 4000, BEAT_BUCKETS - 1]);
+        assert_eq!(a.count(), 5);
+
+        let mut b = Beats::default();
+        b.set(1);
+        b.set(64);
+        a.merge(&b);
+        assert_eq!(a.buckets(), vec![0, 1, 63, 64, 4000, BEAT_BUCKETS - 1], "merging is a union, not a sum");
+        assert_eq!(Beats::default().buckets(), Vec::<usize>::new());
     }
 }

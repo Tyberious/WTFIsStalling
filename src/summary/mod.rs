@@ -9,6 +9,7 @@ mod details;
 mod freezes;
 mod gpu;
 mod hardware;
+mod platform;
 mod stalls;
 mod storage;
 mod wording;
@@ -269,6 +270,12 @@ impl Summary {
         // a different kind, and the warnings that are not hitches last.
         let first = shown.first().map(|i| &self.findings[*i]);
         let Some(first) = first else { return };
+        // Background notes are not something to attack; a clean PC gets one line instead of a plan.
+        if first.severity == Severity::Low {
+            out.push(String::new());
+            out.push("  Nothing here needs fixing. The notes below are background about this PC.".into());
+            return;
+        }
         out.push(String::new());
         out.push("  ORDER OF ATTACK  (change ONE thing, run this again, and the comparison above will say what moved)".into());
         wrap(&format!("Start here:  {}", first.title), "    ", out);
@@ -579,9 +586,18 @@ impl Analyzer {
     /// * `stalls::periodicity` notes "the stalls keep time" on findings that already exist and
     ///   then rewrites the advice of every finding whose evidence says so, which means it has to
     ///   run after every section that sets an advice it may append to.
-    /// * `wording::devices_behind_drivers` runs last of the finding sections: it rewrites every
-    ///   "driver <file>" title and puts "Start here: this driver is N years old" in FRONT of the
-    ///   advice, so anything added after it would end up behind that sentence.
+    /// * `stalls::on_whose_behalf` and `stalls::periodicity` only note on findings that already
+    ///   exist, so both go after every section that can create a "driver <file>" key.
+    /// * `stalls::quiet_polling` goes after `stalls::long_dpc_isr`, which leaves it the per-driver
+    ///   totals, and after everything that creates a driver finding: a driver that already has one
+    ///   has been said more about than "it wakes on a timer" could add.
+    /// * `wording::devices_behind_drivers` rewrites every "driver <file>" title and puts "Start
+    ///   here: this driver is N years old" in FRONT of the advice, so anything that REPLACES an
+    ///   advice must come before it. The `platform` sections below only append.
+    /// * `platform::*` run last of the finding sections. They attach context to the freeze, the
+    ///   "CPU went dark" and the periodic findings and to `driver <file>` findings, so everything
+    ///   that creates those has to have run; `platform::legacy_interrupts` also reads the device
+    ///   map that `wording::devices_behind_drivers` loads.
     /// * `details::tables` runs after everything, because it prints the totals the sections above
     ///   worked out (the tally, the driver table, paging, disks, GPU and drive-health lines, the
     ///   event-log counts and the seconds spent throttled).
@@ -608,12 +624,17 @@ impl Analyzer {
         hardware::whea(&mut cx);
         hardware::unexpected_shutdowns(&mut cx);
         cx.found.in_group(Group::Interruptions);
+        stalls::on_whose_behalf(&mut cx);
         stalls::periodicity(&mut cx);
         cx.found.in_group(Group::Health);
+        stalls::quiet_polling(&mut cx);
         hardware::cpu_throttling(&mut cx);
         hardware::firmware_throttle(&mut cx);
         details::tool_cost(&mut cx);
         wording::devices_behind_drivers(&mut cx);
+        platform::hardware_access(&mut cx);
+        platform::network_filters(&mut cx);
+        platform::legacy_interrupts(&mut cx);
 
         let mut findings: Vec<Finding> = std::mem::take(&mut cx.found.0).into_iter().map(|(_, f)| f).collect();
         findings.sort_by_key(|f| (std::cmp::Reverse(f.severity), std::cmp::Reverse(f.impact)));
@@ -781,6 +802,7 @@ mod tests {
             culprit: culprit.to_string(),
             marked: true,
             cpus: vec![0],
+            on_cpu: None,
             freeze: None,
         };
         az.incidents.push(flagged("CPU went dark (firmware SMI / hypervisor / interrupts off)"));
@@ -829,6 +851,7 @@ mod tests {
             culprit: culprit.to_string(),
             marked: false,
             cpus: Vec::new(),
+            on_cpu: None,
             freeze: None,
         };
         for (i, pid) in [42216, 42980, 2308, 18996].into_iter().enumerate() {
@@ -881,6 +904,41 @@ mod tests {
         let text = lines.join(" ");
         assert!(text.contains("coincided with") && text.contains("coincided with nothing"), "{text}");
         assert!(text.contains("What is NOT explained"), "{text}");
+    }
+
+    /// A healthy PC with a couple of background notes (RGB tools present, an old-style interrupt)
+    /// must not be told to "start here": there is nothing to attack.
+    #[test]
+    fn background_notes_alone_do_not_get_an_order_of_attack() {
+        let mut summary = Summary::demo(Health::Ok);
+        summary.findings.push(Finding {
+            key: "hardware tools".into(),
+            group: Group::Health,
+            severity: Severity::Low,
+            title: "6 programs that talk to the hardware directly are running".into(),
+            evidence: vec!["e".into()],
+            advice: "a".into(),
+            metrics: Vec::new(),
+            impact: 0,
+        });
+        let lines = summary.result_lines();
+        assert!(!lines.iter().any(|l| l.contains("ORDER OF ATTACK") || l.contains("Start here")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Nothing here needs fixing")), "{lines:?}");
+        // One real finding brings the plan back.
+        summary.findings.insert(
+            0,
+            Finding {
+                key: "driver x.sys".into(),
+                group: Group::Interruptions,
+                severity: Severity::Medium,
+                title: "x.sys  -  something".into(),
+                evidence: vec!["e".into()],
+                advice: "a".into(),
+                metrics: Vec::new(),
+                impact: 0,
+            },
+        );
+        assert!(summary.result_lines().iter().any(|l| l.contains("Start here: x.sys")));
     }
 
     /// A long tail of findings must not bury the answer, and nothing may be silently dropped.
@@ -989,6 +1047,7 @@ mod tests {
                 culprit: "whole-PC freeze".into(),
                 marked: false,
                 cpus: (0..8).collect(),
+                on_cpu: None,
                 freeze: Some(FreezeFacts {
                     cpus: 8,
                     ncpu: 8,
@@ -1013,6 +1072,7 @@ mod tests {
                 culprit: "driver NETIO.SYS".into(),
                 marked: false,
                 cpus: vec![5],
+                on_cpu: Some("iCUE.exe (4242)".into()),
                 freeze: None,
             });
         }
@@ -1024,6 +1084,7 @@ mod tests {
             culprit: "process consent.exe (18812)".into(),
             marked: false,
             cpus: Vec::new(),
+            on_cpu: None,
             freeze: None,
         });
 
@@ -1064,6 +1125,14 @@ mod tests {
         // happen rather than how long the run was.
         let netio = summary.findings.iter().find(|f| f.key == "driver NETIO.SYS").expect("the network filter");
         assert_eq!((netio.severity, netio.group), (Severity::Medium, Group::Interruptions), "{:?}", netio.evidence);
+        // ...and the report says which program it was working for. All 55 stalls had iCUE.exe on
+        // the processor, which is what turns "update your network driver" into something to do.
+        assert!(
+            netio.evidence.iter().any(|e| e.contains("while iCUE.exe was on the processor, in 55 of the 55 of them")),
+            "{:?}",
+            netio.evidence
+        );
+        assert!(netio.evidence.iter().any(|e| e.contains("the program to try closing first")), "{:?}", netio.evidence);
         let consent = summary.findings.iter().find(|f| f.key.contains("consent.exe")).expect("the one starvation stall");
         assert_eq!(consent.severity, Severity::Low, "one 31 ms stall in an hour is a lead, not a HIGH");
 

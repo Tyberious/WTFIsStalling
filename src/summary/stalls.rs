@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use crate::analyze::IncidentClass;
 use crate::modules::knowledge;
 use crate::period;
-use crate::state::KIND_ISR;
+use crate::state::{Beats, BEAT_MS, KIND_ISR};
 use crate::util::{fmt_dur, ms_to_ticks, plural, qpc_freq, ticks_to_ms};
 
 use super::ctx::Ctx;
-use super::wording::{process_advice, process_title, GENERIC_DRIVER_ADVICE, POLLING_ADVICE};
+use super::wording::{on_behalf_of, process_advice, process_title, GENERIC_DRIVER_ADVICE, POLLING_ADVICE};
 use super::{Group, Metric, Severity};
 
 const DARK_ADVICE: &str = "Windows itself was frozen out, which points below the operating system. Update the BIOS/UEFI, load BIOS \
@@ -353,6 +353,147 @@ pub(super) fn long_dpc_isr(cx: &mut Ctx) {
     cx.drivers = drivers;
 }
 
+/// Fewest stalls blamed on one driver before the program it was working for is worth a sentence.
+/// Under this it is as likely to be whatever happened to be on the processor: the periodicity
+/// detector wants 5 events before it calls a pattern a pattern, and this is the same kind of claim.
+const MIN_ON_BEHALF_STALLS: usize = 4;
+/// ...and the share of THOSE stalls the same program has to hold. A plain majority would let
+/// "5 of 9" through, which is not a pattern anyone should act on; 60% is.
+const ON_BEHALF_SHARE: f64 = 0.6;
+
+/// The one program a driver was working for in most of its stalls, with how many that was.
+///
+/// `names` is one entry per stall blamed on the driver: the program that held the processor, or
+/// `None` where no single one did (or where naming it would say nothing - see
+/// `wording::on_behalf_of`). The denominator stays ALL of that driver's stalls, so the sentence
+/// the report prints uses the same number a reader can count in the table.
+fn worked_for(names: &[Option<String>]) -> Option<(String, usize, usize)> {
+    let total = names.len();
+    if total < MIN_ON_BEHALF_STALLS {
+        return None;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in names.iter().flatten() {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    let (name, n) = counts.into_iter().max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))?;
+    ((n as f64) >= total as f64 * ON_BEHALF_SHARE).then(|| (name.to_string(), n, total))
+}
+
+/// A driver does not decide to run: it runs because something asked it to. The CPU samples inside
+/// a stall say who that was, which turns "update your storage driver" into "this happens while
+/// iCUE.exe is running".
+pub(super) fn on_whose_behalf(cx: &mut Ctx) {
+    let mut per_driver: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    for i in cx.az.incidents.iter().filter(|i| !i.marked && i.class == IncidentClass::Kernel) {
+        let key = stable_key(&i.culprit);
+        if !key.starts_with("driver ") {
+            continue;
+        }
+        per_driver.entry(key).or_default().push(i.on_cpu.as_deref().and_then(on_behalf_of));
+    }
+    let mut drivers: Vec<(String, Vec<Option<String>>)> = per_driver.into_iter().collect();
+    drivers.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, names) in &drivers {
+        let Some((who, n, total)) = worked_for(names) else { continue };
+        let windows = who.ends_with("(part of Windows)");
+        let tail = if windows {
+            " That is part of Windows rather than a program to close, so the thing to change is whatever asked it to do that work."
+        } else {
+            " A driver runs because something asked it to, so this is the program to try closing first."
+        };
+        cx.found.note(key, format!("Its stalls happened while {who} was on the processor, in {n} of the {total} of them.{tail}"));
+    }
+}
+
+/// Drivers that wake on a steady beat without ever stalling anything.
+///
+/// The stall-based periodicity below can only see a driver whose bursts crossed a threshold. A
+/// sensor poll that takes 300 microseconds every five seconds crosses nothing, yet it is the same
+/// fingerprint and the same answer. So the ETW callback records, per DPC/ISR routine, which
+/// quarter-second bucket of the run it was active in (`state::Beats`: one bit per bucket, a fixed
+/// number of routines, so the memory is bounded and the callback stays O(1)), and this rolls those
+/// bits up per driver and runs the same detector over them.
+///
+/// Third-party drivers only, and only ones whose own version resource says who wrote them: Windows
+/// polls its own hardware on timers all day and saying so would be noise. A driver with no readable
+/// version resource is skipped rather than guessed at.
+/// Whether one driver's bucket map is a steady beat worth a note.
+///
+/// `is_microsoft` is what the file's own version resource says, or `None` when it has no readable
+/// one. Only a driver someone else wrote is reported: Windows polls its own hardware on timers all
+/// day, and an unknown author is not evidence of anything, so both are skipped rather than guessed.
+///
+/// The buckets are quarter-seconds, which is also `period::detect`'s own burst window, so a driver
+/// that is simply always busy produces gaps of one bucket and is rejected by the detector's
+/// one-second floor rather than by a rule of this function's own.
+fn steady_beat(is_microsoft: Option<bool>, buckets: &[usize]) -> Option<period::Period> {
+    if is_microsoft != Some(false) {
+        return None;
+    }
+    let times: Vec<f64> = buckets.iter().map(|i| *i as f64 * BEAT_MS / 1000.0).collect();
+    period::detect(&times)
+}
+
+pub(super) fn quiet_polling(cx: &mut Ctx) {
+    let beats = std::mem::take(&mut cx.beats);
+    let mut by_module: HashMap<String, Beats> = HashMap::new();
+    for (routine, b) in &beats {
+        let name = cx.az.modules.name(*routine);
+        by_module.entry(name).or_default().merge(b);
+    }
+    let mut modules: Vec<(String, Beats)> = by_module.into_iter().collect();
+    modules.sort_by(|a, b| b.1.count().cmp(&a.1.count()).then_with(|| a.0.cmp(&b.0)));
+
+    let mut said = 0;
+    for (module, b) in &modules {
+        // A driver that already has a finding has been said more about than this could add.
+        if cx.found.0.iter().any(|(k, _)| k == &format!("driver {module}")) || said >= MAX_QUIET_POLLERS {
+            continue;
+        }
+        let Some(p) = steady_beat(cx.az.modules.is_microsoft(module), &b.buckets()) else { continue };
+        let what = cx.az.modules.describe_short(module);
+        let key = format!("timer {module}");
+        cx.found.add(
+            &key,
+            Severity::Low,
+            format!("{module}  -  {what}: wakes on a steady timer"),
+            format!(
+                "Its interrupt handling ran in {} separate quarter-second slices of the run, spread evenly: {} Nothing it did was \
+                 long enough to stall this PC, so this is a lead rather than a problem.",
+                b.count(),
+                p.describe()
+            ),
+            format!(
+                "Nothing to change unless the hitches you are chasing keep the same time. If they do: {}",
+                knowledge(module).map(|k| k.advice).unwrap_or(POLLING_ADVICE)
+            ),
+            0,
+        );
+        // Both numbers a next run can compare: how often it wakes, and how much of the run it was
+        // awake for. Neither grows just because the run was longer.
+        cx.found.measure(&key, Metric::secs("wakes every", p.seconds));
+        if let Some((_, agg)) = cx.drivers.iter().find(|(name, _)| name == module) {
+            let total = agg.dpc_n + agg.isr_n;
+            cx.found.note(
+                &key,
+                format!(
+                    "Over the whole run that was {total} interrupt run{}, {} in total, at worst {}.",
+                    plural(total),
+                    fmt_dur(agg.total),
+                    fmt_dur(agg.dpc_max.max(agg.isr_max))
+                ),
+            );
+            cx.found.measure(&key, Metric::ms("worst DPC/ISR", ticks_to_ms(agg.dpc_max.max(agg.isr_max))));
+        }
+        said += 1;
+    }
+}
+
+/// At most this many "wakes on a timer" notes. They are Low and informational; a long tail of them
+/// would push real findings off the first screen for nothing.
+const MAX_QUIET_POLLERS: usize = 3;
+
 /// Stalls that repeat on a timer point at software polling rather than at hardware.
 pub(super) fn periodicity(cx: &mut Ctx) {
     let tally = &cx.tally;
@@ -428,6 +569,61 @@ mod tests {
         // 4 ms or more, once a minute or more often: that is what a person hears.
         assert_eq!(exec_severity(ms(4.2), 60, hour), Severity::High);
         assert_eq!(exec_severity(ms(4.2), 4, hour), Severity::Medium, "the same driver, four times an hour");
+    }
+
+    /// The rule for "running for iCUE.exe in 9 of 11 stalls": enough stalls to be a pattern, and a
+    /// clear majority of them.
+    #[test]
+    fn the_program_behind_a_driver_needs_both_enough_stalls_and_a_majority() {
+        let some = |names: &[&str]| -> Vec<Option<String>> { names.iter().map(|n| (!n.is_empty()).then(|| n.to_string())).collect() };
+
+        // 9 of 11: what the issue asks for.
+        let mut names = some(&["iCUE.exe"; 9]);
+        names.extend(some(&["", "explorer.exe"]));
+        assert_eq!(worked_for(&names), Some(("iCUE.exe".to_string(), 9, 11)));
+
+        // Three stalls all pointing the same way is still a coincidence, not a pattern.
+        assert_eq!(worked_for(&some(&["iCUE.exe"; 3])), None);
+        assert_eq!(worked_for(&[]), None);
+
+        // A bare majority of NAMED stalls is not enough when most stalls named nobody: the
+        // denominator is every stall blamed on the driver, which is what the sentence says too.
+        let mut thin = some(&["iCUE.exe", "iCUE.exe"]);
+        thin.extend(some(&["", "", "", "", ""]));
+        assert_eq!(worked_for(&thin), None);
+
+        // Split between two programs: neither reaches the bar, so nothing is said.
+        let split = some(&["iCUE.exe", "iCUE.exe", "chrome.exe", "chrome.exe", "explorer.exe"]);
+        assert_eq!(worked_for(&split), None);
+
+        // Exactly at the bar: 6 of 10.
+        let mut edge = some(&["iCUE.exe"; 6]);
+        edge.extend(some(&["chrome.exe"; 4]));
+        assert_eq!(worked_for(&edge).map(|(n, ..)| n), Some("iCUE.exe".to_string()));
+    }
+
+    /// The sub-threshold beat: a driver that wakes every 5 s for a moment, seen only through the
+    /// quarter-second bucket map, with nothing long enough to have stalled anything.
+    #[test]
+    fn a_driver_that_wakes_on_a_timer_is_seen_through_the_bucket_map() {
+        let third_party = Some(false);
+        // Every 5 s = every 20 buckets, for two minutes.
+        let every_5s: Vec<usize> = (0..24).map(|i| i * 20).collect();
+        let p = steady_beat(third_party, &every_5s).expect("a steady beat");
+        assert!((p.seconds - 5.0).abs() < 0.01, "period {}", p.seconds);
+
+        // Windows' own drivers, and drivers whose author cannot be read, are left alone.
+        assert!(steady_beat(Some(true), &every_5s).is_none(), "Windows polls its own hardware all day");
+        assert!(steady_beat(None, &every_5s).is_none(), "an unreadable version resource is not evidence of anything");
+
+        // A driver that is simply always busy fills every bucket: gaps of 0.25 s, under the
+        // detector's one-second floor, so it is a storm and not a timer.
+        let always: Vec<usize> = (0..400).collect();
+        assert!(steady_beat(third_party, &always).is_none());
+        // ...and neither too few wakes nor irregular ones are a pattern.
+        assert!(steady_beat(third_party, &[0, 20, 40]).is_none());
+        assert!(steady_beat(third_party, &[0, 12, 18, 44, 49, 120, 124]).is_none());
+        assert!(steady_beat(third_party, &[]).is_none());
     }
 
     #[test]

@@ -41,13 +41,24 @@ fn str_value<const N: usize>(subkey: &str, value: &str, flags: u32) -> Option<St
     (rc == ERROR_SUCCESS).then(|| from_wide(&buf))
 }
 
+/// A DWORD under HKEY_LOCAL_MACHINE. Absent and zero are different answers here: `MSISupported`
+/// missing means "the driver package never asked for message-signaled interrupts", while
+/// `MSISupported = 0` means someone wrote the opt-out deliberately. Never collapse the two.
+pub fn hklm_dword(subkey: &str, value: &str) -> Option<u32> {
+    dword(HKEY_LOCAL_MACHINE, subkey, value)
+}
+
 /// A DWORD under HKEY_CURRENT_USER (the per-user settings the GUI follows, such as the theme).
 pub fn hkcu_dword(subkey: &str, value: &str) -> Option<u32> {
+    dword(HKEY_CURRENT_USER, subkey, value)
+}
+
+fn dword(root: HKEY, subkey: &str, value: &str) -> Option<u32> {
     let mut out = 0u32;
     let mut size = 4u32;
     let rc = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             wide(subkey).as_ptr(),
             wide(value).as_ptr(),
             RRF_RT_REG_DWORD,
@@ -76,4 +87,21 @@ pub fn subkeys(path: &str) -> Vec<String> {
     }
     unsafe { RegCloseKey(key) };
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No value is asserted: this reads the real registry of whatever machine runs the test.
+    #[test]
+    fn hklm_reads_do_not_panic_and_absent_values_are_none() {
+        let build = hklm_str(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild");
+        println!("CurrentBuild = {build:?}");
+        println!("CSDVersion (DWORD) = {:?}", hklm_dword(r"SYSTEM\CurrentControlSet\Control\Windows", "CSDVersion"));
+        assert_eq!(hklm_dword(r"SOFTWARE\no such key at all", "nope"), None);
+        assert_eq!(hklm_dword(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "no such value"), None);
+        // A string value is not a DWORD, and must not be returned as one.
+        assert_eq!(hklm_dword(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild"), None);
+    }
 }

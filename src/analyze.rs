@@ -116,9 +116,20 @@ pub(crate) struct IncidentSummary {
     pub(crate) marked: bool,
     /// The CPUs whose probes were held up (system-wide indexes); empty for CPU starvation.
     pub(crate) cpus: Vec<u16>,
+    /// The process that held most of the CPU samples inside this stall, when one clearly did.
+    ///
+    /// A driver runs on behalf of whoever asked it to work, so for a stall blamed on a driver this
+    /// is the program that set it off ("running for iCUE.exe"). Never a culprit by itself, and
+    /// never set for a whole-PC freeze, where everything on the CPUs was stopped too.
+    pub(crate) on_cpu: Option<String>,
     /// Set on a `Freeze`; what the interrupt records say about it.
     pub(crate) freeze: Option<FreezeFacts>,
 }
+
+/// Share of a stall's CPU samples one process must hold before the report will say the driver was
+/// running for it. Above `SHARE_RULE` (0.4, the bar for blaming a process outright) on purpose: a
+/// plain majority is the least that can honestly be called "this program was on the processor".
+const ON_BEHALF_SHARE: f64 = 0.5;
 
 /// One slow request seen on a disk, and whether a whole-PC freeze explains it.
 #[derive(Clone, Copy)]
@@ -483,20 +494,25 @@ impl Analyzer {
         }
 
         let mut freeze = None;
+        let mut on_cpu = None;
         let culprit = match class {
             IncidentClass::Freeze => {
                 let (culprit, facts) = self.verdict_freeze(kernel, &ev, ncpu, start, end);
                 freeze = Some(facts);
                 culprit
             }
-            IncidentClass::Kernel => self.verdict_kernel(kernel, &ev),
+            IncidentClass::Kernel => {
+                let (culprit, who) = self.verdict_kernel(kernel, &ev);
+                on_cpu = who;
+                culprit
+            }
             IncidentClass::Starvation => self.verdict_sched(&ev, start, end),
         };
         self.print_io_context(&ev);
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
-        self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, freeze });
+        self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, on_cpu, freeze });
     }
 
     /// "4" on an ordinary PC; "4 (E-core)" where the cores are not all the same. Nothing is
@@ -589,12 +605,21 @@ impl Analyzer {
         );
         let lead = start - ms_to_ticks(0.5);
         let ev = self.gather(lead, end, from, lead - ms_to_ticks(REF_MS), caught_up);
-        let culprit = self.verdict_kernel(&cluster, &ev);
+        let (culprit, on_cpu) = self.verdict_kernel(&cluster, &ev);
         self.print_io_context(&ev);
         let mut cpus: Vec<u16> = cluster.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
-        self.incidents.push(IncidentSummary { class: IncidentClass::Kernel, start, dur, culprit, marked: true, cpus, freeze: None });
+        self.incidents.push(IncidentSummary {
+            class: IncidentClass::Kernel,
+            start,
+            dur,
+            culprit,
+            marked: true,
+            cpus,
+            on_cpu,
+            freeze: None,
+        });
     }
 
     /// The one place a file path turns into report text: NT device path -> drive letter, then
@@ -709,7 +734,9 @@ impl Analyzer {
         }
     }
 
-    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> String {
+    /// Returns the culprit, and the program that held the CPU through the stall when one clearly
+    /// did. See `IncidentSummary::on_cpu`.
+    fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence) -> (String, Option<String>) {
         let look = self.look(stalls, ev);
         let cpus = look.per_cpu.len();
         // Ordinary DPCs running right through the stall on most of the stalled CPUs means no CPU
@@ -760,9 +787,17 @@ impl Analyzer {
             "unexplained".to_string()
         };
 
+        // Who the CPU was actually running, whatever the verdict was. "Idle" is the processor
+        // having nothing to do, and the tool's own process is already filtered out upstream.
+        let on_cpu = look
+            .on_cpu_procs
+            .first()
+            .filter(|(p, s)| *s >= ON_BEHALF_SHARE && !p.starts_with("Idle") && look.samples >= MIN_SAMPLES)
+            .map(|(p, _)| p.clone());
+
         self.print_routines(&look);
         self.print_on_cpu(&look.on_cpu_procs, &look.on_cpu_mods);
-        culprit
+        (culprit, on_cpu)
     }
 
     /// The whole machine stopped. Whatever the CPU samples landed in was stopped with it, so
@@ -1374,7 +1409,7 @@ mod tests {
         let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![dpc(0, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "driver nvlddmkm.sys");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver nvlddmkm.sys");
     }
 
     #[test]
@@ -1384,7 +1419,7 @@ mod tests {
         let s = stall(0, 0.0, 100.0);
         // Same DPC, same size, but it ran on CPU 1 while the probe stalled on CPU 0.
         let ev = evidence(vec![dpc(1, 0.0, 40.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     #[test]
@@ -1394,7 +1429,7 @@ mod tests {
         let s = stall(0, 0.0, 100.0);
         // 34% covered: just below the 35% rule-1 threshold.
         let ev = evidence(vec![dpc(0, 0.0, 34.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     #[test]
@@ -1406,7 +1441,7 @@ mod tests {
         // window. Neither driver's own code reaches the 35% bar, and the two must not be added
         // together into one: the honest answer is that nothing explains the stall.
         let ev = evidence(vec![dpc(0, 0.0, 20.0, MOD_A + 0x10), isr(0, 0.0, 20.0, MOD_B + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     /// The dilution bug from the verdict audit: on a multi-CPU cluster, coverage used to be
@@ -1419,12 +1454,12 @@ mod tests {
         // of the cluster and now correctly reads as "it held both of them".
         let stalls = [stall(0, 0.0, 10.0), stall(1, 0.0, 10.0)];
         let ev = evidence(vec![dpc(0, 0.0, 9.0, MOD_A + 0x10), dpc(1, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&stalls, &ev), "driver nvlddmkm.sys");
+        assert_eq!(az.verdict_kernel(&stalls, &ev).0, "driver nvlddmkm.sys");
 
         // Holding ONE of eight CPUs is not an explanation for an eight-CPU event.
         let stalls: Vec<Stall> = (0..8).map(|c| stall(c, 0.0, 10.0)).collect();
         let ev = evidence(vec![dpc(3, 0.0, 9.0, MOD_A + 0x10)], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&stalls, &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&stalls, &ev).0, "unexplained");
     }
 
     #[test]
@@ -1436,11 +1471,11 @@ mod tests {
 
         let mut profiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let v = profiled.verdict_kernel(&[s], &ev);
-        assert!(v.starts_with("CPU went dark"), "expected 'CPU went dark...', got {v:?}");
+        assert!(v.0.starts_with("CPU went dark"), "expected 'CPU went dark...', got {v:?}");
 
         // Same evidence, but sampling wasn't enabled: it must not claim the CPU went dark.
         let mut unprofiled = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
-        assert_eq!(unprofiled.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(unprofiled.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     /// From the field logs: "the CPU went dark, Windows itself was frozen out" printed for a
@@ -1456,7 +1491,7 @@ mod tests {
         let execs: Vec<ExecRec> = (0..800).map(|i| dpc(0, i as f64, 0.01, MOD_A + 0x10)).collect();
         let ev = evidence(execs, vec![], baseline);
         let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), true);
-        assert_eq!(az.verdict_kernel(&[s], &ev), "not woken (timers or scheduling)");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "not woken (timers or scheduling)");
     }
 
     #[test]
@@ -1467,7 +1502,7 @@ mod tests {
         let s = stall(0, 0.0, 2.0);
         let ev = evidence(vec![], vec![], baseline);
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     #[test]
@@ -1484,7 +1519,7 @@ mod tests {
             sample(0, 50.0, USER_IP, 300),
         ];
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "driver rtwlane.sys");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver rtwlane.sys");
     }
 
     /// The behavior that was right and has to survive: one core held for 8 ms with a network
@@ -1498,7 +1533,7 @@ mod tests {
         let mut samples: Vec<(SampleRec, u32)> = (0..9).map(|i| sample(5, i as f64, MOD_B + 0x10, 4)).collect();
         samples.push(sample(5, 9.0, USER_IP, 4));
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "driver NETIO.SYS");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "driver NETIO.SYS");
     }
 
     #[test]
@@ -1514,7 +1549,7 @@ mod tests {
             sample(0, 50.0, USER_IP, 300),
         ];
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "process game.exe (200)");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "process game.exe (200)");
     }
 
     /// A share of nearly nothing is not evidence. Two samples in a stall cannot name a culprit.
@@ -1524,7 +1559,7 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![], vec![sample(0, 10.0, USER_IP, 200), sample(0, 20.0, USER_IP, 200)], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     #[test]
@@ -1532,7 +1567,7 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
         let s = stall(0, 0.0, 100.0);
         let ev = evidence(vec![], vec![], HashMap::new());
-        assert_eq!(az.verdict_kernel(&[s], &ev), "unexplained");
+        assert_eq!(az.verdict_kernel(&[s], &ev).0, "unexplained");
     }
 
     #[test]

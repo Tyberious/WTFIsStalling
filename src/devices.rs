@@ -177,8 +177,17 @@ pub(crate) fn clean_desc(s: &str) -> String {
 }
 
 pub(crate) fn present(instance_id: &str) -> bool {
+    devnode(instance_id).is_some()
+}
+
+/// The device node handle for a present device, which is what the configuration-manager resource
+/// and property calls take. `CM_LOCATE_DEVNODE_NORMAL` only finds devices that are present now,
+/// which is exactly the filter every caller here wants: the registry remembers everything ever
+/// plugged in. <https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_locate_devnodew>
+pub(crate) fn devnode(instance_id: &str) -> Option<u32> {
     let mut devinst = 0u32;
-    unsafe { CM_Locate_DevNodeW(&mut devinst, wide(instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS }
+    let ok = unsafe { CM_Locate_DevNodeW(&mut devinst, wide(instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS };
+    ok.then_some(devinst)
 }
 
 /// Today's date in local time, for driver ages.
