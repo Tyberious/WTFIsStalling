@@ -503,7 +503,11 @@ mod tests {
         let s = run(heavy, Some("this PC has few processor cores"), 10_000);
         let f = s.findings.iter().find(|f| f.title.starts_with("Measuring cost")).expect("the cost is a finding");
         assert_eq!(f.severity, Severity::Low, "an observation about the measuring must never be High or Medium");
-        assert_eq!(s.health, Health::Ok, "and must not turn the banner into a problem");
+        // Compared with a cheap run on the SAME machine rather than with `Health::Ok`: summarize()
+        // also reads this PC's real event log and drives, and a CI runner or a developer's PC may
+        // have something genuine to report there. The point is that the cost changes nothing.
+        let calm = Overhead { monitor_100ns: 10_000_000, probes_100ns: Some(20_000_000), elapsed_s: 60.0, ncpu: 16 };
+        assert_eq!(s.health, run(calm, None, 0).health, "and must not change the banner");
         assert!(f.evidence.iter().any(|e| e.contains("total processor capacity")), "{:?}", f.evidence);
         assert!(f.evidence.iter().any(|e| e.contains("200% of one processor core")), "{:?}", f.evidence);
         assert!(f.evidence.iter().any(|e| e.contains("10000 of the 100000 kernel events")), "{:?}", f.evidence);
