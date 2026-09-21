@@ -378,6 +378,17 @@ impl Summary {
                     vec![Metric::count("slow requests", 3), Metric::ms("worst wait", 840.0)],
                 ),
                 finding(
+                    Severity::Medium,
+                    Group::OneProgram,
+                    "gpu frames",
+                    "The picture stopped updating when you felt the hitch",
+                    vec![
+                        "At 2 of the 3 moment(s) you flagged, the graphics kernel put no new picture on screen for up to 240 ms. The                          program whose frames stopped was dwm.exe  -  part of Windows: the desktop compositor that draws every window.",
+                    ],
+                    gpu::FRAMES_ADVICE,
+                    vec![Metric::ms("longest moment with no new picture", 240.0)],
+                ),
+                finding(
                     Severity::Low,
                     Group::Health,
                     "disk 0",
@@ -547,6 +558,8 @@ pub struct RunData<'a> {
     pub io_warn: i64,
     pub clock: &'a [ClockSample],
     pub gpu: &'a GpuLog,
+    /// What the second (graphics-kernel) ETW session saw, and why it did not run when it did not.
+    pub gpu_trace: crate::gputrace::GpuTraceReport,
 }
 
 impl Analyzer {
@@ -758,6 +771,7 @@ mod tests {
                 io_warn: ms_to_ticks(200.0),
                 clock: &[],
                 gpu: &GpuLog::default(),
+                gpu_trace: Default::default(),
             })
         };
 
@@ -820,6 +834,7 @@ mod tests {
             io_warn: ms_to_ticks(200.0),
             clock: &[],
             gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
         });
         let flagged_findings: Vec<&Finding> =
             summary.findings.iter().filter(|f| f.evidence.iter().any(|e| e.contains("of the 3 moments you flagged"))).collect();
@@ -870,6 +885,7 @@ mod tests {
             io_warn: ms_to_ticks(200.0),
             clock: &[],
             gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
         });
         let edge: Vec<&Finding> = summary.findings.iter().filter(|f| f.title.starts_with("msedge.exe")).collect();
         assert_eq!(edge.len(), 1, "one finding for the program, not one per process");
@@ -925,6 +941,7 @@ mod tests {
             io_warn: ms_to_ticks(200.0),
             clock: &[],
             gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
         });
         let f = |key: &str| summary.findings.iter().find(|f| f.key == key).unwrap_or_else(|| panic!("no finding for {key}"));
 
@@ -1028,6 +1045,7 @@ mod tests {
                 io_warn: ms_to_ticks(200.0),
                 clock: &[],
                 gpu: &GpuLog::default(),
+                gpu_trace: Default::default(),
             })
         };
 
@@ -1283,6 +1301,7 @@ mod tests {
             io_warn: ms_to_ticks(200.0),
             clock: &[],
             gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
         });
 
         let freeze = summary.findings.iter().find(|f| f.key == "whole-PC freeze").expect("one freeze finding");

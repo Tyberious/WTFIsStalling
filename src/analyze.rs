@@ -9,6 +9,7 @@ use crate::disks::DiskMap;
 use crate::diskwait::{self, Role};
 use crate::diskwhy::{self, Cause, DiskWhy};
 use crate::files::{self, DosMap};
+use crate::gputrace::{GpuTrace, GpuWindow, MarkGpu};
 use crate::health::{self, DriveHealth};
 use crate::intr::{self, Flow, Reference};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
@@ -228,6 +229,11 @@ pub struct Analyzer {
     /// Flagged moments the thread-switch rings did not reach back far enough to explain.
     pub(crate) switch_uncovered: std::sync::atomic::AtomicU32,
     pub(crate) switch_gathers: std::sync::atomic::AtomicU32,
+    /// The graphics-kernel trace, when a second session could be started for it.
+    pub(crate) gputrace: Option<Arc<GpuTrace>>,
+    /// What it saw at each flagged moment. Kept as the moment is examined: its rings only hold a
+    /// few seconds and the summary runs minutes later.
+    pub(crate) gpu_marks: Vec<MarkGpu>,
 }
 
 /// Everything ETW recorded around one incident, copied out so the lock is held briefly.
@@ -323,6 +329,8 @@ impl Analyzer {
             notable_total: 0,
             switch_uncovered: Default::default(),
             switch_gathers: Default::default(),
+            gputrace: None,
+            gpu_marks: Vec::new(),
         }
     }
 
@@ -374,6 +382,8 @@ impl Analyzer {
             notable_total: 0,
             switch_uncovered: Default::default(),
             switch_gathers: Default::default(),
+            gputrace: None,
+            gpu_marks: Vec::new(),
         }
     }
 
@@ -599,6 +609,9 @@ impl Analyzer {
             IncidentClass::Starvation => self.verdict_sched(&ev, start, end, &probes),
         };
         self.print_io_context(&ev);
+        if let Some(w) = self.gpu_window(start - ms_to_ticks(100.0), end) {
+            self.print_gpu(&w);
+        }
         if !ev.etw_caught_up {
             say!("    note: kernel trace data for this window was incomplete (trace lagging or events lost)");
         }
@@ -812,6 +825,13 @@ impl Analyzer {
             MARK_BEFORE_MS / 1000.0
         );
 
+        // The whole flagged window, whatever the CPUs did in it: "the picture stopped updating"
+        // is exactly the kind of hitch that leaves no trace on the processor side.
+        if let Some(w) = self.gpu_window(from, to) {
+            self.print_gpu(&w);
+            self.note_gpu_mark(&w);
+        }
+
         // A full stall in the window already has (or will get) its own entry and verdict.
         let full = self.incidents.iter().filter(|i| !i.marked && i.start >= from && i.start <= to).count()
             + self.pending.iter().filter(|s| s.start >= from && s.start <= to).count();
@@ -903,6 +923,54 @@ impl Analyzer {
                 say!("    Kept waiting: {name} was blocked for {}{why}{by}", fmt_dur(w.blocked));
             }
         }
+    }
+
+    /// Records the graphics-kernel trace to read alongside the kernel one.
+    pub fn set_gpu_trace(&mut self, trace: Arc<GpuTrace>) {
+        self.gputrace = Some(trace);
+    }
+
+    /// What the graphics-kernel trace saw in one window, or `None` when there is no such trace.
+    fn gpu_window(&self, from: i64, to: i64) -> Option<GpuWindow> {
+        let trace = self.gputrace.as_ref()?;
+        let w = trace.inner.lock().unwrap_or_else(|e| e.into_inner()).window(from, to);
+        Some(w)
+    }
+
+    /// One compact line of GPU facts for the event log. Facts only: whether any of this had
+    /// anything to do with the hitch is the verdict's and the findings' business, and "at the
+    /// same moment" is as far as either may go without a mechanism.
+    fn print_gpu(&mut self, w: &GpuWindow) {
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(c) = w.display.filter(|c| c.stalled()) {
+            facts.push(format!("the displays stopped refreshing for {:.0} ms (normally every {:.1} ms)", c.worst_ms, c.typical_ms));
+        }
+        if let Some((pid, c)) = w.program.as_ref().filter(|(_, c)| c.stalled()) {
+            let who = process_name(&self.procs.label(*pid, 0));
+            facts.push(format!("{who} put up no new frame for {:.0} ms (normally every {:.1} ms)", c.worst_ms, c.typical_ms));
+        }
+        if w.trim_bytes > 0 {
+            facts.push(format!("video memory was over budget; Windows asked for {:.0} MB to be freed", w.trim_bytes as f64 / 1e6));
+        }
+        if w.residency_ops > 0 && w.residency_ms >= 1.0 {
+            facts.push(format!("{} video memory transfer(s) took {:.0} ms in total", w.residency_ops, w.residency_ms));
+        }
+        if !facts.is_empty() {
+            say!("    GPU: {}.", facts.join("; "));
+        }
+    }
+
+    /// Keeps what the GPU trace saw at a flagged moment, for the summary to count later.
+    fn note_gpu_mark(&mut self, w: &GpuWindow) {
+        let program = w.program.as_ref().map(|(pid, c)| (process_name(&self.procs.label(*pid, 0)), c.worst_ms, c.stalled()));
+        self.gpu_marks.push(MarkGpu {
+            covered: w.refresh_covered || w.present_covered,
+            display_gap_ms: w.display.map_or(0.0, |c| c.worst_ms),
+            display_stalled: w.display.is_some_and(|c| c.stalled()),
+            program,
+            trim_bytes: w.trim_bytes,
+            residency_ms: w.residency_ms,
+        });
     }
 
     /// The one place a file path turns into report text: NT device path -> drive letter, then

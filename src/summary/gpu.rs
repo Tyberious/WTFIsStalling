@@ -3,11 +3,13 @@
 
 use crate::evlog;
 use crate::gpu::GpuLog;
+use crate::gputrace::{GpuTraceReport, MarkGpu};
 use crate::modules::knowledge;
 use crate::procs::process_name;
 use crate::util::ms_to_ticks;
 
 use super::ctx::{when_text, Ctx, EVENT_LOG_DAYS};
+use super::wording::process_title;
 use super::{Metric, Severity};
 
 const DISPLAY_RESET_ADVICE: &str = "The graphics driver stopped answering for about two seconds, so Windows restarted it: that is a \
@@ -44,6 +46,15 @@ const GPU_WAITING_ADVICE: &str = "At the moments you flagged, the graphics card 
     of the PC: the game's own CPU work (one overloaded thread is enough), loading or shader compilation, or one of the other \
     findings in this report. Lowering graphics settings will not help with this kind of hitch.";
 
+/// The picture stopping is the symptom, not the cause, so this must not read as blame on whatever
+/// program happened to be drawing (it is often the desktop compositor, which is part of Windows).
+pub(super) const FRAMES_ADVICE: &str = "This is the hitch itself rather than its cause: the graphics kernel had no new picture to put on \
+    screen. If anything else in this report names a driver, a disk or video memory, change that one thing first and run this again. \
+    If nothing else shows up, the cause is inside the program drawing the picture or on the graphics card: install the current \
+    graphics driver from the card maker's site, turn off in-game overlays and recording tools (Discord, GeForce Experience, Xbox Game \
+    Bar, streaming software), and lower the settings that load the card the most (resolution or render scale, ray tracing, frame \
+    generation).";
+
 #[derive(Default)]
 struct GpuReport {
     findings: Vec<GpuFinding>,
@@ -63,9 +74,17 @@ struct GpuFinding {
     metric: Metric,
 }
 
-/// Findings and detail lines from the once-a-second GPU samples. `marks` are the moments the user
-/// flagged (QPC); `name_of` turns a pid into a program name.
-fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> String) -> GpuReport {
+/// Findings and detail lines from the once-a-second GPU samples and the graphics-kernel trace.
+/// `marks` are the moments the user flagged (QPC); `name_of` turns a pid into a program name;
+/// `trace` and `gpu_marks` are what the second ETW session saw over the run and at each of those
+/// moments (both empty when there was no such session).
+fn gpu_findings(
+    log: &GpuLog,
+    marks: &[i64],
+    name_of: &mut dyn FnMut(u32) -> String,
+    trace: &GpuTraceReport,
+    gpu_marks: &[MarkGpu],
+) -> GpuReport {
     let (mut findings, mut lines) = (Vec::new(), Vec::new());
     let mut vram_clear: Option<(u64, String)> = None;
     let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / 1e9);
@@ -197,7 +216,98 @@ fn gpu_findings(log: &GpuLog, marks: &[i64], name_of: &mut dyn FnMut(u32) -> Str
             }
         }
     }
-    let vram_clear = if findings.iter().any(|f| f.key.starts_with("gpu vram")) { None } else { vram_clear.map(|(_, text)| text) };
+    // ---- what the graphics-kernel trace saw: frame cadence and video memory pressure
+    let totals = &trace.totals;
+    if let Some(note) = &trace.note {
+        lines.push(format!("  frame timing and video memory pressure were not measured: {note}"));
+    }
+    if totals.available {
+        lines.push(format!(
+            "  graphics kernel trace: {} display refreshes, {} frames handed to the graphics card",
+            totals.refresh_ticks, totals.presents
+        ));
+        if totals.residency_ops > 0 {
+            let budget = if totals.trim_events == 0 {
+                "never over budget".to_string()
+            } else {
+                format!("over budget {} time(s), up to {} asked to be freed", totals.trim_events, gb(totals.trim_max_bytes))
+            };
+            lines.push(format!(
+                "  video memory moves: {} transfer(s) taking {:.0} ms in total; {budget}",
+                totals.residency_ops, totals.residency_ms
+            ));
+        }
+    }
+
+    // Windows asking for video memory to be freed is the card's own answer to "is it full",
+    // which is worth more than the once-a-second counter and is attributed the same way: to the
+    // adapter with the most video memory, the one games run on.
+    if totals.trim_events > 0 {
+        let biggest = log.adapters.iter().max_by_key(|a| a.vram);
+        let at_mark = gpu_marks.iter().filter(|m| m.trim_bytes > 0).count();
+        let mut evidence = format!(
+            "The graphics card ran out of room {} time(s) while monitoring: Windows asked for up to {} of video memory to be freed.",
+            totals.trim_events,
+            gb(totals.trim_max_bytes)
+        );
+        if totals.residency_failed > 0 {
+            evidence.push_str(&format!(" {} of those attempts could not be satisfied at all.", totals.residency_failed));
+        }
+        if at_mark > 0 {
+            evidence.push_str(&format!(" {at_mark} of the {} moments you flagged happened while that was going on.", gpu_marks.len()));
+        }
+        findings.push(GpuFinding {
+            // The same subject as the counter-based finding above, so the two become one entry.
+            key: biggest.map_or_else(|| "gpu vram".to_string(), |a| format!("gpu vram {}", a.name)),
+            severity: if at_mark > 0 || totals.residency_failed > 0 { Severity::High } else { Severity::Medium },
+            title: biggest.map_or_else(|| "Video memory ran out".to_string(), |a| format!("{}  -  video memory ran out", a.name)),
+            evidence,
+            advice: VRAM_ADVICE,
+            metric: Metric::count("times video memory ran out", totals.trim_events as u32),
+        });
+    }
+
+    // ---- the picture stopping at a flagged moment
+    let covered = gpu_marks.iter().filter(|m| m.covered).count();
+    let stopped: Vec<&MarkGpu> =
+        gpu_marks.iter().filter(|m| m.covered && (m.display_stalled || m.program.as_ref().is_some_and(|(_, _, s)| *s))).collect();
+    if covered > 0 {
+        lines.push(format!(
+            "  at the {} moment(s) you flagged: {covered} with frame-timing evidence, {} where the picture stopped updating",
+            gpu_marks.len(),
+            stopped.len()
+        ));
+    }
+    if !stopped.is_empty() {
+        let worst = stopped.iter().map(|m| m.display_gap_ms.max(m.program.as_ref().map_or(0.0, |(_, gap, _)| *gap))).fold(0.0, f64::max);
+        let who = stopped
+            .iter()
+            .filter_map(|m| m.program.as_ref())
+            .filter(|(_, _, s)| *s)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(name, ..)| name.clone());
+        let mut evidence = format!(
+            "At {} of the {} moment(s) you flagged, the graphics kernel put no new picture on screen for up to {worst:.0} ms.",
+            stopped.len(),
+            gpu_marks.len()
+        );
+        if let Some(name) = &who {
+            evidence.push_str(&format!(" The program whose frames stopped was {}.", process_title(name)));
+        }
+        findings.push(GpuFinding {
+            key: "gpu frames".into(),
+            // A symptom with no named cause must not set the banner on a single sighting.
+            severity: if stopped.len() * 2 > covered { Severity::Medium } else { Severity::Low },
+            title: "The picture stopped updating when you felt the hitch".into(),
+            evidence,
+            advice: FRAMES_ADVICE,
+            metric: Metric::ms("longest moment with no new picture", worst),
+        });
+    }
+
+    // Video memory cannot be ruled out while the card was asking for room.
+    let ruled_out = !findings.iter().any(|f| f.key.starts_with("gpu vram")) && totals.trim_events == 0;
+    let vram_clear = if ruled_out { vram_clear.map(|(_, text)| text) } else { None };
     GpuReport { findings, lines, vram_clear }
 }
 
@@ -236,7 +346,9 @@ pub(super) fn driver_resets(cx: &mut Ctx) {
 pub(super) fn graphics(cx: &mut Ctx) {
     let gpu = cx.run.gpu;
     let mark_times = cx.az.mark_times.clone();
-    let gpu_report = gpu_findings(gpu, &mark_times, &mut |pid| process_name(&cx.az.procs.label(pid, 0)));
+    let trace = cx.run.gpu_trace.clone();
+    let gpu_marks = cx.az.gpu_marks.clone();
+    let gpu_report = gpu_findings(gpu, &mark_times, &mut |pid| process_name(&cx.az.procs.label(pid, 0)), &trace, &gpu_marks);
     let gpu_lines = gpu_report.lines;
     for f in gpu_report.findings {
         cx.found.add(&f.key, f.severity, f.title, f.evidence, f.advice.to_string(), 0);
@@ -257,6 +369,117 @@ pub(super) fn graphics(cx: &mut Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gputrace::GpuTraceTotals;
+
+    /// A run in which the graphics-kernel session did work.
+    fn trace(trim_events: u64, trim_max: u64, failed: u64) -> GpuTraceReport {
+        GpuTraceReport {
+            totals: GpuTraceTotals {
+                available: true,
+                events: 1_000,
+                refresh_ticks: 600,
+                presents: 400,
+                residency_ops: 50,
+                residency_ms: 120.0,
+                trim_events,
+                trim_max_bytes: trim_max,
+                residency_failed: failed,
+            },
+            ..GpuTraceReport::default()
+        }
+    }
+
+    fn mark(stalled: bool, who: &str, gap_ms: f64) -> MarkGpu {
+        MarkGpu {
+            covered: true,
+            display_gap_ms: if stalled { gap_ms } else { 8.0 },
+            display_stalled: stalled,
+            program: Some((who.to_string(), gap_ms, stalled)),
+            trim_bytes: 0,
+            residency_ms: 0.0,
+        }
+    }
+
+    /// The card telling Windows to free video memory is the card's own answer to "is it full?",
+    /// and it has to land on the same subject as the once-a-second counter, not beside it.
+    #[test]
+    fn video_memory_running_out_is_the_same_subject_as_full_video_memory() {
+        const GB: u64 = 1_000_000_000;
+        let calm: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 30.0, 6 * GB, 0)).collect();
+        let report = gpu_findings(&gpu_log(12 * GB, &calm), &[], &mut |_| String::new(), &trace(47, 512_000_000, 0), &[]);
+        assert!(report.vram_clear.is_none(), "the card asked for room, so video memory cannot be ruled out");
+        let f = report.findings.iter().find(|f| f.key.starts_with("gpu vram")).expect("a video memory finding");
+        assert_eq!(f.key, "gpu vram NVIDIA GeForce RTX 4070", "the same key the counters use, so the two merge into one entry");
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(f.evidence.contains("ran out of room 47 time(s)"), "{}", f.evidence);
+        assert!(f.evidence.contains("up to 0.5 GB"), "{}", f.evidence);
+        assert!(report.lines.iter().any(|l| l.contains("600 display refreshes")), "{:?}", report.lines);
+        assert!(report.lines.iter().any(|l| l.contains("over budget 47 time(s)")), "{:?}", report.lines);
+
+        // Full counters AND the card asking for room: one subject, two pieces of evidence.
+        let full: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 80.0, 11_600_000_000, 0)).collect();
+        let report = gpu_findings(&gpu_log(12 * GB, &full), &[], &mut |_| "game.exe".into(), &trace(3, GB, 0), &[]);
+        let keys: Vec<&str> = report.findings.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["gpu vram NVIDIA GeForce RTX 4070", "gpu vram NVIDIA GeForce RTX 4070"]);
+
+        // An attempt that failed outright, or one at a flagged moment, is the worse case.
+        let at_mark = [MarkGpu { covered: true, trim_bytes: GB, ..MarkGpu::default() }];
+        let report = gpu_findings(&gpu_log(12 * GB, &calm), &[], &mut |_| String::new(), &trace(9, GB, 2), &at_mark);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.evidence.contains("2 of those attempts could not be satisfied"), "{}", f.evidence);
+        assert!(f.evidence.contains("1 of the 1 moments you flagged"), "{}", f.evidence);
+
+        // No trace at all: nothing is said about any of it, and the counters still rule VRAM out.
+        let report = gpu_findings(&gpu_log(12 * GB, &calm), &[], &mut |_| String::new(), &GpuTraceReport::default(), &[]);
+        assert!(report.findings.is_empty() && report.vram_clear.is_some());
+        assert!(!report.lines.iter().any(|l| l.contains("graphics kernel")), "{:?}", report.lines);
+    }
+
+    /// The program whose frames stopped is the victim, never the culprit - and it is very often
+    /// the desktop compositor, which nobody can close.
+    #[test]
+    fn the_picture_stopping_is_reported_without_telling_anyone_to_close_windows() {
+        let marks = [mark(true, "dwm.exe", 180.0), mark(true, "dwm.exe", 240.0), mark(false, "dwm.exe", 7.0)];
+        let report = gpu_findings(&GpuLog::default(), &[], &mut |_| String::new(), &trace(0, 0, 0), &marks);
+        let f = report.findings.iter().find(|f| f.key == "gpu frames").expect("a frames finding");
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(f.title.starts_with("The picture stopped updating"), "{}", f.title);
+        assert!(f.evidence.contains("At 2 of the 3 moment(s) you flagged"), "{}", f.evidence);
+        assert!(f.evidence.contains("up to 240 ms"), "{}", f.evidence);
+        assert!(f.evidence.contains("part of Windows"), "the compositor is named as what it is: {}", f.evidence);
+        let text = format!("{} {} {}", f.title, f.evidence, f.advice).to_lowercase();
+        for forbidden in ["close dwm", "close this program", "end task", "uninstall"] {
+            assert!(!text.contains(forbidden), "says '{forbidden}': {text}");
+        }
+        assert!(report.lines.iter().any(|l| l.contains("3 with frame-timing evidence, 2 where the picture stopped")), "{:?}", report.lines);
+
+        // One moment out of three is a lead, not a suspect.
+        let one = [mark(true, "game.exe", 90.0), mark(false, "game.exe", 7.0), mark(false, "game.exe", 7.0)];
+        let report = gpu_findings(&GpuLog::default(), &[], &mut |_| String::new(), &trace(0, 0, 0), &one);
+        assert_eq!(report.findings.iter().find(|f| f.key == "gpu frames").unwrap().severity, Severity::Low);
+
+        // A moment the rings did not reach back over says nothing at all.
+        let uncovered = [MarkGpu { covered: false, display_stalled: true, display_gap_ms: 900.0, ..MarkGpu::default() }];
+        let report = gpu_findings(&GpuLog::default(), &[], &mut |_| String::new(), &trace(0, 0, 0), &uncovered);
+        assert!(!report.findings.iter().any(|f| f.key == "gpu frames"), "an uncovered moment is not evidence");
+        assert!(!report.lines.iter().any(|l| l.contains("where the picture stopped")), "{:?}", report.lines);
+    }
+
+    /// A run with no GPU evidence has to say so in one line, not go quiet.
+    #[test]
+    fn a_run_without_the_second_session_says_why() {
+        let report = gpu_findings(
+            &GpuLog::default(),
+            &[],
+            &mut |_| String::new(),
+            &GpuTraceReport { note: Some("light mode leaves the second trace session off".into()), ..GpuTraceReport::default() },
+            &[],
+        );
+        assert!(report.findings.is_empty());
+        assert_eq!(report.lines.len(), 1);
+        assert!(report.lines[0].contains("were not measured: light mode"), "{:?}", report.lines);
+    }
 
     fn gpu_log(vram: u64, samples: &[(f64, f64, u64, u64)]) -> GpuLog {
         use crate::gpu::{Adapter, AdapterSample, GpuSample};
@@ -286,7 +509,13 @@ mod tests {
         const GB: u64 = 1_000_000_000;
         let samples: Vec<(f64, f64, u64, u64)> =
             (0..20).map(|i| (i as f64, 80.0, if i >= 10 { 11_600_000_000 } else { 6 * GB }, 2 * GB)).collect();
-        let report = gpu_findings(&gpu_log(12 * GB, &samples), &[ms_to_ticks(15_000.0)], &mut |_| "game.exe".into());
+        let report = gpu_findings(
+            &gpu_log(12 * GB, &samples),
+            &[ms_to_ticks(15_000.0)],
+            &mut |_| "game.exe".into(),
+            &GpuTraceReport::default(),
+            &[],
+        );
         assert!(report.vram_clear.is_none(), "full memory must not also be declared fine");
         let vram = report.findings.iter().find(|f| f.key.starts_with("gpu vram")).expect("vram finding");
         assert_eq!(vram.severity, Severity::High);
@@ -299,13 +528,13 @@ mod tests {
 
         // Half-empty memory is no finding, and it lets the report rule video memory out.
         let calm: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 30.0, 6 * GB, 0)).collect();
-        let report = gpu_findings(&gpu_log(12 * GB, &calm), &[], &mut |_| String::new());
+        let report = gpu_findings(&gpu_log(12 * GB, &calm), &[], &mut |_| String::new(), &GpuTraceReport::default(), &[]);
         assert!(report.findings.is_empty());
         assert_eq!(report.vram_clear.as_deref(), Some("NVIDIA GeForce RTX 4070 peaked at 6.0 GB of 12.0 GB (50%)"));
 
         // An integrated GPU's tiny carve-out is always "full" by design and is never judged.
         let igpu: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 30.0, 510_000_000, 0)).collect();
-        let report = gpu_findings(&gpu_log(512_000_000, &igpu), &[], &mut |_| String::new());
+        let report = gpu_findings(&gpu_log(512_000_000, &igpu), &[], &mut |_| String::new(), &GpuTraceReport::default(), &[]);
         assert!(report.findings.is_empty() && report.vram_clear.is_none());
     }
 
@@ -316,23 +545,25 @@ mod tests {
         let keys = |r: &GpuReport| r.findings.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
 
         let busy: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 99.0, 4 * GB, 0)).collect();
-        let report = gpu_findings(&gpu_log(12 * GB, &busy), &marks, &mut |_| String::new());
+        let report = gpu_findings(&gpu_log(12 * GB, &busy), &marks, &mut |_| String::new(), &GpuTraceReport::default(), &[]);
         assert_eq!(keys(&report), ["gpu bound"]);
         assert!(report.findings[0].evidence.contains("3 of the 3"));
 
         // A game that loads the GPU most of the time, but not around the flagged moments.
         let dips: Vec<(f64, f64, u64, u64)> =
             (0..20).map(|i| (i as f64, if [4, 5, 6, 11, 12, 13, 17, 18, 19].contains(&i) { 45.0 } else { 97.0 }, 4 * GB, 0)).collect();
-        let report = gpu_findings(&gpu_log(12 * GB, &dips), &marks, &mut |_| String::new());
+        let report = gpu_findings(&gpu_log(12 * GB, &dips), &marks, &mut |_| String::new(), &GpuTraceReport::default(), &[]);
         assert_eq!(keys(&report), ["gpu waiting"]);
         assert_eq!(report.findings[0].severity, Severity::Low);
         assert!(report.lines.iter().any(|l| l.contains("45% busy on average")), "{:?}", report.lines);
 
         // A desktop idling at 30% all along is not "a game waiting for the CPU".
         let desktop: Vec<(f64, f64, u64, u64)> = (0..20).map(|i| (i as f64, 30.0, 4 * GB, 0)).collect();
-        assert!(gpu_findings(&gpu_log(12 * GB, &desktop), &marks, &mut |_| String::new()).findings.is_empty());
+        assert!(gpu_findings(&gpu_log(12 * GB, &desktop), &marks, &mut |_| String::new(), &GpuTraceReport::default(), &[])
+            .findings
+            .is_empty());
 
         // No flagged moments: load alone is never a finding. A busy GPU is what a game should look like.
-        assert!(gpu_findings(&gpu_log(12 * GB, &busy), &[], &mut |_| String::new()).findings.is_empty());
+        assert!(gpu_findings(&gpu_log(12 * GB, &busy), &[], &mut |_| String::new(), &GpuTraceReport::default(), &[]).findings.is_empty());
     }
 }

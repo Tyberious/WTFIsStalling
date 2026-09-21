@@ -91,6 +91,7 @@ days old) by itself.
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 | **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
 | **The graphics card running out of video memory, or simply being the limit** | Once a second, per GPU: load, video memory in use, and the program responsible. Full video memory is reported with the program holding it and how much was pushed out to system RAM. At the moments you flag, the report says whether the GPU was working flat out (lower GPU settings) or had spare capacity (the hitch is on the CPU side or in the game) |
+| **The picture actually stopping** | A second, small ETW session on the graphics kernel records every display refresh and every frame handed to the card. At a moment you flag, the report can say "no new picture reached the screen for 240 ms" and which program's frames stopped — the part of a hitch a processor-side trace cannot see at all. The same session catches the card telling Windows to free video memory, which is the card's own answer to "is it full?" |
 | **Failing or unstable hardware** | WHEA errors from the System event log, last 7 days: corrected memory errors (unstable XMP/EXPO, bad DIMM), corrected processor errors (undervolt, PBO, overclock), PCI Express link errors with the device named (riser cables, GPU, NVMe), and fatal hardware errors that crashed the PC. A stall within 2 seconds of such an error is tied to it |
 | **Crashes and sudden power loss** | Unexpected shutdowns from the System event log, last 7 days: blue screens with their stop code, and silent restarts or power loss (power supply, heat, unstable overclock) |
 
@@ -198,6 +199,17 @@ Two independent sources, correlated on one clock (QPC):
   routine's activity is also recorded as one bit per quarter-second of the run — a few hundred kilobytes
   in total, and one hash lookup per event — so that a driver waking on a steady timer can be seen even
   when nothing it does is long enough to stall anything.
+* **Graphics-kernel ETW trace.** A second real-time session on the same clock, enabled on
+  Microsoft-Windows-DxgKrnl with one keyword (`Present`) and an event-id filter listing six events:
+  the vertical-blank and hardware-flip-queue DPCs (when the screen was actually refreshed), the
+  presents each program submitted (when it handed over a new frame), and the residency operations that
+  bring textures back into video memory (which carry how much Windows wants freed when the card is over
+  budget). Field offsets come from `TdhGetEventInformation`, worked out once per event id and version
+  and then read by offset, so there is no per-event decoding cost; a version whose layout cannot be
+  worked out is skipped rather than guessed at. It is a few hundred small events a second, it is **off
+  in light mode**, `wtfis-cli --no-gpu-trace` turns it off anywhere, and the cost block reports how
+  many arrived. If the session cannot start — another profiler holding it, an older Windows — the run
+  carries on and DETAILS says in one line that there is no frame-timing evidence.
 * **The machine itself, read once at the end.** Loaded kernel modules (for the hardware-access driver
   table), the installed NDIS network filters and their binaries (registry only), and every present PCI
   device's allocated interrupt resources and PCI device properties (cfgmgr32). All read-only, all
@@ -343,6 +355,7 @@ wtfis-cli --duration 300 --stall-ms 2 --dpc-warn-us 500
 wtfis-cli --light            # measure more gently on a weak or battery-powered PC
 wtfis-cli --no-light         # keep full measuring even there
 wtfis-cli --no-switches      # skip the thread-switch trace (the most expensive thing measured)
+wtfis-cli --no-gpu-trace     # skip the graphics-kernel trace (frame timing and video memory)
 wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that run instead of the newest
 wtfis-cli --no-compare       # don't compare with an earlier run
 ```

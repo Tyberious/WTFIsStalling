@@ -42,6 +42,11 @@ struct Args {
     /// --light mode
     #[arg(long)]
     no_switches: bool,
+    /// Don't trace the graphics kernel. A second, small trace session records when the picture
+    /// actually stopped updating and when the graphics card ran out of video memory - the part of
+    /// a hitch a processor-side trace cannot see. Already off in --light mode
+    #[arg(long)]
+    no_gpu_trace: bool,
     /// Measure more gently: probe every 2 ms and sample the CPU half as often, so the tool costs
     /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
     /// PC with 4 logical CPUs or fewer, or one running on battery
@@ -149,6 +154,7 @@ fn main() {
         io_warn_ms: args.io_warn_ms,
         profile: !args.no_profile,
         switches: !args.no_switches,
+        gpu_trace: !args.no_gpu_trace,
         // Neither flag: decide from the machine itself, exactly as the GUI does.
         light: match (args.light, args.no_light) {
             (true, _) => Some(true),

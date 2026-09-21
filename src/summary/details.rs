@@ -111,7 +111,8 @@ pub(super) fn tables(cx: &mut Ctx) {
     }
     d!("");
     d!("THIS TOOL'S OWN COST  (what the measuring itself used)");
-    for line in overhead.detail_lines(events, events_lost, cx.switch_events) {
+    let gpu_events = cx.run.gpu_trace.totals.available.then_some(cx.run.gpu_trace.totals.events);
+    for line in overhead.detail_lines(events, events_lost, cx.switch_events, gpu_events) {
         d!("{line}");
     }
     if cx.switch_events.is_some() && !cx.scheduler_usable() {
@@ -260,6 +261,23 @@ pub(super) fn tables(cx: &mut Ctx) {
         d!("  file names learned: {named_files}; files with a wait total: {}", file_waits.len());
         for (ts, initial) in debug_rejected {
             d!("  rejected DPC/ISR: event ts {ts}, InitialTime {initial}, now {}", qpc());
+        }
+    }
+    // The graphics provider is a manifest provider, so its events are counted by (id, version)
+    // rather than by opcode. The second list is the one an elevated live run has to check: an
+    // (id, version) whose payload layout this build could not work out is skipped, never guessed.
+    let gpu_debug = (&cx.run.gpu_trace.debug_counts, &cx.run.gpu_trace.debug_unknown);
+    if !gpu_debug.0.is_empty() || !gpu_debug.1.is_empty() {
+        d!("");
+        d!("debug: DxgKrnl events by (event id, version):");
+        for ((id, version), n) in gpu_debug.0 {
+            d!(
+                "  id {id:>4} v{version}: {n}{}",
+                if gpu_debug.1.iter().any(|(k, _)| k == &(*id, *version)) { "  NOT UNDERSTOOD" } else { "" }
+            );
+        }
+        for ((id, version), n) in gpu_debug.1 {
+            d!("  not understood: id {id:>4} v{version}: {n} event(s) skipped");
         }
     }
     cx.details = details;

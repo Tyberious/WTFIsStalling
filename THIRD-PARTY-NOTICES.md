@@ -34,6 +34,12 @@ Apache-2.0 anyway costs nothing and removes the question.*
 These are cited in the source comments but are facts read from published documents, not code or data
 copied from them:
 
+- The **PresentMon** project, <https://github.com/GameTechDev/PresentMon> (MIT), used in
+  `src/gputrace/` as a second source for which Microsoft-Windows-DxgKrnl event IDs, versions and
+  keywords mean what, and for the fact that Windows 11 added the `Present` keyword to the
+  vertical-blank events. No PresentMon code was copied or adapted; the event IDs and keyword values
+  it records are the same facts the provider's own manifest states on any Windows PC
+  (`wevtutil gp Microsoft-Windows-DxgKrnl /ge`).
 - Microsoft's recommended driver block rules and the `DriverPolicy_Enforced.xml` inside
   <https://aka.ms/VulnerableDriverBlockList>
 - CVE records from MITRE's CVE Services API

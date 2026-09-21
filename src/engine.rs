@@ -24,7 +24,7 @@ use crate::reg::hklm_str;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
 use crate::util::{self, ms_to_ticks, wide};
-use crate::{analyze, baseline, cpuclock, etw, gpu, modules, overhead, probe, say, state};
+use crate::{analyze, baseline, cpuclock, etw, gpu, gputrace, modules, overhead, probe, say, state};
 
 pub use crate::analyze::mark_now;
 
@@ -48,6 +48,9 @@ pub struct Config {
     /// was never woken or was woken and not run. This is the highest-volume class the kernel
     /// logger has, so it is off in light mode whatever this says.
     pub switches: bool,
+    /// Trace the graphics kernel in a second ETW session: frame cadence and video memory
+    /// pressure, which a CPU-side trace cannot see at all. Off in light mode whatever this says.
+    pub gpu_trace: bool,
     /// Measure with the lighter settings (2 ms probes, slower CPU sampling). `None` lets the
     /// tool decide before the run from the CPU count and whether the PC is on battery, which is
     /// what the GUI always uses; `Some` overrides that either way.
@@ -70,6 +73,7 @@ impl Default for Config {
             io_warn_ms: 200.0,
             profile: true,
             switches: true,
+            gpu_trace: true,
             light: None,
             log: LogTarget::Auto,
             compare: CompareMode::Auto,
@@ -351,6 +355,31 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     });
     let consumer = etw::spawn_consumer(shared.clone());
 
+    // The graphics kernel is a manifest provider and cannot ride on the system logger above, so
+    // it gets its own real-time session on the same clock. Everything about it is optional: if
+    // it will not start, the run carries on and DETAILS says in one line why there is no GPU
+    // evidence. Off in light mode for the same reason thread switches are.
+    let want_gpu = cfg.gpu_trace && light_reason.is_none();
+    let (mut gpu_session, mut gpu_trace, mut gpu_consumer) = (None, None, None);
+    let mut gpu_note = match (cfg.gpu_trace, light_reason.is_some()) {
+        (false, _) => Some("you asked for it with --no-gpu-trace".to_string()),
+        (_, true) => Some("light mode leaves the second trace session off".to_string()),
+        _ => None,
+    };
+    if want_gpu {
+        match gputrace::start(cfg.debug) {
+            Ok((session, trace, consumer)) => {
+                gpu_session = Some(session);
+                gpu_trace = Some(trace);
+                gpu_consumer = Some(consumer);
+            }
+            Err(e) => {
+                say!("warning: the graphics-kernel trace could not be started ({e}); frame timing and video memory pressure are off.");
+                gpu_note = Some(e);
+            }
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
     let probe_stop = Arc::new(AtomicBool::new(false));
     let probe_stats = Arc::new(probe::ProbeStats::default());
@@ -370,6 +399,9 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
 
     let mut analyzer = analyze::Analyzer::new(shared.clone(), rx, modules, session.profile, probe_stats.tids.clone());
+    if let Some(trace) = &gpu_trace {
+        analyzer.set_gpu_trace(trace.clone());
+    }
     say!(
         "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
         analyzer.modules.len(),
@@ -422,6 +454,21 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     // ETW flushes once a second; let the tail arrive before the final analysis.
     std::thread::sleep(Duration::from_millis(1200));
     analyzer.tick(true);
+    // Read out before the session is stopped: stopping it is what makes its consumer exit.
+    let gpu_report = match &gpu_trace {
+        Some(trace) => {
+            let mut r = trace.report();
+            r.note = gpu_note.take();
+            r
+        }
+        None => crate::gputrace::GpuTraceReport { note: gpu_note.take(), ..Default::default() },
+    };
+    if let Some(s) = &gpu_session {
+        s.stop();
+    }
+    if let Some(h) = gpu_consumer {
+        let _ = h.join();
+    }
     let lost = session.stop();
     match consumer.join() {
         Ok(Err(e)) => say!("ERROR: {e}"),
@@ -442,6 +489,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         io_warn: shared.io_warn,
         clock: &clock_samples,
         gpu: &gpu_log,
+        gpu_trace: gpu_report,
     });
     // Compare with the previous run and leave this run's numbers for the next one. Must happen
     // before the result is printed, so "what changed" is part of the result everywhere.
