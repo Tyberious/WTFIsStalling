@@ -2067,6 +2067,20 @@ impl Analyzer {
 mod tests {
     use super::*;
 
+    /// Prints the three demo reports exactly as rendered. `cargo test golden -- --ignored --nocapture`
+    /// before and after a restructuring shows whether anything user-visible moved.
+    #[test]
+    #[ignore]
+    fn golden_demo_reports() {
+        for health in [Health::Problem, Health::Warning, Health::Ok] {
+            let s = Summary::demo(health);
+            println!("GOLDEN {health:?} headline={} | {}", s.headline, s.subline);
+            for line in s.result_lines().iter().chain(s.detail_lines().iter()) {
+                println!("GOLDEN {line}");
+            }
+        }
+    }
+
     fn usb_hdd() -> DiskInfo {
         DiskInfo { number: 4, model: "Seagate FireCuda Dock".into(), bus: "USB", spinning: Some(true), ..Default::default() }
     }
