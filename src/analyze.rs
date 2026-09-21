@@ -1568,8 +1568,13 @@ impl Analyzer {
     /// totals and returns a few words for the log line.
     fn explain_io(&mut self, slow: &IoRec) -> String {
         let ios: Vec<IoRec> = self.shared.inner.lock().unwrap().ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
-        let spinning = self.disks.get(slow.disk).spinning == Some(true);
-        let ctx = diskwhy::explain(slow, &ios, spinning, self.started);
+        let disk = self.disks.get(slow.disk);
+        let class = match (disk.spinning, disk.bus) {
+            (Some(true), _) => diskwhy::DriveClass::Spinning,
+            (_, "NVMe") => diskwhy::DriveClass::Nvme,
+            _ => diskwhy::DriveClass::Flash,
+        };
+        let ctx = diskwhy::explain(slow, &ios, class, self.started);
         // Remembered so a freeze can later say "this one was a victim of the freeze, not a
         // problem of its own". Capped: a sick drive can produce thousands over a long run.
         let seen = self.disk_slow.entry(slow.disk).or_default();

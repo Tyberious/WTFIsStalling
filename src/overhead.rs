@@ -7,7 +7,7 @@
 //! summed over every thread of the process
 //! (learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes).
 //!
-//! Light mode halves how often the probes wake up and how often the CPU is sampled. It is
+//! Light mode halves how often the probes wake up and leaves the two most expensive traces off. It is
 //! decided once, before the run, so everything in one report is measured the same way.
 
 use std::mem::zeroed;

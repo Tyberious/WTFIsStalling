@@ -402,16 +402,11 @@ pub fn record_of(facts: &RunFacts, health: Health, findings: &[Finding]) -> RunR
 /// one as appearing. Everything else in a key (driver file, disk number, PCI address, GPU name)
 /// already survives a restart.
 ///
-/// Deliberately stricter than `procs::process_name`, which does the same job for a process
-/// label: this one requires a closing parenthesis with at least one digit inside, so a key that
-/// happens to end in "()" or in an unclosed "(" is left alone rather than silently shortened.
+/// Delegates to `procs::strip_pid`, which does the same job for a process label: it requires a
+/// closing parenthesis with at least one digit inside, so a key that happens to end in "()" or
+/// in an unclosed "(" is left alone rather than silently shortened.
 pub fn stable_key(key: &str) -> String {
-    match key.rsplit_once(" (") {
-        Some((head, tail)) if tail.ends_with(')') && tail.len() > 1 && tail[..tail.len() - 1].bytes().all(|b| b.is_ascii_digit()) => {
-            head.to_string()
-        }
-        _ => key.to_string(),
-    }
+    crate::procs::strip_pid(key).to_string()
 }
 
 #[cfg(test)]

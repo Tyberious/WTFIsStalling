@@ -360,6 +360,25 @@ wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that ru
 wtfis-cli --no-compare       # don't compare with an earlier run
 ```
 
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--duration <secs>` | run until Ctrl+C | Stop automatically after this many seconds |
+| `--stall-ms <ms>` | 5.0 | Report a kernel-level stall when a real-time thread wakes this many ms late |
+| `--sched-stall-ms <ms>` | 25.0 | Report CPU starvation when a normal-priority thread wakes this many ms late |
+| `--dpc-warn-us <us>` | 1000.0 | Log individual DPCs/ISRs that run longer than this many microseconds |
+| `--fault-warn-ms <ms>` | 50.0 | Log individual hard page faults slower than this many ms |
+| `--io-warn-ms <ms>` | 200.0 | Log individual disk requests slower than this many ms |
+| `--no-profile` | off | Don't sample the CPU (loses process attribution and firmware/SMI detection) |
+| `--no-switches` | off | Don't trace thread switches, the most expensive thing this tool records; already off in `--light` mode |
+| `--no-gpu-trace` | off | Don't trace the graphics kernel (frame timing and video memory pressure); already off in `--light` mode |
+| `--light` | auto | Measure more gently: probe every 2 ms instead of 1 ms, and leave thread-switch and graphics tracing off; on by itself on a PC with 4 logical CPUs or fewer, or one running on battery |
+| `--no-light` | off | Keep full measuring even on a small or unplugged PC (the opposite of `--light`) |
+| `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory | Report file path |
+| `--no-log` | off | Don't write a report file |
+| `--compare <file>` | newest run from this PC, up to 30 days old | Compare this run with a particular earlier one (the `.wtfis` file saved next to its report) |
+| `--no-compare` | off | Don't compare this run with an earlier one |
+| `--no-elevate` | off | Fail instead of asking for elevation when not running as Administrator |
+
 Run `wtfis-cli --help` for all options. Press Enter to flag a hitch, Ctrl+C to stop and print the
 summary.
 

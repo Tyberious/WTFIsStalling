@@ -106,6 +106,11 @@ pub struct Finding {
     pub title: String,
     pub evidence: Vec<String>,
     pub advice: String,
+    /// Every whole advice item folded into `advice` so far (the one passed to `add`, plus one
+    /// per `advise` call), used only to tell a genuinely new item from one already said: text
+    /// can't be split back out of `advice` itself, since an item may contain the same spaces and
+    /// punctuation used to join items together.
+    advice_items: Vec<String>,
     /// The one or two numbers that measure this finding, for comparing runs. Never printed as
     /// prose: the evidence above says it in words already.
     pub metrics: Vec<Metric>,
@@ -329,6 +334,7 @@ impl Summary {
             title: title.into(),
             evidence: evidence.into_iter().map(String::from).collect(),
             advice: advice.into(),
+            advice_items: vec![advice.into()],
             metrics,
             impact: 0,
         };
@@ -501,7 +507,17 @@ impl Findings {
             }
             None => self.0.push((
                 key.to_string(),
-                Finding { key: key.to_string(), group, severity, title, evidence: vec![evidence], advice, metrics: Vec::new(), impact },
+                Finding {
+                    key: key.to_string(),
+                    group,
+                    severity,
+                    title,
+                    evidence: vec![evidence],
+                    advice_items: vec![advice.clone()],
+                    advice,
+                    metrics: Vec::new(),
+                    impact,
+                },
             )),
         }
     }
@@ -524,10 +540,14 @@ impl Findings {
         }
     }
 
-    /// More to try for a subject that is already a finding.
+    /// More to try for a subject that is already a finding. Skips only when this exact item was
+    /// already said, not merely when it happens to be a substring of the existing advice (e.g.
+    /// "Update the driver" is not the same item as "Update the driver from the vendor's site").
     pub(super) fn advise(&mut self, key: &str, advice: &str) {
         if let Some((_, f)) = self.0.iter_mut().find(|(k, _)| k == key) {
-            if !f.advice.contains(advice) {
+            let advice = advice.trim();
+            if !f.advice_items.iter().any(|item| item.trim() == advice) {
+                f.advice_items.push(advice.to_string());
                 f.advice = format!("{} {advice}", f.advice.trim_end());
             }
         }
@@ -735,6 +755,30 @@ impl Analyzer {
 mod tests {
     use super::*;
     use crate::util::{ms_to_ticks, qpc};
+
+    /// `advise` must dedup by whole item, not by substring: "Update the driver" is not the same
+    /// advice as "Update the driver from the vendor's site" even though it is contained in it,
+    /// but adding the exact same item twice must not repeat it.
+    #[test]
+    fn advise_dedups_by_whole_item_not_substring() {
+        let mut findings = Findings::default();
+        findings.add(
+            "driver x.sys",
+            Severity::Low,
+            "title".into(),
+            "evidence".into(),
+            "Update the driver from the vendor's site".into(),
+            0,
+        );
+        findings.advise("driver x.sys", "Update the driver");
+        let advice = findings.0[0].1.advice.clone();
+        assert!(
+            advice.contains("Update the driver from the vendor's site") && advice.ends_with("Update the driver"),
+            "a genuinely new item is added even though it is a substring of the existing advice: {advice}"
+        );
+        findings.advise("driver x.sys", "Update the driver");
+        assert_eq!(findings.0[0].1.advice, advice, "advising the identical item again must not duplicate it");
+    }
 
     /// Prints the three demo reports exactly as rendered. `cargo test golden -- --ignored --nocapture`
     /// before and after a restructuring shows whether anything user-visible moved.
@@ -1111,6 +1155,7 @@ mod tests {
             title: "6 programs that talk to the hardware directly are running".into(),
             evidence: vec!["e".into()],
             advice: "a".into(),
+            advice_items: vec!["a".into()],
             metrics: Vec::new(),
             impact: 0,
         });
@@ -1127,6 +1172,7 @@ mod tests {
                 title: "x.sys  -  something".into(),
                 evidence: vec!["e".into()],
                 advice: "a".into(),
+                advice_items: vec!["a".into()],
                 metrics: Vec::new(),
                 impact: 0,
             },
@@ -1145,6 +1191,7 @@ mod tests {
             title: format!("noise{i}.sys  -  something"),
             evidence: vec!["e".into()],
             advice: "a".into(),
+            advice_items: vec!["a".into()],
             metrics: Vec::new(),
             impact: 0,
         };

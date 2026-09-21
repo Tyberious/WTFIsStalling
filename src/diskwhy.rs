@@ -38,9 +38,34 @@ pub struct Context {
     pub movers: Vec<(u32, u32, u64)>,
 }
 
+/// How much traffic it takes before "the drive was busy" explains a slow request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveClass {
+    Spinning,
+    /// SATA and USB flash: one queue, a few hundred MB/s at best.
+    Flash,
+    Nvme,
+}
+
+impl DriveClass {
+    /// (MB per second, requests per second) at which the drive counts as busy. Rules of thumb,
+    /// not specifications, set an order of magnitude under what each class sustains: a hard drive
+    /// manages roughly 100-200 random requests a second, a SATA SSD is capped near 550 MB/s by
+    /// the link, and an NVMe drive moves gigabytes a second. The old single flash threshold
+    /// called an NVMe drive "busy" at 33 MB/s (field report, issue #15), about 1% of what it can
+    /// do, which hid that the drive was slow with next to nothing asked of it.
+    fn busy_at(self) -> (f64, f64) {
+        match self {
+            DriveClass::Spinning => (10.0, 50.0),
+            DriveClass::Flash => (30.0, 300.0),
+            DriveClass::Nvme => (200.0, 3000.0),
+        }
+    }
+}
+
 /// `ios` is the recent history (any disk, any order); `history_start` is the oldest moment that
 /// history can vouch for, so silence is never assumed for a time nobody was watching.
-pub fn explain(slow: &IoRec, ios: &[IoRec], spinning: bool, history_start: i64) -> Context {
+pub fn explain(slow: &IoRec, ios: &[IoRec], class: DriveClass, history_start: i64) -> Context {
     let start = slow.end - slow.dur;
     let mut others = 0u32;
     let mut bytes = 0u64;
@@ -70,7 +95,8 @@ pub fn explain(slow: &IoRec, ios: &[IoRec], spinning: bool, history_start: i64) 
     let mb_per_s = bytes as f64 / 1e6 / secs;
     let per_s = others as f64 / secs;
     // A hard drive is saturated by a fraction of what an SSD shrugs off.
-    let fast = if spinning { mb_per_s >= 10.0 || per_s >= 50.0 } else { mb_per_s >= 30.0 || per_s >= 300.0 };
+    let (busy_mb, busy_per_s) = class.busy_at();
+    let fast = mb_per_s >= busy_mb || per_s >= busy_per_s;
     // Rates over a few milliseconds mean little: one neighboring request is not a busy disk.
     let busy = fast && (bytes >= 4_000_000 || others >= 32);
 
@@ -155,7 +181,7 @@ mod tests {
         ios.extend((0..100).map(|i| io(2, 1000.0 + i as f64 * 5.0, 4.0, 1_000_000, 42, b'W')));
         ios.push(io(2, 1100.0, 3.0, 8192, 9, b'R'));
         ios.push(io(5, 1100.0, 3.0, 900_000_000, 99, b'W')); // another disk: irrelevant
-        let c = explain(&slow, &ios, false, T0);
+        let c = explain(&slow, &ios, DriveClass::Flash, T0);
         assert_eq!(c.cause, Cause::Busy);
         assert_eq!(c.others, 101);
         assert!((c.mb_per_s - 200.0).abs() < 1.0, "{}", c.mb_per_s);
@@ -166,7 +192,7 @@ mod tests {
     fn first_request_after_long_silence_is_a_wake_up() {
         let slow = io(4, 9000.0, 3200.0, 4096, 7, b'R');
         let ios = vec![io(4, 100.0, 5.0, 4096, 7, b'R'), slow];
-        let c = explain(&slow, &ios, true, T0);
+        let c = explain(&slow, &ios, DriveClass::Spinning, T0);
         assert_eq!(c.cause, Cause::WokeUp);
         assert!(c.idle_before_ms.unwrap() > 8000.0);
     }
@@ -175,7 +201,7 @@ mod tests {
     fn silence_is_not_assumed_before_the_history_began() {
         // Nothing earlier in the ring, but monitoring started only 1 s before the request.
         let slow = io(4, 9000.0, 3200.0, 4096, 7, b'R');
-        let c = explain(&slow, &[slow], true, ms_to_ticks(10_000.0 + 8000.0));
+        let c = explain(&slow, &[slow], DriveClass::Spinning, ms_to_ticks(10_000.0 + 8000.0));
         assert_eq!(c.cause, Cause::IdleSlow);
     }
 
@@ -183,9 +209,9 @@ mod tests {
     fn quiet_disk_that_is_still_slow_points_at_the_drive() {
         let slow = io(1, 1000.0, 800.0, 65536, 7, b'R');
         let ios = vec![io(1, 900.0, 2.0, 4096, 7, b'R'), slow, io(1, 1200.0, 1.0, 4096, 8, b'R')];
-        assert_eq!(explain(&slow, &ios, false, T0).cause, Cause::IdleSlow);
+        assert_eq!(explain(&slow, &ios, DriveClass::Flash, T0).cause, Cause::IdleSlow);
         let flush = io(1, 1000.0, 800.0, 0, 7, b'F');
-        assert_eq!(explain(&flush, &[flush], false, recent()).cause, Cause::Flush);
+        assert_eq!(explain(&flush, &[flush], DriveClass::Flash, recent()).cause, Cause::Flush);
     }
 
     #[test]
@@ -193,15 +219,26 @@ mod tests {
         let slow = io(3, 1000.0, 1000.0, 4096, 7, b'R');
         let mut ios = vec![slow];
         ios.extend((0..15).map(|i| io(3, 1000.0 + i as f64 * 60.0, 50.0, 1_000_000, 42, b'R'))); // 15 MB/s
-        assert_eq!(explain(&slow, &ios, true, T0).cause, Cause::Busy);
-        assert_eq!(explain(&slow, &ios, false, recent()).cause, Cause::IdleSlow);
+        assert_eq!(explain(&slow, &ios, DriveClass::Spinning, T0).cause, Cause::Busy);
+        assert_eq!(explain(&slow, &ios, DriveClass::Flash, recent()).cause, Cause::IdleSlow);
+    }
+
+    /// The field report in issue #15: an NVMe drive took most of a second with 33 MB/s going
+    /// through it and was called "busy", which blamed the programs instead of the drive.
+    #[test]
+    fn thirty_megabytes_a_second_does_not_make_an_nvme_drive_busy() {
+        let slow = io(6, 1000.0, 1000.0, 4096, 7, b'W');
+        let mut ios = vec![slow];
+        ios.extend((0..33).map(|i| io(6, 1000.0 + i as f64 * 30.0, 5.0, 1_000_000, 42, b'W'))); // 33 MB/s
+        assert_eq!(explain(&slow, &ios, DriveClass::Flash, T0).cause, Cause::Busy);
+        assert_eq!(explain(&slow, &ios, DriveClass::Nvme, recent()).cause, Cause::IdleSlow);
     }
 
     #[test]
     fn one_neighbor_during_a_short_request_is_not_a_busy_disk() {
         let slow = io(0, 1000.0, 16.0, 16384, 7, b'R');
         let ios = vec![io(0, 990.0, 1.0, 4096, 7, b'R'), slow, io(0, 1002.0, 3.0, 2_000_000, 42, b'W')];
-        let c = explain(&slow, &ios, false, T0);
+        let c = explain(&slow, &ios, DriveClass::Flash, T0);
         assert!(c.mb_per_s > 100.0);
         assert_eq!(c.cause, Cause::IdleSlow);
     }

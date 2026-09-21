@@ -159,6 +159,7 @@ fn query_sata(h: &Handle) -> Option<SataSmart> {
     // STORAGE_PREDICT_FAILURE { PredictFailure u32, VendorSpecific[512] }: for ATA drives the
     // vendor block is the SMART READ DATA sector, and unlike SMART_RCV_DRIVE_DATA this query
     // works on a handle without read or write access.
+    // Not yet confirmed on real SATA hardware (issue #13 stays open until it is).
     let mut out = [0u8; 4 + 512];
     let n = h.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, &[], &mut out)?;
     if n < 4 + 362 {

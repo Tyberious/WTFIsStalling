@@ -242,7 +242,7 @@ fn hardware_findings(events: &[HardwareEvent], devices: &[PciDevice], stalls: &[
             advice,
             metrics: vec![
                 Metric::flat("errors while monitoring", times.iter().filter(|t| **t >= run_start).count() as u32),
-                Metric::logged("in the last 7 days", times.len() as u32),
+                Metric::logged(&format!("in the last {EVENT_LOG_DAYS} days"), times.len() as u32),
             ],
         });
     }
@@ -312,7 +312,7 @@ pub(super) fn unexpected_shutdowns(cx: &mut Ctx) {
         // A fatal hardware error already explains a crash; otherwise it stands alone.
         if !cx.found.note("whea fatal", text.clone()) {
             cx.found.add("unexpected shutdowns", sev, "This PC crashed or lost power unexpectedly".into(), text, SHUTDOWN_ADVICE.into(), 0);
-            cx.found.measure("unexpected shutdowns", Metric::logged("crashes in the last 7 days", crashes as u32));
+            cx.found.measure("unexpected shutdowns", Metric::logged(&format!("crashes in the last {EVENT_LOG_DAYS} days"), crashes as u32));
         }
     }
     cx.crashes = crashes;
@@ -379,7 +379,7 @@ pub(super) fn firmware_throttle(cx: &mut Ctx) {
                 0,
             );
             cx.found.measure("throttling", Metric::flat("firmware caps while monitoring", caps_during as u32));
-            cx.found.measure("throttling", Metric::logged("in the last 7 days", firmware_caps.len() as u32));
+            cx.found.measure("throttling", Metric::logged(&format!("in the last {EVENT_LOG_DAYS} days"), firmware_caps.len() as u32));
         }
     }
     cx.firmware_caps = firmware_caps;

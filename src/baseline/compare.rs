@@ -38,7 +38,12 @@ fn noise_floor(unit: Unit) -> f64 {
 /// `scale` is the per-minute factor applied to each value (1.0 when the runs are comparable).
 fn classify(before: f64, after: f64, unit: Unit, scale: (f64, f64)) -> Change {
     let (a, b) = (before * scale.0, after * scale.1);
-    let raw_moved = (after - before).abs() > noise_floor(unit);
+    // The floor is in raw units, but raw numbers from runs of different lengths cannot be set
+    // side by side: 14 stalls in 5 minutes and 14 stalls in an hour are not "the same". So the
+    // earlier number is first projected onto this run's length (what it would have been had
+    // nothing changed), and with comparable runs that is simply the earlier number.
+    let expected = if scale.1 > 0.0 { before * scale.0 / scale.1 } else { before };
+    let raw_moved = (after - expected).abs() > noise_floor(unit);
     let share_moved = (b - a).abs() > NOISE_SHARE * a.abs().max(b.abs());
     if !raw_moved || !share_moved {
         return Change::Same;
@@ -308,6 +313,17 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("fixed")), "one short run cannot prove a fix: {lines:?}");
     }
 
+    /// Found in the demo report: 14 stalls in 5 minutes, then 14 in an hour, read "about the same".
+    #[test]
+    fn the_same_count_over_a_much_longer_run_is_an_improvement() {
+        let per_min = |secs: f64| 60.0 / secs;
+        assert_eq!(classify(14.0, 14.0, Unit::Count, (per_min(300.0), per_min(3540.0))), Change::Better);
+        assert_eq!(classify(14.0, 14.0, Unit::Count, (per_min(3540.0), per_min(300.0))), Change::Worse);
+        // One stall in an hour, then one in five minutes, is one stall: not evidence of anything.
+        assert_eq!(classify(1.0, 1.0, Unit::Count, (per_min(3600.0), per_min(300.0))), Change::Same);
+        assert_eq!(classify(14.0, 14.0, Unit::Count, (1.0, 1.0)), Change::Same);
+    }
+
     #[test]
     fn the_same_problem_with_a_slightly_different_number_is_not_a_change() {
         let m = |n, worst| vec![Metric::count("stalls blamed", n), Metric::ms("worst stall", worst)];
@@ -361,7 +377,9 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("stalls blamed 6.0 per minute -> 8.0 per minute")), "{lines:?}");
         assert_eq!(lines[1], "Worse than last time.");
 
-        // Same numbers per minute: the shorter run must not read as a big improvement.
+        // Same numbers per minute: the shorter run must not read as a big improvement. (The run's
+        // own stall count has to be in proportion too: the same count in a tenth of the time is worse.)
+        let before = RunRecord { stalls_kernel: before.stalls_kernel * 10, ..before };
         let after = run(60.0, vec![finding("driver x.sys", Severity::High, vec![Metric::count("stalls blamed", 6)])]);
         let lines = compare(&before, &after);
         assert_eq!(lines[1], "No real change since last time.", "{lines:?}");

@@ -329,7 +329,13 @@ fn health_line(h: &DriveHealth) -> String {
     }
     if let Some(n) = &h.nvme {
         parts.push(format!("{}% of rated life used", n.percent_used));
-        parts.push(format!("spare {}%", n.spare_percent));
+        // Spare 0% with a threshold of 0% and no "spare low" warning bit is a drive (or a USB
+        // bridge in front of it) that does not fill the field in, not a drive out of spare blocks.
+        if n.spare_percent > 0 || n.spare_threshold > 0 || n.critical_warning & 1 != 0 {
+            parts.push(format!("spare {}%", n.spare_percent));
+        } else {
+            parts.push("spare not reported".to_string());
+        }
         parts.push(format!("{} media errors", n.media_errors));
         parts.push(format!("{} min over temperature", n.warning_temp_minutes + n.critical_temp_minutes));
         parts.push(format!("{} h powered on", n.power_on_hours));

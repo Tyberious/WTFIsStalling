@@ -84,13 +84,21 @@ impl ProcNames {
     }
 }
 
+/// Strips a well-formed trailing " (<digits>)" from a label, e.g. "steam.exe (1234)" ->
+/// "steam.exe". Requires a closing parenthesis with at least one ASCII digit inside; a label
+/// that happens to end in "()" or in an unclosed "(" is returned unchanged rather than silently
+/// shortened.
+pub fn strip_pid(label: &str) -> &str {
+    match label.rsplit_once(" (") {
+        Some((head, tail)) if tail.ends_with(')') && tail.len() > 1 && tail[..tail.len() - 1].bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => label,
+    }
+}
+
 /// "steam.exe (1234)" -> "steam.exe", so several processes of one program add up, and so the
 /// report never prints a process ID it does not need.
 pub fn process_name(label: &str) -> String {
-    match label.rsplit_once(" (") {
-        Some((name, rest)) if rest.trim_end_matches(')').chars().all(|c| c.is_ascii_digit()) => name.to_string(),
-        _ => label.to_string(),
-    }
+    strip_pid(label).to_string()
 }
 
 /// A process people do not recognize by file name: what it is doing, and the one thing that
@@ -202,5 +210,19 @@ pub fn pid_of_thread(tid: u32) -> Option<u32> {
         let pid = GetProcessIdOfThread(h);
         CloseHandle(h);
         (pid != 0).then_some(pid)
+    }
+}
+
+#[cfg(test)]
+mod strip_pid_tests {
+    use super::strip_pid;
+
+    #[test]
+    fn strips_only_well_formed_trailing_pid() {
+        assert_eq!(strip_pid("chrome.exe (1234)"), "chrome.exe");
+        assert_eq!(strip_pid("odd ()"), "odd ()");
+        assert_eq!(strip_pid("a (12"), "a (12");
+        assert_eq!(strip_pid("App (x86) (77)"), "App (x86)");
+        assert_eq!(strip_pid("plain"), "plain");
     }
 }

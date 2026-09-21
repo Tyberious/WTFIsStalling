@@ -337,7 +337,7 @@ pub(super) fn driver_resets(cx: &mut Ctx) {
             cx.found.add(&key, sev, format!("{file}  -  {what}: it hung and was reset"), text, DISPLAY_RESET_ADVICE.to_string(), 0);
         }
         cx.found.measure(&key, Metric::flat("resets while monitoring", times.iter().filter(|t| **t >= run_start_unix).count() as u32));
-        cx.found.measure(&key, Metric::logged("in the last 7 days", times.len() as u32));
+        cx.found.measure(&key, Metric::logged(&format!("in the last {EVENT_LOG_DAYS} days"), times.len() as u32));
     }
     cx.display_log = display_log;
 }

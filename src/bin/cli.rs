@@ -47,7 +47,7 @@ struct Args {
     /// a hitch a processor-side trace cannot see. Already off in --light mode
     #[arg(long)]
     no_gpu_trace: bool,
-    /// Measure more gently: probe every 2 ms and sample the CPU half as often, so the tool costs
+    /// Measure more gently: probe every 2 ms and leave thread-switch and GPU tracing off, so the tool costs
     /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
     /// PC with 4 logical CPUs or fewer, or one running on battery
     #[arg(long)]
