@@ -411,6 +411,25 @@ impl Inner {
             && !self.readies.is_empty()
     }
 
+    /// The switch and wake-up records in `[from, to]`.
+    ///
+    /// This runs under the lock the ETW callback needs for every event, and the rings hold up to
+    /// millions of records, so it must not walk them: a binary search finds the window's edges.
+    /// ETW delivers a session's events in timestamp order, but to be safe against neighbors that
+    /// are slightly out of order the search is widened by a millisecond each side and the exact
+    /// bounds are applied to what is left.
+    pub fn switch_window(&self, from: i64, to: i64) -> (Vec<SwitchRec>, Vec<ReadyRec>) {
+        let slop = crate::util::ms_to_ticks(1.0);
+        let (lo, hi) = (from - slop, to + slop);
+        let a = self.switches.partition_point(|r| r.ts < lo);
+        let b = self.switches.partition_point(|r| r.ts <= hi);
+        let switches = self.switches.range(a..b.max(a)).filter(|r| r.ts >= from && r.ts <= to).copied().collect();
+        let a = self.readies.partition_point(|r| r.ts < lo);
+        let b = self.readies.partition_point(|r| r.ts <= hi);
+        let readies = self.readies.range(a..b.max(a)).filter(|r| r.ts >= from && r.ts <= to).copied().collect();
+        (switches, readies)
+    }
+
     pub fn prune(&mut self, keep: i64) {
         let cutoff = self.latest_ts - keep;
         let switch_cutoff = self.latest_ts - crate::util::ms_to_ticks(SWITCH_KEEP_MS);
@@ -522,6 +541,21 @@ mod tests {
         assert_eq!(inner.switches.front().unwrap().new_tid, 2);
         assert!(inner.readies.is_empty());
         assert_eq!(inner.samples.len(), 1, "20 s of samples are still kept");
+    }
+
+    #[test]
+    fn a_window_of_switches_is_found_without_walking_the_ring() {
+        let mut inner = Inner::default();
+        let ms = crate::util::ms_to_ticks;
+        for i in 0..1000 {
+            inner.push_switch(sw(ms(i as f64), i as u32));
+            inner.push_ready(ReadyRec { ts: ms(i as f64), tid: i as u32, by_tid: 0, cpu: 0, flag: 0 });
+        }
+        let (s, r) = inner.switch_window(ms(100.0), ms(200.0));
+        assert_eq!((s.len(), r.len()), (101, 101), "both ends are inclusive");
+        assert_eq!((s.first().unwrap().new_tid, s.last().unwrap().new_tid), (100, 200));
+        assert_eq!(inner.switch_window(ms(5000.0), ms(6000.0)).0.len(), 0);
+        assert_eq!(inner.switch_window(ms(-50.0), ms(2.0)).0.len(), 3);
     }
 
     /// The rings only reach a few seconds back, so whether they cover a window has to be asked

@@ -502,13 +502,7 @@ impl Analyzer {
                 self.switch_uncovered.fetch_add(1, Relaxed);
             }
         }
-        let switches: Vec<SwitchRec> = if switches_cover {
-            inner.switches.iter().filter(|r| r.ts >= switch_from && r.ts <= to).copied().collect()
-        } else {
-            Vec::new()
-        };
-        let readies: Vec<ReadyRec> =
-            if switches_cover { inner.readies.iter().filter(|r| r.ts >= switch_from && r.ts <= to).copied().collect() } else { Vec::new() };
+        let (switches, readies) = if switches_cover { inner.switch_window(switch_from, to) } else { (Vec::new(), Vec::new()) };
         Evidence {
             switches,
             readies,
@@ -709,10 +703,7 @@ impl Analyzer {
         if !inner.switches_cover(start) {
             return None;
         }
-        Some((
-            inner.switches.iter().filter(|r| r.ts >= start && r.ts <= to).copied().collect(),
-            inner.readies.iter().filter(|r| r.ts >= start && r.ts <= to).copied().collect(),
-        ))
+        Some(inner.switch_window(start, to))
     }
 
     fn pid_of(&self, tid: u32) -> u32 {
