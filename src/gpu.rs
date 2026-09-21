@@ -7,23 +7,16 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::pdh;
+use crate::util::{from_wide, qpc};
 use windows_sys::Wdk::Graphics::Direct3D::{
     D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMT_ADAPTERINFO, D3DKMT_ADAPTERREGISTRYINFO, D3DKMT_CLOSEADAPTER,
     D3DKMT_ENUMADAPTERS2, D3DKMT_QUERYADAPTERINFO, D3DKMT_SEGMENTSIZEINFO, KMTQAITYPE_ADAPTERREGISTRYINFO, KMTQAITYPE_GETSEGMENTSIZE,
 };
-use windows_sys::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W,
-    PDH_FMT_DOUBLE,
-};
-
-use crate::util::{from_wide, qpc, wide};
-
-const PDH_MORE_DATA: u32 = 0x8000_07D2;
 
 /// A graphics adapter as the graphics kernel describes it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -131,78 +124,47 @@ fn fold(engines: &HashMap<String, f64>, adapter_mem: &[(String, f64, f64)], proc
 }
 
 struct Counters {
-    query: *mut c_void,
-    engine: *mut c_void,
-    adapter_dedicated: *mut c_void,
-    adapter_shared: *mut c_void,
-    process_dedicated: *mut c_void,
-    process_shared: *mut c_void,
+    query: pdh::Query,
+    engine: pdh::Counter,
+    adapter_dedicated: pdh::Counter,
+    adapter_shared: pdh::Counter,
+    process_dedicated: pdh::Counter,
+    process_shared: pdh::Counter,
 }
 
 impl Counters {
     fn open() -> Option<Counters> {
-        unsafe {
-            let mut query = null_mut();
-            if PdhOpenQueryW(null(), 0, &mut query) != 0 {
-                return None;
+        let query = pdh::Query::open()?;
+        let all = (
+            query.add(r"\GPU Engine(*)\Utilization Percentage"),
+            query.add(r"\GPU Adapter Memory(*)\Dedicated Usage"),
+            query.add(r"\GPU Adapter Memory(*)\Shared Usage"),
+            query.add(r"\GPU Process Memory(*)\Dedicated Usage"),
+            query.add(r"\GPU Process Memory(*)\Shared Usage"),
+        );
+        match all {
+            (Some(engine), Some(adapter_dedicated), Some(adapter_shared), Some(process_dedicated), Some(process_shared)) => {
+                query.collect(); // utilization is a rate: it needs a first reading to diff against
+                Some(Counters { query, engine, adapter_dedicated, adapter_shared, process_dedicated, process_shared })
             }
-            let add = |path: &str| {
-                let mut counter = null_mut();
-                (PdhAddEnglishCounterW(query, wide(path).as_ptr(), 0, &mut counter) == 0).then_some(counter)
-            };
-            let all = (
-                add(r"\GPU Engine(*)\Utilization Percentage"),
-                add(r"\GPU Adapter Memory(*)\Dedicated Usage"),
-                add(r"\GPU Adapter Memory(*)\Shared Usage"),
-                add(r"\GPU Process Memory(*)\Dedicated Usage"),
-                add(r"\GPU Process Memory(*)\Shared Usage"),
-            );
-            match all {
-                (Some(engine), Some(adapter_dedicated), Some(adapter_shared), Some(process_dedicated), Some(process_shared)) => {
-                    PdhCollectQueryData(query); // utilization is a rate: it needs a first reading to diff against
-                    Some(Counters { query, engine, adapter_dedicated, adapter_shared, process_dedicated, process_shared })
-                }
-                _ => {
-                    PdhCloseQuery(query);
-                    None
-                }
-            }
+            _ => None,
         }
     }
 
-    fn read(counter: *mut c_void) -> HashMap<String, f64> {
+    fn read(counter: &pdh::Counter) -> HashMap<String, f64> {
         let mut out = HashMap::new();
-        unsafe {
-            let (mut size, mut count) = (0u32, 0u32);
-            if PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, null_mut()) != PDH_MORE_DATA {
-                return out;
-            }
-            // u64-backed so the item structs (which hold pointers and doubles) are aligned.
-            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-            let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-            if PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
-                return out;
-            }
-            for item in std::slice::from_raw_parts(items, count as usize) {
-                if item.FmtValue.CStatus != 0 || item.szName.is_null() {
-                    continue;
-                }
-                let mut len = 0;
-                while *item.szName.add(len) != 0 {
-                    len += 1;
-                }
-                // Several processes can share an instance name only in theory; add rather than overwrite.
-                *out.entry(from_wide(std::slice::from_raw_parts(item.szName, len))).or_default() += item.FmtValue.Anonymous.doubleValue;
-            }
+        // Several processes can share an instance name only in theory; add rather than overwrite.
+        for (name, value) in counter.read() {
+            *out.entry(name).or_default() += value;
         }
         out
     }
 
     fn sample(&self) -> Option<GpuSample> {
-        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+        if !self.query.collect() {
             return None;
         }
-        let pair = |a: *mut c_void, b: *mut c_void| -> Vec<(String, f64, f64)> {
+        let pair = |a: &pdh::Counter, b: &pdh::Counter| -> Vec<(String, f64, f64)> {
             let shared = Self::read(b);
             Self::read(a)
                 .into_iter()
@@ -210,17 +172,11 @@ impl Counters {
                 .collect()
         };
         let adapters = fold(
-            &Self::read(self.engine),
-            &pair(self.adapter_dedicated, self.adapter_shared),
-            &pair(self.process_dedicated, self.process_shared),
+            &Self::read(&self.engine),
+            &pair(&self.adapter_dedicated, &self.adapter_shared),
+            &pair(&self.process_dedicated, &self.process_shared),
         );
         (!adapters.is_empty()).then(|| GpuSample { ts: qpc(), adapters })
-    }
-}
-
-impl Drop for Counters {
-    fn drop(&mut self) {
-        unsafe { PdhCloseQuery(self.query) };
     }
 }
 

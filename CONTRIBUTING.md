@@ -100,16 +100,23 @@ by accident once signing is on. Build provenance attestation works without any o
 | File | Role |
 | --- | --- |
 | `src/engine.rs` | One monitoring run from start to summary; shared by both front ends |
-| `src/etw.rs` | Kernel trace session and event payload parsing |
+| `src/etw/` | Kernel trace session (`mod.rs`) and event payload parsing (`events.rs`) |
 | `src/probe.rs` | Latency probes and the real-time helper process |
 | `src/analyze.rs` | Correlation and per-incident verdicts, including user-flagged moments |
-| `src/summary.rs` | Ranked findings, verdict and report text built from a finished run |
+| `src/summary/` | Ranked findings, verdict and report text built from a finished run |
+| `src/baseline/` | The run record and its file format (`mod.rs`), and comparing two runs (`compare.rs`) |
 | `src/period.rs` | Detects events that repeat on a timer |
 | `src/cpuclock.rs` | Per-core effective speed sampling (throttling) |
 | `src/modules.rs` | Kernel address → driver, and the driver knowledge base |
-| `src/procs.rs` | PID → process name |
+| `src/procs.rs` | PID → process name, and what is known about the processes people do not recognize |
+| `src/pdh.rs` | The performance-counter query both samplers use |
+| `src/reg.rs` | Reading the registry |
 | `src/state.rs` | Records and ring buffers shared between the trace thread and the analyzer |
 | `src/bin/gui.rs` | Win32 window |
 | `src/bin/cli.rs` | Console front end |
+
+`Analyzer::summarize` in [`src/summary/mod.rs`](src/summary/mod.rs) is the report's table of
+contents: one call per section (`stalls`, `storage`, `hardware`, `gpu`, `wording`, `details`), in
+the order the report is built. The order matters and the doc comment above it says why.
 
 By contributing you agree that your contribution is licensed under the [MIT license](LICENSE).

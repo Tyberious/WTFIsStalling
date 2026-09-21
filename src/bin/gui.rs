@@ -27,7 +27,6 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX,
@@ -40,6 +39,7 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use wtfis::engine::{self, Config};
+use wtfis::reg;
 use wtfis::summary::{Health, Summary};
 use wtfis::util::{self, wide};
 
@@ -145,20 +145,7 @@ fn system_wants_dark() -> bool {
         Ok("light") => return false,
         _ => {}
     }
-    let mut value = 1u32;
-    let mut size = 4u32;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize").as_ptr(),
-            wide("AppsUseLightTheme").as_ptr(),
-            RRF_RT_REG_DWORD,
-            null_mut(),
-            &mut value as *mut u32 as *mut c_void,
-            &mut size,
-        )
-    };
-    rc == 0 && value == 0
+    reg::hkcu_dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme") == Some(0)
 }
 
 /// Lets common controls (buttons, scroll bars) pick up their dark visual styles. This is

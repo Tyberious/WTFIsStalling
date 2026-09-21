@@ -20,9 +20,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::baseline::CompareMode;
 use crate::overhead::Overhead;
+use crate::reg::hklm_str;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
-use crate::util::{self, ms_to_ticks, reg_str, wide};
+use crate::util::{self, ms_to_ticks, wide};
 use crate::{analyze, baseline, cpuclock, etw, gpu, modules, overhead, probe, say, state};
 
 pub use crate::analyze::mark_now;
@@ -123,7 +124,7 @@ pub fn relaunch_elevated(extra: &[&str]) -> bool {
 fn print_system_info(ncpu: u32) {
     let cv = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
     let bios_key = "HARDWARE\\DESCRIPTION\\System\\BIOS";
-    let cpu = reg_str("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString");
+    let cpu = hklm_str("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString");
     let mut mem: MEMORYSTATUSEX = unsafe { zeroed() };
     mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
     unsafe { GlobalMemoryStatusEx(&mut mem) };
@@ -136,17 +137,17 @@ fn print_system_info(ncpu: u32) {
     );
     say!(
         "Board  : {} {}, BIOS {} ({})",
-        u(reg_str(bios_key, "BaseBoardManufacturer")),
-        u(reg_str(bios_key, "BaseBoardProduct")),
-        u(reg_str(bios_key, "BIOSVersion")),
-        u(reg_str(bios_key, "BIOSReleaseDate"))
+        u(hklm_str(bios_key, "BaseBoardManufacturer")),
+        u(hklm_str(bios_key, "BaseBoardProduct")),
+        u(hklm_str(bios_key, "BIOSVersion")),
+        u(hklm_str(bios_key, "BIOSReleaseDate"))
     );
     // Only worth a line when there is something unusual about the layout: a hybrid chip
     // (P-cores and E-cores) or more than one processor group.
     if let Some(note) = topology().note() {
         say!("CPUs   : {note}");
     }
-    say!("Windows: build {} ({})", u(reg_str(cv, "CurrentBuild")), u(reg_str(cv, "DisplayVersion")));
+    say!("Windows: build {} ({})", u(hklm_str(cv, "CurrentBuild")), u(hklm_str(cv, "DisplayVersion")));
 }
 
 fn open_log(target: &LogTarget) -> Option<String> {

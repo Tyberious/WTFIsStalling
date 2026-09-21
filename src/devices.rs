@@ -6,15 +6,11 @@
 //! to devices that are present right now, since the registry remembers everything ever plugged in.
 
 use std::collections::HashMap;
-use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS};
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-};
 
-use crate::util::{from_wide, wide};
+use crate::reg;
+use crate::util::wide;
 
 const ENUM: &str = r"SYSTEM\CurrentControlSet\Enum";
 const CLASS: &str = r"SYSTEM\CurrentControlSet\Control\Class";
@@ -86,28 +82,30 @@ impl DeviceMap {
     pub fn load() -> DeviceMap {
         let mut by_file: HashMap<String, Vec<DeviceDriver>> = HashMap::new();
         let mut service_files: HashMap<String, Option<String>> = HashMap::new();
-        for bus in subkeys(ENUM) {
-            for device in subkeys(&format!(r"{ENUM}\{bus}")) {
-                for instance in subkeys(&format!(r"{ENUM}\{bus}\{device}")) {
+        for bus in reg::subkeys(ENUM) {
+            for device in reg::subkeys(&format!(r"{ENUM}\{bus}")) {
+                for instance in reg::subkeys(&format!(r"{ENUM}\{bus}\{device}")) {
                     let key = format!(r"{ENUM}\{bus}\{device}\{instance}");
-                    let Some(service) = reg_str(&key, "Service") else { continue };
+                    let Some(service) = reg::hklm_path(&key, "Service") else { continue };
                     let file = service_files
                         .entry(service.to_lowercase())
-                        .or_insert_with(|| reg_str(&format!(r"{SERVICES}\{service}"), "ImagePath").and_then(|p| file_name(&p)))
+                        .or_insert_with(|| reg::hklm_path(&format!(r"{SERVICES}\{service}"), "ImagePath").and_then(|p| file_name(&p)))
                         .clone();
                     let Some(file) = file else { continue };
                     if !present(&format!(r"{bus}\{device}\{instance}")) {
                         continue;
                     }
-                    let Some(name) = reg_str(&key, "FriendlyName").or_else(|| reg_str(&key, "DeviceDesc")).map(|d| clean_desc(&d)) else {
+                    let Some(name) =
+                        reg::hklm_path(&key, "FriendlyName").or_else(|| reg::hklm_path(&key, "DeviceDesc")).map(|d| clean_desc(&d))
+                    else {
                         continue;
                     };
                     let mut entry = DeviceDriver { device: name, ..Default::default() };
-                    if let Some(driver) = reg_str(&key, "Driver") {
+                    if let Some(driver) = reg::hklm_path(&key, "Driver") {
                         let class_key = format!(r"{CLASS}\{driver}");
-                        entry.provider = reg_str(&class_key, "ProviderName").map(|p| clean_desc(&p)).unwrap_or_default();
-                        entry.version = reg_str(&class_key, "DriverVersion").unwrap_or_default();
-                        entry.date = reg_str(&class_key, "DriverDate").as_deref().and_then(parse_date);
+                        entry.provider = reg::hklm_path(&class_key, "ProviderName").map(|p| clean_desc(&p)).unwrap_or_default();
+                        entry.version = reg::hklm_path(&class_key, "DriverVersion").unwrap_or_default();
+                        entry.date = reg::hklm_path(&class_key, "DriverDate").as_deref().and_then(parse_date);
                     }
                     let list = by_file.entry(file).or_default();
                     if !list.iter().any(|d| d.device == entry.device) {
@@ -183,46 +181,9 @@ pub(crate) fn present(instance_id: &str) -> bool {
     unsafe { CM_Locate_DevNodeW(&mut devinst, wide(instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS }
 }
 
-pub(crate) fn subkeys(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut key: HKEY = null_mut();
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide(path).as_ptr(), 0, KEY_READ, &mut key) } != ERROR_SUCCESS {
-        return out;
-    }
-    for index in 0..8192 {
-        let mut name = [0u16; 256];
-        let mut len = name.len() as u32;
-        if unsafe { RegEnumKeyExW(key, index, name.as_mut_ptr(), &mut len, null(), null_mut(), null_mut(), null_mut()) } != ERROR_SUCCESS {
-            break;
-        }
-        out.push(String::from_utf16_lossy(&name[..len as usize]));
-    }
-    unsafe { RegCloseKey(key) };
-    out
-}
-
-pub(crate) fn reg_str(subkey: &str, value: &str) -> Option<String> {
-    let mut buf = [0u16; 1024];
-    let mut size = (buf.len() * 2) as u32;
-    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            wide(subkey).as_ptr(),
-            wide(value).as_ptr(),
-            flags,
-            null_mut(),
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-        )
-    };
-    (r == ERROR_SUCCESS).then(|| from_wide(&buf)).filter(|s| !s.is_empty())
-}
-
 /// Today's date in local time, for driver ages.
 pub fn today() -> (i32, u32, u32) {
-    let mut st = unsafe { std::mem::zeroed() };
-    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st) };
+    let st = crate::util::local_time();
     (st.wYear as i32, st.wMonth as u32, st.wDay as u32)
 }
 

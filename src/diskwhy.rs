@@ -131,106 +131,10 @@ impl DiskWhy {
     }
 }
 
-/// A process people do not recognize by file name: what it is doing, and the one thing that
-/// actually controls it. `windows` = part of Windows, so "close it" or "pause it" is not advice.
-pub struct Worker {
-    pub what: &'static str,
-    pub tip: &'static str,
-    pub windows: bool,
-}
-
-const IDLE_TIP: &str = "Windows saves this work for when the PC is idle, so a PC that is switched off right after use never gets \
-    it done: leave it on and untouched for an hour, then monitor again.";
-
-pub fn known_worker(process: &str) -> Option<Worker> {
-    let p = process.to_lowercase();
-    let w = |what, tip, windows| Worker { what, tip, windows };
-    let table: &[(&str, Worker)] = &[
-        (
-            "msmpeng",
-            w(
-                "Microsoft Defender antivirus scanning",
-                "Let the scan finish. To keep it away from games: Windows Security > Virus & threat protection > Manage settings > \
-                 Exclusions, add your game library folder.",
-                true,
-            ),
-        ),
-        (
-            "searchindexer",
-            w(
-                "Windows Search indexing files",
-                "It stops when the index is complete. To keep it off this drive: Settings > Privacy & security > Searching Windows, \
-                 add the folder under 'Exclude folders'.",
-                true,
-            ),
-        ),
-        ("searchprotocolhost", w("Windows Search indexing files", IDLE_TIP, true)),
-        ("tiworker", w("Windows Update installing", "Let the update finish, restart the PC, then monitor again.", true)),
-        ("trustedinstaller", w("Windows Update installing", "Let the update finish, restart the PC, then monitor again.", true)),
-        ("wuauclt", w("Windows Update", "Let the update finish, restart the PC, then monitor again.", true)),
-        ("mousocoreworker", w("Windows Update", "Let the update finish, restart the PC, then monitor again.", true)),
-        ("defrag", w("Windows drive optimization (defrag / TRIM)", IDLE_TIP, true)),
-        ("compattelrunner", w("Windows telemetry", IDLE_TIP, true)),
-        (
-            "backgroundtaskhost",
-            w(
-                "Windows running a background task for a Store app or a Windows feature",
-                "It normally finishes within minutes. If it keeps coming back: Settings > Apps > Installed apps > (the app) > Advanced \
-                 options > 'Let this app run in background' = Never, for apps you do not need updating themselves.",
-                true,
-            ),
-        ),
-        (
-            "vssvc",
-            w("a backup or restore point being made", "Let it finish; move scheduled backups to a time you are not using the PC.", true),
-        ),
-        ("memcompression", w("Windows paging memory out", "The PC is short of memory: close memory-hungry programs or add RAM.", true)),
-        ("system", w("Windows itself (file cache, paging or a driver)", IDLE_TIP, true)),
-        (
-            "dwm",
-            w(
-                "the desktop compositor that draws every window",
-                "It is driven by the graphics driver: update or clean-reinstall that, and close overlays and screen recorders.",
-                true,
-            ),
-        ),
-        (
-            "audiodg",
-            w(
-                "the Windows audio engine",
-                "Update the audio driver and turn off audio enhancements (Sound settings > device > Enhancements).",
-                true,
-            ),
-        ),
-        (
-            "wmiprvse",
-            w(
-                "a hardware-information service that monitoring tools query",
-                "Something is polling it hard: fully exit RGB, fan-control and hardware-monitoring utilities one at a time.",
-                true,
-            ),
-        ),
-        ("csrss", w("a core Windows process", IDLE_TIP, true)),
-        ("registry", w("a core Windows process", IDLE_TIP, true)),
-        ("svchost", w("a Windows service", IDLE_TIP, true)),
-        ("onedrive", w("OneDrive syncing", "Pause syncing from the OneDrive tray icon while you play.", false)),
-        (
-            "steam",
-            w(
-                "Steam downloading, updating or verifying a game",
-                "Pause the download, or in Steam > Settings > Downloads turn off downloads during gameplay.",
-                false,
-            ),
-        ),
-        ("epicgameslauncher", w("Epic Games Launcher downloading or updating", "Pause the download while you play.", false)),
-        ("battle.net", w("Battle.net downloading or updating", "Pause the download while you play.", false)),
-    ];
-    table.iter().find(|(k, _)| p.starts_with(k)).map(|(_, v)| Worker { ..*v })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procs::known_worker;
 
     fn io(disk: u32, start_ms: f64, dur_ms: f64, size: u32, pid: u32, op: u8) -> IoRec {
         let dur = ms_to_ticks(dur_ms);

@@ -1,11 +1,9 @@
 use std::fs::File;
 use std::io::Write;
 use std::mem::{size_of, zeroed};
-use std::ptr::null_mut;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 static LOG: Mutex<Option<File>> = Mutex::new(None);
@@ -63,42 +61,40 @@ pub fn status(s: &str) {
     }
 }
 
-/// "20260920-001530", for report file names.
-pub fn file_timestamp() -> String {
-    let st = unsafe {
-        let mut st = std::mem::zeroed();
+/// The local date and time, as Windows reports it.
+pub fn local_time() -> windows_sys::Win32::Foundation::SYSTEMTIME {
+    unsafe {
+        let mut st = zeroed();
         GetLocalTime(&mut st);
         st
-    };
+    }
+}
+
+/// Seconds since the Unix epoch, 0 if the clock is somehow before it. The Windows event log
+/// timestamps are in these terms, so everything compared against them is too.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// "" or "s": the suffix that makes a word agree with a count.
+pub fn plural(n: u64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// "20260920-001530", for report file names.
+pub fn file_timestamp() -> String {
+    let st = local_time();
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
 }
 
 /// "2026-09-20 00:15" (local), for showing when a saved run was made.
 pub fn local_stamp() -> String {
-    let st = unsafe {
-        let mut st = std::mem::zeroed();
-        GetLocalTime(&mut st);
-        st
-    };
+    let st = local_time();
     format!("{:04}-{:02}-{:02} {:02}:{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
-}
-
-/// A string value from HKEY_LOCAL_MACHINE, for the machine description lines.
-pub fn reg_str(subkey: &str, value: &str) -> Option<String> {
-    let mut buf = [0u16; 256];
-    let mut size = (buf.len() * 2) as u32;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            wide(subkey).as_ptr(),
-            wide(value).as_ptr(),
-            RRF_RT_REG_SZ,
-            null_mut(),
-            buf.as_mut_ptr() as _,
-            &mut size,
-        )
-    };
-    (rc == 0).then(|| from_wide(&buf).trim().to_string())
 }
 
 pub fn total_ram_bytes() -> u64 {
@@ -167,11 +163,7 @@ static CLOCK: OnceLock<WallClock> = OnceLock::new();
 
 pub fn clock() -> &'static WallClock {
     CLOCK.get_or_init(|| {
-        let st = unsafe {
-            let mut st = std::mem::zeroed();
-            GetLocalTime(&mut st);
-            st
-        };
+        let st = local_time();
         WallClock {
             qpc0: qpc(),
             ms_of_day0: ((st.wHour as i64 * 60 + st.wMinute as i64) * 60 + st.wSecond as i64) * 1000 + st.wMilliseconds as i64,

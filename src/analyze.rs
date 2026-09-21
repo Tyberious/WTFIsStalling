@@ -11,12 +11,12 @@ use crate::files::{self, DosMap};
 use crate::health::{self, DriveHealth};
 use crate::modules::{ModuleMap, KERNEL_SPACE};
 use crate::probe::{Stall, StallKind};
-use crate::procs::ProcNames;
+use crate::procs::{process_name, ProcNames};
 use crate::quiet::Quieter;
 use crate::say;
 use crate::state::*;
 use crate::topology::{topology, Topology};
-use crate::util::{clock, fmt_dur, ms_to_ticks, qpc, ticks_to_ms};
+use crate::util::{clock, fmt_dur, ms_to_ticks, plural, qpc, ticks_to_ms};
 
 pub(crate) struct IncidentSummary {
     pub(crate) kind: StallKind,
@@ -685,11 +685,11 @@ impl Analyzer {
             let what = match r.subject.split_once(' ') {
                 Some(("disk", n)) => {
                     let disk = n.parse().map(|n| self.disks.get(n).short()).unwrap_or_else(|_| r.subject.clone());
-                    format!("{disk}: {} more slow request{}", r.count, if r.count == 1 { "" } else { "s" })
+                    format!("{disk}: {} more slow request{}", r.count, plural(r.count as u64))
                 }
-                Some(("driver", module)) => format!("{module}: {} more long DPC/ISR run{}", r.count, if r.count == 1 { "" } else { "s" }),
+                Some(("driver", module)) => format!("{module}: {} more long DPC/ISR run{}", r.count, plural(r.count as u64)),
                 Some(("paging", program)) => {
-                    format!("{program}: {} more slow hard page fault{}", r.count, if r.count == 1 { "" } else { "s" })
+                    format!("{program}: {} more slow hard page fault{}", r.count, plural(r.count as u64))
                 }
                 _ => format!("{}: {} more", r.subject, r.count),
             };
@@ -758,14 +758,6 @@ fn op_name(op: u8) -> &'static str {
         b'R' => "read",
         b'W' => "write",
         _ => "flush",
-    }
-}
-
-/// "steam.exe (1234)" -> "steam.exe", so several processes of one program add up.
-fn process_name(label: &str) -> String {
-    match label.rsplit_once(" (") {
-        Some((name, rest)) if rest.trim_end_matches(')').chars().all(|c| c.is_ascii_digit()) => name.to_string(),
-        _ => label.to_string(),
     }
 }
 

@@ -2,7 +2,8 @@
 //! can be reported as "NVIDIA GeForce RTX 4090". Read from the device registry; only devices
 //! that are present right now count, since the registry also remembers every card ever installed.
 
-use crate::devices::{clean_desc, present, reg_str, subkeys};
+use crate::devices::{clean_desc, present};
+use crate::reg;
 
 const ENUM_PCI: &str = r"SYSTEM\CurrentControlSet\Enum\PCI";
 
@@ -17,14 +18,17 @@ pub struct PciDevice {
 /// Every PCI device currently present, with its bus address.
 pub fn devices() -> Vec<PciDevice> {
     let mut out = Vec::new();
-    for hw in subkeys(ENUM_PCI) {
-        for instance in subkeys(&format!(r"{ENUM_PCI}\{hw}")) {
+    for hw in reg::subkeys(ENUM_PCI) {
+        for instance in reg::subkeys(&format!(r"{ENUM_PCI}\{hw}")) {
             let key = format!(r"{ENUM_PCI}\{hw}\{instance}");
-            let Some((bus, device, function)) = reg_str(&key, "LocationInformation").as_deref().and_then(parse_location) else { continue };
+            let Some((bus, device, function)) = reg::hklm_path(&key, "LocationInformation").as_deref().and_then(parse_location) else {
+                continue;
+            };
             if !present(&format!(r"PCI\{hw}\{instance}")) {
                 continue;
             }
-            let Some(name) = reg_str(&key, "FriendlyName").or_else(|| reg_str(&key, "DeviceDesc")).map(|d| clean_desc(&d)) else {
+            let Some(name) = reg::hklm_path(&key, "FriendlyName").or_else(|| reg::hklm_path(&key, "DeviceDesc")).map(|d| clean_desc(&d))
+            else {
                 continue;
             };
             out.push(PciDevice { bus, device, function, name });

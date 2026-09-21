@@ -31,6 +31,8 @@ use std::sync::OnceLock;
 use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
 use windows_sys::Win32::System::Threading::{GetActiveProcessorCount, GetActiveProcessorGroupCount};
 
+use crate::util::plural;
+
 /// One logical CPU to pin a probe thread to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
@@ -226,7 +228,7 @@ impl Topology {
                 cores.dedup();
                 let (n, threads) = (cores.len(), cpus.len());
                 let name = if perf { "P-core" } else { "E-core" };
-                let s = if n == 1 { "" } else { "s" };
+                let s = plural(n as u64);
                 if threads > n {
                     format!("{n} {name}{s} ({threads} threads)")
                 } else {
