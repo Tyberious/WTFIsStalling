@@ -645,12 +645,13 @@ impl Analyzer {
         let threads = |k: usize| format!("{k} of the {n} measuring thread{} {}", plural(n as u64), if k == 1 { "was" } else { "were" });
         if v.late > 0 {
             say!(
-                "    SCHEDULER: {} never made runnable until {} into it: nothing woke {}. The timer that wakes",
+                "    SCHEDULER: {} never made runnable until {} into it: nothing woke {}.",
                 threads(v.late),
                 fmt_dur(v.worst_delay),
                 if v.late == 1 { "it" } else { "them" }
             );
-            say!("               them did not fire, which is the clock, the firmware or power management - below the scheduler.");
+            say!("               The timer that wakes them fired late, which points at the clock, the firmware or power management,");
+            say!("               below the scheduler, unless the verdict below shows interrupt-level work holding the timer's processor.");
         }
         if v.queued > 0 {
             let idle = v.on_idle_cpu;
