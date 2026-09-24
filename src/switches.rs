@@ -115,6 +115,19 @@ pub fn voluntary_wait(reason: i8) -> bool {
     matches!(reason, 4 | 11 | 5 | 12 | 15 | 22) // DelayExecution, Suspended, WrQueue, WrTerminated
 }
 
+/// Can a long wait of this kind count as a program being HELD UP?
+///
+/// Not a voluntary one, and not UserRequest / WrUserRequest (6 / 13): that is what every window's
+/// message loop and every event wait in a program sits in when there is nothing to do, and the
+/// trace cannot tell "idle" from "stuck" for it. Measured live (2026-09-24): at one flagged moment
+/// msedge.exe, a CEF helper, RustRover and Claude each "waited" ~1,996 ms in it, which is idle
+/// loops waking on their own 2 s timeouts, and the report made the first of them its top suspect.
+/// A real lock has its own reasons (WrResource, WrPushLock, the mutexes) and disk and paging
+/// waits theirs, so those still count.
+pub fn held_up_wait(reason: i8) -> bool {
+    !voluntary_wait(reason) && !matches!(reason, 6 | 13)
+}
+
 /// What held a processor while some other thread was waiting for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RanInstead {
@@ -860,6 +873,19 @@ mod tests {
         }
         for reason in [0i8, 2, 6, 13, 21, 29] {
             assert!(!voluntary_wait(reason), "{reason}");
+        }
+    }
+
+    /// An idle message loop or event wait (UserRequest) looks exactly like a stuck one in this
+    /// trace, so it can never make a program "held up"; locks, disk and paging waits still do.
+    #[test]
+    fn a_message_or_event_wait_is_never_a_program_held_up() {
+        for reason in [6i8, 13, 4, 11, 15] {
+            assert!(!held_up_wait(reason), "{reason}");
+        }
+        // Executive, PageIn, WrPageIn, WrResource, WrPushLock, WrGuardedMutex.
+        for reason in [0i8, 2, 9, 27, 28, 35] {
+            assert!(held_up_wait(reason), "{reason}");
         }
     }
 

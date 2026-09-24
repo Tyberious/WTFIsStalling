@@ -56,7 +56,9 @@ drops the suffix (`0.10.0-beta.1` and `0.10.0` are both `0.10.0.0`); the text ve
 
 1. In `Cargo.toml`, set the version to the release (`0.10.0`, or `0.10.0-beta.1` for a beta).
    Build once so `Cargo.lock` follows, then commit. Name the commit for what the release changes
-   for users.
+   for users. If the window changed since the last release, retake the README screenshots
+   now, before that commit (they show the version in the title bar): demo data only, captured from
+   the app window alone.
 2. Tag and push: `git tag v0.10.0 && git push origin v0.10.0`. The release workflow refuses a tag
    that does not match `Cargo.toml`, and any `-dev` version.
 3. When the workflow is green, check the published files:

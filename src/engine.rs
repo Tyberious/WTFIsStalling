@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use crate::baseline::CompareMode;
 use crate::overhead::Overhead;
 use crate::reg::hklm_str;
-use crate::summary::{RunData, Summary};
+use crate::summary::{Machine, RunData, Setup, Summary, SwitchTrace};
 use crate::topology::topology;
 use crate::util::{self, ms_to_ticks, wide};
 use crate::{analyze, baseline, cpuclock, etw, foreground, gpu, gputrace, modules, overhead, probe, say, state, storport};
@@ -68,6 +68,9 @@ pub struct Config {
     /// saved next to the report).
     pub compare: CompareMode,
     pub debug: bool,
+    /// How to flag a hitch in this front end, for the one line shown while monitoring
+    /// ("Monitoring - reproduce the hitch now; <this>.").
+    pub mark_hint: &'static str,
 }
 
 impl Default for Config {
@@ -88,6 +91,7 @@ impl Default for Config {
             log: LogTarget::Auto,
             compare: CompareMode::Auto,
             debug: false,
+            mark_hint: "press Ctrl+Shift+F9 (or 'I felt it!') when you feel one",
         }
     }
 }
@@ -140,7 +144,9 @@ pub fn relaunch_elevated(extra: &[&str]) -> bool {
     rc as usize > 32
 }
 
-fn print_system_info(ncpu: u32) {
+/// Prints the System / Board / Windows lines and returns the hardware models for the short
+/// summary (the board and BIOS stay in the report only).
+fn print_system_info(ncpu: u32) -> Machine {
     let cv = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
     let bios_key = "HARDWARE\\DESCRIPTION\\System\\BIOS";
     let cpu = hklm_str("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString");
@@ -148,12 +154,9 @@ fn print_system_info(ncpu: u32) {
     mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
     unsafe { GlobalMemoryStatusEx(&mut mem) };
     let u = |s: Option<String>| s.unwrap_or_else(|| "?".into());
-    say!(
-        "System : {} ({ncpu} logical CPUs), {:.1} GB RAM ({}% in use)",
-        u(cpu),
-        mem.ullTotalPhys as f64 / (1u64 << 30) as f64,
-        mem.dwMemoryLoad
-    );
+    let ram_gb = mem.ullTotalPhys as f64 / (1u64 << 30) as f64;
+    let cpu = u(cpu).trim().to_string();
+    say!("System : {cpu} ({ncpu} logical CPUs), {ram_gb:.1} GB RAM ({}% in use)", mem.dwMemoryLoad);
     say!(
         "Board  : {} {}, BIOS {} ({})",
         u(hklm_str(bios_key, "BaseBoardManufacturer")),
@@ -166,7 +169,9 @@ fn print_system_info(ncpu: u32) {
     if let Some(note) = topology().note() {
         say!("CPUs   : {note}");
     }
-    say!("Windows: build {} ({})", u(hklm_str(cv, "CurrentBuild")), u(hklm_str(cv, "DisplayVersion")));
+    let windows = format!("build {} ({})", u(hklm_str(cv, "CurrentBuild")), u(hklm_str(cv, "DisplayVersion")));
+    say!("Windows: {windows}");
+    Machine { cpu, logical_cpus: ncpu, ram_gb, gpus: Vec::new(), windows }
 }
 
 fn open_log(target: &LogTarget) -> Option<String> {
@@ -192,6 +197,17 @@ pub struct RunOutput {
     /// The full report with the result first: system info, RESULT, DETAILS, event log.
     pub report: String,
     pub summary: Summary,
+    /// The short summary for a Discord message or a forum post (`Summary::forum_summary`).
+    pub short: String,
+    /// Where the short summary was saved, next to the report, if anywhere.
+    pub short_path: Option<String>,
+}
+
+/// "C:\x\WTFIsStalling-20260924-101500.txt" -> "C:\x\WTFIsStalling-20260924-101500-summary.txt".
+pub fn summary_path_for(report_path: &str) -> String {
+    let p = std::path::Path::new(report_path);
+    let stem = p.file_stem().map_or_else(|| "WTFIsStalling".into(), |s| s.to_string_lossy().into_owned());
+    p.with_file_name(format!("{stem}-summary.txt")).display().to_string()
 }
 
 /// Monitors until `stop` is set (or `cfg.duration` elapses), then prints the summary.
@@ -259,6 +275,15 @@ fn wrap_line(line: &str, out: &mut Vec<String>) {
     out.push(current);
 }
 
+/// The header and the events out of everything a run printed: without the `tail` (the DETAILS
+/// and RESULT it printed last) and without what lies between `header_len` and `events_from` (the
+/// instruction shown while monitoring).
+fn split_capture(lines: &[String], header_len: usize, events_from: usize, tail: usize) -> (&[String], &[String]) {
+    let streamed = lines.len().saturating_sub(tail);
+    let header = &lines[..header_len.min(streamed)];
+    (header, &lines[events_from.clamp(header.len(), streamed)..streamed])
+}
+
 fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     util::clock();
     let log_path = open_log(&cfg.log);
@@ -269,20 +294,28 @@ fn run_guarded(cfg: &Config, stop: &AtomicBool) -> Result<RunOutput, String> {
     }
     util::set_log(None);
     let lines = util::take_capture();
-    let (summary, header_len) = result?;
+    let (summary, header_len, events_from) = result?;
 
     // The file was streamed chronologically (so a crash still leaves a log). Now that the
-    // answer is known, rewrite it answer-first.
-    let streamed = lines.len() - summary.detail_lines().len() - summary.result_lines().len();
-    let (header, events) = lines[..streamed].split_at(header_len.min(streamed));
+    // answer is known, rewrite it answer-first. The "Monitoring - reproduce the hitch now" line
+    // between the header and the events was an instruction for the live view and is left out.
+    let tail = summary.detail_lines().len() + summary.result_lines().len();
+    let (header, events) = split_capture(&lines, header_len, events_from, tail);
     let report = compose_report(header, &summary, events);
+    let short = summary.forum_summary(log_path.as_deref());
+    let mut short_path = None;
     if let Some(path) = &log_path {
         let _ = std::fs::write(path, &report);
+        // Saved next to the report: once the window is closed, this file is the only place the
+        // short version is left, and it costs one small write.
+        let p = summary_path_for(path);
+        if std::fs::write(&p, format!("{short}\r\n")).is_ok() {
+            short_path = Some(p);
+        }
     }
-    Ok(RunOutput { log_path, report, summary })
+    Ok(RunOutput { log_path, report, summary, short, short_path })
 }
 
-/// Returns the summary and how many captured lines make up the system-info header.
 /// 1 ms system timer resolution for as long as a run lasts, and not a moment longer: the request is
 /// system-wide, and "changes nothing on the system" has to stay true once monitoring stops. Released
 /// on every way out of the run, early returns and panics included.
@@ -301,11 +334,19 @@ impl Drop for TimerResolution {
     }
 }
 
-fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<(Summary, usize), String> {
+/// Returns the summary, how many captured lines make up the system-info header, and where the
+/// events begin (after the one-line instruction shown while monitoring).
+///
+/// Nothing about how the run is set up is printed as it happens: the report opens with the
+/// machine and then the answer. What the setup means for the result goes into `Setup`, which
+/// the summary turns into notes in RESULT and a "HOW THIS RUN MEASURED" block in DETAILS.
+fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<(Summary, usize, usize), String> {
     // Every group, not just group 0: past 64 logical CPUs Windows splits the machine up.
     let ncpu = topology().total() as u32;
     say!("WTFIsStalling {} - what is stalling this PC?", env!("CARGO_PKG_VERSION"));
-    print_system_info(ncpu);
+    let mut machine = print_system_info(ncpu);
+    let header_len = util::capture_len();
+    let mut setup = Setup { stall_ms: cfg.stall_ms, sched_stall_ms: cfg.sched_stall_ms, ..Setup::default() };
 
     // Decided once, before anything starts: mid-run switching would make the two halves of one
     // report incomparable. Both facts are readable without administrator rights.
@@ -314,14 +355,16 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         Some(true) => overhead::auto_light_reason(ncpu, overhead::on_battery()).or(Some("you asked for it")),
         None => overhead::auto_light_reason(ncpu, overhead::on_battery()),
     };
+    // Light mode deliberately leaves CPU sampling alone: its interval is a system-wide Windows
+    // setting, a hard kill would leave it changed until reboot, and other profilers would see it.
+    // The probes are the real cost, and those are ours to slow down.
     let probe_ms = if light_reason.is_some() { overhead::PROBE_MS_LIGHT } else { overhead::PROBE_MS_NORMAL };
+    (setup.light, setup.probe_ms) = (light_reason, probe_ms);
 
     // Since Windows 11 24H2 kernel module addresses are hidden without SeDebugPrivilege.
     etw::enable_privilege("SeDebugPrivilege");
     let modules = modules::ModuleMap::load();
-    if modules.is_empty() {
-        say!("warning: Windows would not reveal kernel module addresses; drivers will show as raw addresses.");
-    }
+    setup.modules_hidden = modules.is_empty();
 
     util::status("Starting kernel trace...");
     // Context switches cost far more than everything else in this session put together, and light
@@ -331,34 +374,16 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     // for the same reason it leaves the switches off.
     let want_stacks = if light_reason.is_some() { crate::stacks::StackSet::NONE } else { cfg.stacks };
     let session = etw::Session::start(cfg.profile, want_switches, want_stacks)?;
-    if !session.profile && cfg.profile {
-        say!("warning: CPU sampling could not be enabled; process attribution and firmware/SMI detection are off.");
-    }
-    if want_switches && !session.switches {
-        say!("warning: Windows would not trace context switches; the report cannot say whether a stalled thread was woken.");
-    }
+    setup.sampling_failed = !session.profile && cfg.profile;
+    setup.switches = match (session.switches, want_switches) {
+        (true, _) => SwitchTrace::Traced,
+        (false, true) => SwitchTrace::Refused,
+        (false, false) if cfg.switches && light_reason.is_some() => SwitchTrace::LightMode,
+        (false, false) => SwitchTrace::Off,
+    };
+    setup.stack_error = session.stack_error;
+    setup.stacks = (!session.stacks.is_empty()).then(|| session.stacks.plain());
     let _timer_resolution = TimerResolution::raise();
-    // Light mode deliberately leaves CPU sampling alone: its interval is a system-wide Windows
-    // setting, a hard kill would leave it changed until reboot, and other profilers would see it.
-    // The probes are the real cost, and those are ours to slow down.
-    if let Some(why) = light_reason {
-        say!("Light mode: on, because {why}. The probes check every {probe_ms:.0} ms instead of 1 ms, so measuring costs this PC");
-        say!("            less. Stalls shorter than about {probe_ms:.0} ms can be missed.");
-    }
-    if let Some(rc) = session.stack_error {
-        say!("warning: Windows refused call stacks (Win32 error {rc}); the report cannot say which drivers were in the path.");
-    } else if !session.stacks.is_empty() {
-        say!("Stacks  : recording which drivers {} went through", session.stacks.plain());
-        say!("          (driver names only, never function names).");
-    }
-    if session.switches {
-        say!("Switches: tracing every thread switch, which is what tells 'nothing woke it' apart from 'it was woken and not run'.");
-        say!("          It is the most expensive thing this tool records: tens of thousands of events a second on a busy PC. The");
-        say!("          DETAILS block reports what it actually cost; 'wtfis-cli --no-switches' turns it off.");
-    } else if cfg.switches && light_reason.is_some() {
-        say!("Switches: not traced in light mode (it is the most expensive thing this tool records), so the report cannot say");
-        say!("          whether a stalled thread was never woken or was woken and not given a processor.");
-    }
 
     let shared = Arc::new(state::Shared {
         inner: Mutex::new({
@@ -395,7 +420,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
                 gpu_consumer = Some(consumer);
             }
             Err(e) => {
-                say!("warning: the graphics-kernel trace could not be started ({e}); frame timing and video memory pressure are off.");
+                setup.gpu_failed = Some(e.clone());
                 gpu_note = Some(e);
             }
         }
@@ -414,7 +439,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
                 stor_consumer = Some(consumer);
             }
             Err(e) => {
-                say!("warning: the storage driver trace could not be started ({e}); where slow disk time went is not measured.");
+                setup.storage_failed = Some(e.clone());
                 stor_note = Some(e);
             }
         }
@@ -431,7 +456,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, probe_ms, tx, probe_stats.clone()) {
         Ok(c) => Some(c),
         Err(e) => {
-            say!("warning: could not start the latency probe process ({e}); only individual slow events will be reported.");
+            setup.probe_failed = Some(e.to_string());
             None
         }
     };
@@ -449,14 +474,13 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     }
     analyzer.set_cpu_clock(cpu_clock.clone());
     analyzer.set_foreground(foreground);
-    say!(
-        "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
-        analyzer.modules.len(),
-        cfg.stall_ms,
-        cfg.sched_stall_ms
-    );
-    let header_len = util::capture_len();
+    setup.modules = analyzer.modules.len();
+    // The graphics kernel's adapter names, read once when the sampler started.
+    machine.gpus = gpu_log.lock().unwrap_or_else(|e| e.into_inner()).adapters.iter().map(|a| a.name.clone()).collect();
+    // The one line shown while monitoring, and only then: the report drops it (see run_guarded).
     say!("");
+    say!("Monitoring - reproduce the hitch now; {}.", cfg.mark_hint);
+    let events_from = util::capture_len();
 
     let started = Instant::now();
     let mut last_status = u64::MAX;
@@ -474,9 +498,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         }
         if !checked_realtime && elapsed >= 2 {
             checked_realtime = true;
-            if !probe_stats.realtime.load(Ordering::Relaxed) {
-                say!("warning: probes could not get real-time priority; busy high-priority apps may show up as kernel-level stalls.");
-            }
+            setup.no_realtime = !probe_stats.realtime.load(Ordering::Relaxed);
         }
         if elapsed != last_status {
             last_status = elapsed;
@@ -555,12 +577,14 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     // Compare with the previous run and leave this run's numbers for the next one. Must happen
     // before the result is printed, so "what changed" is part of the result everywhere.
     baseline::attach(&mut summary, &cfg.compare, log_path);
+    summary.set_setup(&setup);
+    summary.machine = machine;
     // Streamed order ends with the result, because on a console the bottom is what you see.
     say!("");
     for line in summary.detail_lines().iter().chain(summary.result_lines().iter()) {
         say!("{line}");
     }
-    Ok((summary, header_len))
+    Ok((summary, header_len, events_from))
 }
 
 #[cfg(test)]
@@ -585,5 +609,24 @@ mod tests {
         assert!(at("WTFIsStalling test") < at("RESULT") && at("RESULT") < at("DETAILS") && at("DETAILS") < at("EVENT LOG"));
         assert!(at("EVENT LOG") < at("STALL #1"));
         assert!(lines[at("VERDICT:") + 1].starts_with("            word"), "continuation lines hang under the text");
+    }
+
+    /// The report opens with the machine and then the answer: the line shown while monitoring
+    /// is left out, and so is the result the run printed at the end of its live output.
+    #[test]
+    fn the_report_keeps_the_header_and_the_events_and_drops_the_live_instruction() {
+        let lines: Vec<String> =
+            ["WTFIsStalling x", "System : cpu", "Windows: build 1", "", "Monitoring - reproduce", "", "[12:00] STALL #1"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(["DETAILS".to_string(), "RESULT".to_string()])
+                .collect();
+        let (header, events) = split_capture(&lines, 3, 5, 2);
+        assert_eq!(header, &lines[..3]);
+        assert_eq!(events, &lines[5..7], "{events:?}");
+        assert!(!header.iter().chain(events).any(|l| l.starts_with("Monitoring") || l == "RESULT"));
+        // Nothing to split is never a panic.
+        assert_eq!(split_capture(&lines[..2], 3, 5, 9), (&lines[..0], &lines[..0]));
+        assert_eq!(summary_path_for("C:\\r\\WTFIsStalling-1.txt"), "C:\\r\\WTFIsStalling-1-summary.txt");
     }
 }

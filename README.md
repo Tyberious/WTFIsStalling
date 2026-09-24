@@ -28,6 +28,10 @@ nothing on the system.
    **When you feel a hitch, press Ctrl+Shift+F9** (works inside games) or click **I felt it!** The report
    then zooms in on the seconds before each press, with no thresholds.
 4. Click **Stop**. Read the summary, or click **Copy report** and paste it to whoever is helping you.
+   Asking on Discord or in a forum? Click **Copy summary** instead: a short version (the verdict, your
+   CPU, graphics card, RAM and Windows build, the stall counts and the top findings with what to try)
+   that fits in one Discord message, code block included. Attach the full report file if someone asks
+   for more.
 
 > **"Windows protected your PC"?** That is SmartScreen reacting to a new, unsigned program that few
 > people have downloaded yet, not a virus detection. Click **More info**, then **Run anyway**. If you
@@ -42,8 +46,18 @@ nothing on the system.
 > with the detection name so it can be reported to the vendor as a false positive.
 
 The colored bar gives the verdict; the report underneath starts with the ranked findings and what to
-try for each, followed by the supporting numbers and the event log. A copy is saved next to the exe as
-`WTFIsStalling-<date>.txt`. The window follows the system light / dark theme.
+try for each, followed by the supporting numbers and the event log. How the run measured (thresholds,
+what was traced) is in DETAILS; anything that changes how to read the result, such as a trace Windows
+would not start, is a one-line note right under the overview. A copy is saved next to the exe as
+`WTFIsStalling-<date>.txt`, and the short summary next to it as `WTFIsStalling-<date>-summary.txt`. The
+window follows the system light / dark theme.
+
+The short summary is built only from what the report says, and never holds a user name, a computer
+name, a folder path or a serial number: hardware models only, and the report by its file name. It is
+capped at 2,000 characters including the ``` fence around it, which is Discord's limit without Nitro
+([Discord: Sending Messages](https://support.discord.com/hc/en-us/articles/360034632292-Sending-Messages));
+when a run finds a lot, the lesser findings' advice goes first, then the lesser findings, and the last
+line says how many more are in the full report. Nothing is cut mid-sentence.
 
 **Did it help?** Try what the report suggests, then run the tool again. The second report says what
 changed, in the RESULT block right under the overview:
@@ -464,6 +478,7 @@ wtfis-cli --no-gpu-trace     # skip the graphics-kernel trace (frame timing and 
 wtfis-cli --no-storage-trace # skip the storage-driver trace (drive vs Windows time, retries, resets)
 wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that run instead of the newest
 wtfis-cli --no-compare       # don't compare with an earlier run
+wtfis-cli --summary > s.txt  # print only the short summary (the report file is still written)
 ```
 
 | Flag | Default | Effect |
@@ -483,12 +498,14 @@ wtfis-cli --no-compare       # don't compare with an earlier run
 | `--no-light` | off | Keep full measuring even on a small or unplugged PC (the opposite of `--light`) |
 | `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory, or `%TEMP%` if that can't be written | Report file path |
 | `--no-log` | off | Don't write a report file |
+| `--summary` | off | Print only the short summary (one Discord message or forum post) to standard output; what you need to see while monitoring goes to standard error, and the report file is still written |
 | `--compare <file>` | newest run from this PC, up to 30 days old | Compare this run with a particular earlier one (the `.wtfis` file saved next to its report) |
 | `--no-compare` | off | Don't compare this run with an earlier one |
 | `--no-elevate` | off | Fail instead of asking for elevation when not running as Administrator |
 
 Run `wtfis-cli --help` for all options. Press Enter to flag a hitch, Ctrl+C to stop and print the
-summary.
+summary. After the result and the report's path, the console prints the short summary between two
+marker lines, ready to copy, and saves it next to the report as `WTFIsStalling-<date>-summary.txt`.
 
 ## Building
 

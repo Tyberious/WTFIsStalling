@@ -8,6 +8,7 @@ use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use wtfis::baseline::CompareMode;
 use wtfis::engine::{self, Config, LogTarget};
 use wtfis::stacks::StackSet;
+use wtfis::util;
 
 #[derive(Parser)]
 #[command(
@@ -80,6 +81,10 @@ struct Args {
     /// Don't write a report file
     #[arg(long)]
     no_log: bool,
+    /// Print only the short summary (small enough for one Discord message or forum post) to
+    /// standard output. The full report file is still written
+    #[arg(long)]
+    summary: bool,
     /// Compare this run with a particular earlier one: the .wtfis file saved next to its report
     /// (default: the newest run from this PC in the report's folder, up to 30 days old)
     #[arg(long, value_name = "FILE")]
@@ -155,6 +160,17 @@ fn main() {
     // (below) blocks the main thread. After the run finishes it instead forwards Enter presses
     // through this channel, since `--pause-on-exit`'s final "press Enter to close" wait would
     // otherwise race the same stdin against this thread.
+    // --summary keeps standard output for the summary alone, so it can be redirected to a file;
+    // what a person at the console still needs to see goes to standard error.
+    let only_summary = args.summary;
+    let say = move |line: &str| if only_summary { eprintln!("{line}") } else { println!("{line}") };
+    if only_summary {
+        util::set_line_sink(Box::new(|line| {
+            if line.starts_with("ERROR") {
+                eprintln!("{line}");
+            }
+        }));
+    }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || loop {
         let mut buf = String::new();
@@ -167,7 +183,7 @@ fn main() {
                     }
                 } else {
                     engine::mark_now();
-                    println!("  marked - the report will show what happened just before this moment");
+                    say("  marked - the report will show what happened just before this moment");
                 }
             }
         }
@@ -209,15 +225,33 @@ fn main() {
             (false, None) => CompareMode::Auto,
         },
         debug: args.debug,
+        mark_hint: "press Enter when you feel one, Ctrl+C to stop",
     };
-    println!("Press Enter whenever you feel a hitch to mark that moment. Press Ctrl+C to stop and see the summary.");
+    say("Press Enter whenever you feel a hitch to mark that moment. Press Ctrl+C to stop and see the summary.");
     let result = engine::run(&cfg, &STOP);
     DONE.store(true, Ordering::SeqCst);
-    if let Some(path) = result.as_ref().ok().and_then(|out| out.log_path.as_ref()) {
-        println!("\nReport saved to {path} (result first, then details and the event log)");
+    match &result {
+        Ok(out) => {
+            if let Some(path) = &out.log_path {
+                say(&format!("\nReport saved to {path} (result first, then details and the event log)"));
+            }
+            if only_summary {
+                println!("{}", out.short);
+            } else {
+                // Delimited, so it is plain where the part to copy starts and ends.
+                println!("\n---- SHORT SUMMARY: fits in one Discord message or forum post; copy everything between these lines ----");
+                println!("{}", out.short);
+                println!("---- END OF SHORT SUMMARY ----");
+                if let Some(p) = &out.short_path {
+                    println!("(also saved as {p})");
+                }
+            }
+        }
+        Err(e) if only_summary => eprintln!("ERROR: {e}"),
+        Err(_) => {}
     }
     if args.pause_on_exit {
-        println!("\nPress Enter to close...");
+        say("\nPress Enter to close...");
         let _ = rx.recv();
     }
     std::process::exit(if result.is_ok() { 0 } else { 2 });

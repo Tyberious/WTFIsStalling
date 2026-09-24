@@ -5,13 +5,26 @@ What changed in each release, in short. The full notes, with details and downloa
 
 ## Unreleased (0.10.0)
 
+### Added
+- A short summary for Discord and forums: **Copy summary** in the app, `--summary` on the command line, and a
+  `-summary.txt` file next to each report. It fits in one Discord message (2,000 characters, code block
+  included) and holds hardware models, the counts and the top findings, never a name, path or serial number.
+
 ### Changed
+- The report opens with the verdict: how the run measured (thresholds, which traces ran) moved to a "HOW THIS RUN
+  MEASURED" block in DETAILS, and anything that changes how to read the result is a one-line note under the
+  overview.
 - The list of hardware-access tools no longer draws on any GPL-licensed source: every fact once taken from
   Eclypsium's Screwed-Drivers list was re-sourced from LOLDrivers, Microsoft or the vendor, and claims no such
   source confirms were made less specific (for example "an ASRock utility" instead of a product name).
 
 ### Fixed
 - The 64-bit build of an Intel utility driver (`semav6msr64.sys`) was never recognized.
+- Programs could be reported as "held up" for about 2 seconds at a flagged moment when their threads were only
+  idle, waiting for their next message or event; on a PC running a browser or other Chromium-based apps this could
+  become the top suspect. Such waits no longer count; waits on locks, disks and paging still do.
+- The app window showed the full path of the saved report, including the Windows user name; it now shows the file
+  name only.
 
 ## 0.9.0 (2026-09-24)
 

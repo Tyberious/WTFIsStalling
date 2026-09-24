@@ -6,13 +6,18 @@
 
 mod ctx;
 mod details;
+mod forum;
 mod freezes;
 mod gpu;
 mod hardware;
 mod platform;
+mod setup;
 mod stalls;
 mod storage;
 mod wording;
+
+pub use forum::{summary_len, Machine, SUMMARY_MAX};
+pub use setup::{Setup, SwitchTrace};
 
 use std::sync::atomic::Ordering;
 
@@ -125,11 +130,18 @@ pub struct Summary {
     pub subline: String,
     /// Short "label: value" lines: duration, stall counts, worst delays.
     pub overview: Vec<String>,
+    /// Warnings that change how the result reads (a trace that could not start, call stacks
+    /// refused): one line each, right under the overview.
+    pub notes: Vec<String>,
     /// "Compared with your last run": empty when there is no previous run to compare with.
     pub comparison: Vec<String>,
     pub findings: Vec<Finding>,
     /// Supporting tables, already formatted.
     pub details: Vec<String>,
+    /// How this run measured (thresholds, what was traced), first thing in DETAILS.
+    pub measured: Vec<String>,
+    /// The hardware models, for the short summary.
+    pub machine: Machine,
     /// This run's numbers, for the next run to compare itself against.
     pub record: RunRecord,
 }
@@ -138,13 +150,18 @@ const WIDTH: usize = 100;
 /// The DETAILS tables are printed as-is and are allowed to be wider than the RESULT block.
 const DETAIL_WIDTH: usize = 118;
 
-/// Word-wraps `text`; the first line starts with `first`, the rest align under its text.
+/// Word-wraps `text` to the RESULT width; the first line starts with `first`, the rest align under its text.
 fn wrap(text: &str, first: &str, out: &mut Vec<String>) {
+    wrap_to(text, first, WIDTH, out);
+}
+
+/// `wrap` to any width.
+fn wrap_to(text: &str, first: &str, width: usize, out: &mut Vec<String>) {
     let hang = " ".repeat(first.len());
     let mut indent = first;
     let mut line = String::new();
     for word in text.split_whitespace() {
-        if !line.is_empty() && indent.len() + line.len() + 1 + word.len() > WIDTH {
+        if !line.is_empty() && indent.len() + line.chars().count() + 1 + word.chars().count() > width {
             out.push(format!("{indent}{line}"));
             indent = &hang;
             line.clear();
@@ -197,16 +214,14 @@ impl Summary {
     pub fn result_lines(&self) -> Vec<String> {
         let bar = "=".repeat(WIDTH);
         let mut out = vec![bar.clone(), "RESULT".into(), String::new()];
-        let tag = match self.health {
-            Health::Problem => "PROBLEM FOUND",
-            Health::Warning => "SUSPECT FOUND",
-            Health::Ok => "ALL CLEAR",
-            Health::NoData => "NO DATA",
-        };
-        out.push(format!("  >>> {tag}: {}", self.headline));
+        out.push(format!("  >>> {}: {}", self.tag(), self.headline));
         wrap(&self.subline, "      ", &mut out);
         out.push(String::new());
         out.extend(self.overview.iter().map(|l| format!("  {l}")));
+        // Aligned with the overview's values, like its own "Note:" line.
+        for note in &self.notes {
+            wrap(note, "  Note:             ", &mut out);
+        }
         // Right after the overview and before the findings: what changed since the last run.
         if !self.comparison.is_empty() {
             out.push(String::new());
@@ -319,8 +334,15 @@ impl Summary {
                 }
             }
         }
+        out.extend(self.measured.iter().cloned());
         out.extend(self.details.iter().cloned());
         out
+    }
+
+    /// How the engine set this run up: the notes go into RESULT, the explanations into DETAILS.
+    pub fn set_setup(&mut self, setup: &Setup) {
+        self.notes = setup.notes();
+        self.measured = setup.measured_lines();
     }
 }
 
@@ -455,7 +477,7 @@ impl Summary {
             }],
             ..RunRecord::default()
         };
-        Summary {
+        let mut summary = Summary {
             health,
             headline,
             subline,
@@ -470,11 +492,22 @@ impl Summary {
                 },
                 "Note:             demo data, not a real measurement".into(),
             ],
+            notes: Vec::new(),
             comparison: baseline::compare(&previous, &record),
             findings,
             details: vec![String::new(), "(demo: no details)".into()],
+            measured: Vec::new(),
+            machine: Machine {
+                cpu: "AMD Ryzen 7 5800X 8-Core Processor".into(),
+                logical_cpus: 16,
+                ram_gb: 31.9,
+                gpus: vec!["NVIDIA GeForce RTX 3070".into()],
+                windows: "build 26100 (24H2)".into(),
+            },
             record,
-        }
+        };
+        summary.set_setup(&Setup::demo());
+        summary
     }
 }
 
@@ -753,7 +786,19 @@ impl Analyzer {
             health,
             &findings,
         );
-        Summary { health, headline, subline, overview, comparison: Vec::new(), findings, details: cx.details, record }
+        Summary {
+            health,
+            headline,
+            subline,
+            overview,
+            notes: Vec::new(),
+            comparison: Vec::new(),
+            findings,
+            details: cx.details,
+            measured: Vec::new(),
+            machine: Machine::default(),
+            record,
+        }
     }
 }
 
@@ -786,8 +831,9 @@ mod tests {
         assert_eq!(findings.0[0].1.advice, advice, "advising the identical item again must not duplicate it");
     }
 
-    /// Prints the three demo reports exactly as rendered. `cargo test golden -- --ignored --nocapture`
-    /// before and after a restructuring shows whether anything user-visible moved.
+    /// Prints the three demo reports exactly as rendered, then their short summaries.
+    /// `cargo test golden -- --ignored --nocapture` before and after a restructuring shows whether
+    /// anything user-visible moved. The version is masked so that a version bump moves nothing.
     #[test]
     #[ignore]
     fn golden_demo_reports() {
@@ -795,6 +841,11 @@ mod tests {
             let s = Summary::demo(health);
             println!("GOLDEN {health:?} headline={} | {}", s.headline, s.subline);
             for line in s.result_lines().iter().chain(s.detail_lines().iter()) {
+                println!("GOLDEN {line}");
+            }
+            let short = s.forum_summary(Some("WTFIsStalling-20260924-101500.txt"));
+            println!("GOLDEN SUMMARY {health:?} ({} of {SUMMARY_MAX} characters)", summary_len(&short));
+            for line in short.replace(env!("CARGO_PKG_VERSION"), "<version>").split("\r\n") {
                 println!("GOLDEN {line}");
             }
         }

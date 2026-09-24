@@ -47,6 +47,7 @@ const ID_TOGGLE: usize = 1;
 const ID_COPY: usize = 2;
 const ID_SHOW: usize = 3;
 const ID_MARK: usize = 4;
+const ID_COPY_SUMMARY: usize = 5;
 
 const HOTKEY_MARK: i32 = 1;
 
@@ -67,6 +68,7 @@ const INTRO: &str = "How to use\r\n\
     \x20    and the report below says what to do about it.\r\n\
     \r\n\
     \x20 \"Copy report\" puts the whole report on the clipboard so it can be pasted to whoever is helping you.\r\n\
+    \x20 \"Copy summary\" copies a short version that fits in one Discord message or forum post.\r\n\
     \r\n\
     This tool only observes. It changes nothing on the system.";
 
@@ -184,7 +186,7 @@ unsafe fn apply_theme(hwnd: HWND) {
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &flag as *const i32 as *const c_void, 4);
     if let Some(ui) = UI.get() {
         let theme = wide(if dark { "DarkMode_Explorer" } else { "Explorer" });
-        for h in [ui.toggle, ui.copy, ui.show, ui.mark, ui.log] {
+        for h in [ui.toggle, ui.copy, ui.copy_summary, ui.show, ui.mark, ui.log] {
             SetWindowTheme(h as HWND, theme.as_ptr(), null());
         }
     }
@@ -197,6 +199,7 @@ unsafe fn apply_theme(hwnd: HWND) {
 struct Ui {
     toggle: usize,
     copy: usize,
+    copy_summary: usize,
     show: usize,
     mark: usize,
     status: usize,
@@ -227,6 +230,8 @@ static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STATUS: Mutex<String> = Mutex::new(String::new());
 /// What "Copy report" copies: the live log while running, the answer-first report afterwards.
 static REPORT: Mutex<String> = Mutex::new(String::new());
+/// What "Copy summary" copies: the short version of the last result.
+static SHORT: Mutex<String> = Mutex::new(String::new());
 static OUTCOME: Mutex<Option<Result<engine::RunOutput, String>>> = Mutex::new(None);
 static REPORT_PATH: Mutex<Option<String>> = Mutex::new(None);
 
@@ -269,11 +274,13 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
     RUNNING.store(true, Ordering::SeqCst);
     MARKS.store(0, Ordering::SeqCst);
     REPORT.lock().unwrap().clear();
+    SHORT.lock().unwrap().clear();
     *REPORT_PATH.lock().unwrap() = None;
     set_text(ui.log, "");
     set_text(ui.toggle, "Stop && show result");
     unsafe {
         EnableWindow(ui.copy as HWND, 0);
+        EnableWindow(ui.copy_summary as HWND, 0);
         EnableWindow(ui.show as HWND, 0);
         EnableWindow(ui.mark as HWND, 1);
         let ok = RegisterHotKey(hwnd, HOTKEY_MARK, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F9 as u32) != 0;
@@ -288,7 +295,11 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
         },
     );
     set_banner(hwnd, Tone::Info, "Monitoring - reproduce the hitch now", "Starting...");
-    std::thread::spawn(|| {
+    // The one line the report view shows while monitoring says how to flag a hitch, which
+    // depends on whether the hotkey could be registered.
+    let mark_hint =
+        if HOTKEY_OK.load(Ordering::SeqCst) { Config::default().mark_hint } else { "click \"I felt it!\" right away when you feel one" };
+    std::thread::spawn(move || {
         let outcome = match demo_health() {
             Some(health) => {
                 while !STOP.load(Ordering::SeqCst) {
@@ -299,9 +310,10 @@ fn start_monitoring(hwnd: HWND, ui: &Ui) {
                 let header = [format!("WTFIsStalling {} - demo data", env!("CARGO_PKG_VERSION"))];
                 let events = ["[21:14:07.412] STALL #1  kernel-level (DPC/ISR/firmware)  11.80 ms  on CPU 4".to_string()];
                 let report = engine::compose_report(&header, &summary, &events);
-                Ok(engine::RunOutput { log_path: None, report, summary })
+                let short = summary.forum_summary(None);
+                Ok(engine::RunOutput { log_path: None, report, summary, short, short_path: None })
             }
-            None => engine::run(&Config::default(), &STOP),
+            None => engine::run(&Config { mark_hint, ..Config::default() }, &STOP),
         };
         *OUTCOME.lock().unwrap() = Some(outcome);
         post(WM_APP_DONE);
@@ -350,9 +362,15 @@ fn show_outcome(hwnd: HWND, ui: &Ui) {
             set_banner(hwnd, tone, &headline, &s.subline);
             set_text(ui.log, &out.report);
             *REPORT.lock().unwrap() = out.report;
+            *SHORT.lock().unwrap() = out.short;
+            unsafe { EnableWindow(ui.copy_summary as HWND, 1) };
             if let Some(path) = out.log_path {
                 unsafe { EnableWindow(ui.show as HWND, 1) };
-                set_text(ui.status, &format!("Saved to {path}"));
+                // The file name only: people post screenshots of this window, and the full path
+                // starts with C:\Users\<their name>. "Show report file" opens the folder.
+                let name =
+                    std::path::Path::new(&path).file_name().map_or_else(|| "the report file".into(), |n| n.to_string_lossy().into_owned());
+                set_text(ui.status, &format!("Saved as {name}  -  'Show report file' opens its folder"));
                 *REPORT_PATH.lock().unwrap() = Some(path);
             }
         }
@@ -361,8 +379,9 @@ fn show_outcome(hwnd: HWND, ui: &Ui) {
     }
 }
 
-fn copy_report(hwnd: HWND) {
-    let text = wide(&REPORT.lock().unwrap());
+/// Puts `source`'s text on the clipboard as Unicode text.
+fn copy_to_clipboard(hwnd: HWND, source: &Mutex<String>) {
+    let text = wide(&source.lock().unwrap());
     unsafe {
         if OpenClipboard(hwnd) == 0 {
             return;
@@ -439,6 +458,8 @@ unsafe fn create_controls(hwnd: HWND) {
 
     let ui = Ui {
         toggle: child("BUTTON", "Start monitoring", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, ID_TOGGLE, button_font),
+        // "Copy summary" sits left of "Copy report", so it is created first: creation order is the Tab order.
+        copy_summary: child("BUTTON", "Copy summary", WS_TABSTOP | WS_DISABLED, 0, ID_COPY_SUMMARY, ui_font),
         copy: child("BUTTON", "Copy report", WS_TABSTOP | WS_DISABLED, 0, ID_COPY, ui_font),
         show: child("BUTTON", "Show report file", WS_TABSTOP | WS_DISABLED, 0, ID_SHOW, ui_font),
         mark: child("BUTTON", "I felt it!", WS_TABSTOP | WS_DISABLED, 0, ID_MARK, button_font),
@@ -470,8 +491,18 @@ fn banner_rect(hwnd: HWND) -> RECT {
     let mut rc: RECT = unsafe { std::mem::zeroed() };
     unsafe { GetClientRect(hwnd, &mut rc) };
     let m = scale(hwnd, 12);
-    let top = m + scale(hwnd, 40) + m;
+    let top = status_top(hwnd) + scale(hwnd, STATUS_H + 4);
     RECT { left: m, top, right: rc.right - m, bottom: top + scale(hwnd, 86) }
+}
+
+/// Height of the button row and of the status line under it, in 96-DPI pixels.
+const ROW_H: i32 = 40;
+const STATUS_H: i32 = 20;
+
+/// The status line has a row of its own under the buttons: next to four of them it would get no
+/// room at all at the minimum window size.
+fn status_top(hwnd: HWND) -> i32 {
+    scale(hwnd, 12 + ROW_H + 4)
 }
 
 unsafe fn layout(hwnd: HWND, ui: &Ui) {
@@ -479,17 +510,21 @@ unsafe fn layout(hwnd: HWND, ui: &Ui) {
     GetClientRect(hwnd, &mut rc);
     let s = |v: i32| scale(hwnd, v);
     let (w, h, m) = (rc.right, rc.bottom, s(12));
-    let (toggle_w, side_w, row_h) = (s(230), s(130), s(40));
+    let (toggle_w, mark_w, row_h, gap) = (s(230), s(150), s(ROW_H), s(8));
     MoveWindow(ui.toggle as HWND, m, m, toggle_w, row_h, 1);
-    let show_x = w - m - side_w;
-    let copy_x = show_x - s(8) - side_w;
-    MoveWindow(ui.show as HWND, show_x, m + s(6), side_w, row_h - s(12), 1);
-    MoveWindow(ui.copy as HWND, copy_x, m + s(6), side_w, row_h - s(12), 1);
-    let mark_x = m + toggle_w + s(8);
-    let mark_w = s(150);
+    let mark_x = m + toggle_w + gap;
     MoveWindow(ui.mark as HWND, mark_x, m, mark_w, row_h, 1);
-    let status_x = mark_x + mark_w + m;
-    MoveWindow(ui.status as HWND, status_x, m + s(12), (copy_x - m - status_x).max(0), s(20), 1);
+    // The three small buttons share what is left of the row, up to 130 px each: at the minimum
+    // window size that is about 109 px, still wide enough for "Show report file".
+    let free_x = mark_x + mark_w + gap;
+    let side_w = ((w - m - free_x - 2 * gap) / 3).clamp(s(100), s(130));
+    let show_x = w - m - side_w;
+    let copy_x = show_x - gap - side_w;
+    let summary_x = copy_x - gap - side_w;
+    for (h, x) in [(ui.show, show_x), (ui.copy, copy_x), (ui.copy_summary, summary_x)] {
+        MoveWindow(h as HWND, x, m + s(6), side_w, row_h - s(12), 1);
+    }
+    MoveWindow(ui.status as HWND, m, status_top(hwnd), (w - 2 * m).max(0), s(STATUS_H), 1);
     let top = banner_rect(hwnd).bottom + m;
     MoveWindow(ui.log as HWND, m, top, (w - 2 * m).max(0), (h - top - m).max(0), 1);
     let dpi = GetDpiForWindow(hwnd);
@@ -575,8 +610,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ID_TOGGLE if RUNNING.load(Ordering::SeqCst) => request_stop(ui),
             ID_TOGGLE => start_monitoring(hwnd, ui),
             ID_COPY => {
-                copy_report(hwnd);
+                copy_to_clipboard(hwnd, &REPORT);
                 set_text(ui.status, "Report copied to the clipboard.");
+            }
+            ID_COPY_SUMMARY => {
+                copy_to_clipboard(hwnd, &SHORT);
+                set_text(ui.status, "Summary copied: paste it as one message in Discord or a forum post.");
             }
             ID_SHOW => show_report_file(),
             ID_MARK => mark(ui),

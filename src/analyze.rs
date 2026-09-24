@@ -873,7 +873,7 @@ impl Analyzer {
         for w in rows {
             let ready = if w.ready >= ready_floor { w.ready } else { 0 };
             let long_enough = w.blocked >= blocked_floor && w.blocked <= blocked_ceiling;
-            let blocked = if long_enough && !switches::voluntary_wait(w.blocked_reason) { w.blocked } else { 0 };
+            let blocked = if long_enough && switches::held_up_wait(w.blocked_reason) { w.blocked } else { 0 };
             if ready == 0 && blocked == 0 {
                 continue;
             }
