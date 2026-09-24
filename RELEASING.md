@@ -71,3 +71,18 @@ drops the suffix (`0.10.0-beta.1` and `0.10.0` are both `0.10.0.0`); the text ve
    is new for users, fixes, known limits, and the verification and download sections.
 5. For a final release, date its section in `CHANGELOG.md`.
 6. Set `main` to the next `-dev` version (`0.11.0-dev`) and commit.
+
+### A patch while `main` is ahead
+
+When `main` already holds work for the next minor version, a patch cannot be tagged from `main`,
+because it would ship those features too.
+
+1. Make the fix on `main` first.
+2. Branch from the last release's tag (`git switch -c release/0.9.x v0.9.0`), apply the same fix
+   there (`git cherry-pick`, or by hand if the code has moved), and set that patch version in
+   `Cargo.toml`.
+3. Follow "Making it" from that branch, steps 1 to 4.
+4. On `main`, give the patch its own dated section in `CHANGELOG.md`, and take its fixes out of
+   the unreleased section. `main` keeps its `-dev` version.
+5. Delete the branch, locally and on GitHub (`git push origin --delete release/0.9.x`). The tag
+   keeps its commits; if another patch is needed, branch again from the newest patch tag.
