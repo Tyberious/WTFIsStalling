@@ -74,9 +74,16 @@ impl Overhead {
     /// The plain-lines block for DETAILS. `events` is how many kernel events were processed;
     /// `switch_events` is how many of those were context switches and thread wake-ups, which is
     /// the one class expensive enough that its price should be visible (`None` when they were not
-    /// being traced at all). `gpu_events` is the second session's own count, priced separately
-    /// because it is a separate session with its own switch.
-    pub fn detail_lines(&self, events: u64, lost: u32, switch_events: Option<u64>, gpu_events: Option<u64>) -> Vec<String> {
+    /// being traced at all). `gpu_events` and `storage_events` are the other sessions' own counts,
+    /// priced separately because each is a separate session with its own switch.
+    pub fn detail_lines(
+        &self,
+        events: u64,
+        lost: u32,
+        switch_events: Option<u64>,
+        gpu_events: Option<u64>,
+        storage_events: Option<u64>,
+    ) -> Vec<String> {
         let secs = |t: u64| t as f64 / PER_SECOND;
         let line = |what: &str, t: u64| {
             let (core, machine) = shares(t, self.elapsed_s, self.ncpu);
@@ -103,6 +110,12 @@ impl Overhead {
             None => {
                 "  GPU trace:          not traced (light mode, --no-gpu-trace, or Windows would not start a second session)".to_string()
             }
+        });
+        out.push(match storage_events {
+            Some(n) => {
+                format!("  Storage trace:      {n} events ({:.0} per second) - where slow disk time went (--no-storage-trace)", per_s(n))
+            }
+            None => "  Storage trace:      not traced (--no-storage-trace, or Windows would not start another session)".to_string(),
         });
         out
     }
@@ -212,11 +225,11 @@ mod tests {
         assert!(zero.probe_shares().is_none());
         assert_eq!(zero.total_share(), 0.0);
         assert!(zero.concerns(0, 0).is_empty());
-        assert_eq!(zero.detail_lines(0, 0, None, None).len(), 5);
+        assert_eq!(zero.detail_lines(0, 0, None, None, None).len(), 6);
         // Elapsed but no CPU count reported: fall back to "one core" rather than dividing by 0.
         let no_cpus = Overhead { monitor_100ns: SEC, probes_100ns: None, elapsed_s: 10.0, ncpu: 0 };
         assert_eq!(no_cpus.monitor_shares(), (10.0, 10.0));
-        assert!(no_cpus.detail_lines(5, 0, None, None)[1].contains("not measured"));
+        assert!(no_cpus.detail_lines(5, 0, None, None, None)[1].contains("not measured"));
     }
 
     #[test]

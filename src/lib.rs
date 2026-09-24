@@ -32,6 +32,7 @@ pub mod procs;
 pub mod quiet;
 pub mod reg;
 pub mod state;
+pub mod storport;
 pub mod summary;
 pub mod switches;
 pub mod topology;

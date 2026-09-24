@@ -171,7 +171,19 @@ mod tests {
 
     fn io(disk: u32, start_ms: f64, dur_ms: f64, size: u32, pid: u32, op: u8) -> IoRec {
         let dur = ms_to_ticks(dur_ms);
-        IoRec { end: ms_to_ticks(10_000.0 + start_ms) + dur, dur, disk, tid: pid * 10, pid, size, op, file: 0, offset: 0, irp_flags: 0 }
+        IoRec {
+            end: ms_to_ticks(10_000.0 + start_ms) + dur,
+            dur,
+            disk,
+            tid: pid * 10,
+            pid,
+            size,
+            op,
+            file: 0,
+            irp: 0,
+            offset: 0,
+            irp_flags: 0,
+        }
     }
 
     /// Monitoring began just before the requests the tests issue, unless a test says otherwise.

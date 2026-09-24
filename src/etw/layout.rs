@@ -10,6 +10,8 @@
 //! structure) ends the walk, and any event whose wanted fields could not all be placed is skipped
 //! and counted under `--debug` instead.
 //!
+//! Shared by every manifest-provider session (`gputrace`, `storport`); see `manifest`.
+//!
 //! https://learn.microsoft.com/en-us/windows/win32/api/tdh/nf-tdh-tdhgeteventinformation
 //! https://learn.microsoft.com/en-us/windows/win32/api/tdh/ns-tdh-event_property_info
 
@@ -65,8 +67,8 @@ pub fn field_offsets(props: &[Prop], wanted: &[&str], ptr_size: usize) -> Fields
 }
 
 /// Reads `TRACE_EVENT_INFO` for one event and turns its top-level properties into `Prop`s.
-/// `None` when TDH has no schema for the event, which is what happens on a Windows whose
-/// dxgkrnl.sys manifest does not describe this version.
+/// `None` when TDH has no schema for the event, which is what happens on a Windows whose copy of
+/// the provider's manifest does not describe this version.
 ///
 /// # Safety
 /// `rec` must be the event record ETW handed to the callback.

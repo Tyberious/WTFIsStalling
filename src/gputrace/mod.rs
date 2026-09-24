@@ -4,31 +4,27 @@
 //!
 //! The kernel logger in `etw` is a system logger and cannot carry a manifest provider, so this is
 //! its own session ("WTFIsStallingGpuSession") on the same QPC clock, with
-//! Microsoft-Windows-DxgKrnl enabled through `EnableTraceEx2`. It has the same lifetime rules as
-//! the first session: stopped on `Drop`, a stale one from a hard kill stopped at startup, the
-//! callback wrapped in `catch_unwind`, and a poisoned lock tolerated.
+//! Microsoft-Windows-DxgKrnl enabled through `EnableTraceEx2`. The session itself (lifetime,
+//! stale-session takeover, event-id filter, consumer thread) is `etw::manifest`, shared with the
+//! storage-port trace; the callback is wrapped in `catch_unwind` and a poisoned lock tolerated.
 //!
 //! Everything here is optional. If the session cannot start the run carries on and the report
 //! says in one line that GPU evidence was not available.
 
 mod events;
-mod layout;
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS,
-    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    TRACE_LEVEL_INFORMATION,
-};
+use windows_sys::Win32::System::Diagnostics::Etw::TRACE_LEVEL_INFORMATION;
 
-use crate::util::{ms_to_ticks, qpc, ticks_to_ms, wide};
+use crate::etw::manifest;
+pub use crate::etw::manifest::Session;
+use crate::util::{ms_to_ticks, qpc, ticks_to_ms};
 
 const SESSION_NAME: &str = "WTFIsStallingGpuSession";
 
@@ -82,14 +78,6 @@ const EV_RESIDENT_STOP: u16 = 339;
 /// `MAX_EVENT_FILTER_EVENT_ID_COUNT` (64) ids are allowed; this uses six.
 /// https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_event_id
 const WANTED: [u16; 6] = [EV_VSYNC, EV_VSYNC_MULTIPLANE, EV_HSYNC_MULTIPLANE, EV_PRESENT, EV_RESIDENT_START, EV_RESIDENT_STOP];
-
-const EVENT_TRACE_REAL_TIME_MODE: u32 = 0x0000_0100;
-const WNODE_FLAG_TRACED_GUID: u32 = 0x0002_0000;
-const EVENT_TRACE_CONTROL_STOP: u32 = 1;
-const PROCESS_TRACE_MODE_REAL_TIME: u32 = 0x0000_0100;
-const PROCESS_TRACE_MODE_RAW_TIMESTAMP: u32 = 0x0000_1000;
-const PROCESS_TRACE_MODE_EVENT_RECORD: u32 = 0x1000_0000;
-const ERROR_ALREADY_EXISTS: u32 = 183;
 
 /// How much history the rings keep, in ms of trace time. A flagged moment looks 3 s back and
 /// 0.3 s forward and is analyzed once the trace has caught up past its end, so 3.3 s has to
@@ -181,7 +169,7 @@ pub struct GpuInner {
 
     /// Property offsets worked out once per (event id, version) and then reused; `None` means
     /// that version's layout could not be worked out and its events are skipped, never guessed.
-    layouts: HashMap<(u16, u8), Option<layout::Fields>>,
+    layouts: manifest::LayoutCache,
 
     /// --debug only: every (event id, version) seen, and the ones not understood.
     pub debug_counts: HashMap<(u16, u8), u64>,
@@ -464,163 +452,29 @@ pub struct MarkGpu {
 
 // ---- the session ----------------------------------------------------------------------------
 
-pub struct Session {
-    handle: CONTROLTRACE_HANDLE,
-    stopped: std::sync::atomic::AtomicBool,
-}
-
-/// A trace session outlives the process that started it, so unwinding must still take it down.
-impl Drop for Session {
-    fn drop(&mut self) {
-        if !self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            self.stop();
-        }
-    }
-}
-
-impl Session {
-    /// Stops the session, which also disables the provider and makes `ProcessTrace` return.
-    pub fn stop(&self) -> u32 {
-        self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (mut buf, total) = props_buffer();
-        let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-        unsafe {
-            (*p).Wnode.BufferSize = total as u32;
-            (*p).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            ControlTraceW(self.handle, null(), p, EVENT_TRACE_CONTROL_STOP);
-            (*p).EventsLost + (*p).RealTimeBuffersLost
-        }
-    }
-}
-
-fn props_buffer() -> (Vec<u64>, usize) {
-    let total = size_of::<EVENT_TRACE_PROPERTIES>() + 2 * 260;
-    (vec![0u64; total.div_ceil(8)], total)
-}
-
-fn stop_by_name() {
-    let (mut buf, total) = props_buffer();
-    let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    unsafe {
-        (*p).Wnode.BufferSize = total as u32;
-        (*p).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        ControlTraceW(CONTROLTRACE_HANDLE { Value: 0 }, wide(SESSION_NAME).as_ptr(), p, EVENT_TRACE_CONTROL_STOP);
-    }
-}
-
-fn try_start() -> Result<CONTROLTRACE_HANDLE, u32> {
-    let (mut buf, total) = props_buffer();
-    let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-    let rc = unsafe {
-        (*p).Wnode.BufferSize = total as u32;
-        (*p).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        // 1 = QueryPerformanceCounter, the same clock the kernel session and the probes use, so
-        // every timestamp in this report is directly comparable.
-        // https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties
-        (*p).Wnode.ClientContext = 1;
-        (*p).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        // Far smaller than the kernel session's: with the event-id filter below this session
-        // carries a few hundred small events a second, not hundreds of megabytes.
-        (*p).BufferSize = 64; // KB
-        (*p).MinimumBuffers = 8;
-        (*p).MaximumBuffers = 64;
-        (*p).FlushTimer = 1; // seconds; the documented minimum
-        (*p).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        StartTraceW(&mut handle, wide(SESSION_NAME).as_ptr(), p)
-    };
-    if rc == 0 {
-        Ok(handle)
-    } else {
-        Err(rc)
-    }
-}
-
-/// The event-id scope filter: an `EVENT_FILTER_EVENT_ID` with `FilterIn` set, followed by the
-/// ids. The struct declares `Events[ANYSIZE_ARRAY]`, so the real thing is the header plus one
-/// `USHORT` per id.
-/// https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_event_id
-fn event_id_filter() -> Vec<u16> {
-    // [FilterIn | Reserved << 8, Count, ids...] as u16 words: FilterIn and Reserved are one byte
-    // each and Count is a USHORT, which is the same 4-byte header on every Windows ABI.
-    let mut words = vec![1u16, WANTED.len() as u16];
-    words.extend_from_slice(&WANTED);
-    words
-}
-
 /// Starts the session, enables DxgKrnl on it and spawns the consumer thread.
 /// The handle must be kept alive for the run; dropping it stops the session.
 pub fn start(debug: bool) -> Result<(Session, Arc<GpuTrace>, JoinHandle<()>), String> {
-    let mut r = try_start();
-    if matches!(r, Err(ERROR_ALREADY_EXISTS)) {
-        // Left over from a run that was killed; take it over.
-        stop_by_name();
-        r = try_start();
-    }
-    let handle = r.map_err(|rc| match rc {
-        5 => "access denied".to_string(),
-        1450 => "Windows is out of trace sessions".to_string(),
-        rc => format!("StartTrace failed with Win32 error {rc}"),
+    let session = manifest::start(&manifest::Spec {
+        session: SESSION_NAME,
+        provider: DXGKRNL_GUID,
+        what: "the graphics provider",
+        level: TRACE_LEVEL_INFORMATION as u8,
+        keywords: KEYWORD_PRESENT,
+        ids: &WANTED,
+        // Far smaller than the kernel session's: with the event-id filter this session carries
+        // a few hundred small events a second, not hundreds of megabytes.
+        buffer_kb: 64,
+        min_buffers: 8,
+        max_buffers: 64,
     })?;
-    let session = Session { handle, stopped: std::sync::atomic::AtomicBool::new(false) };
-
-    let filter = event_id_filter();
-    let mut desc = EVENT_FILTER_DESCRIPTOR {
-        Ptr: filter.as_ptr() as u64,
-        Size: std::mem::size_of_val(&filter[..]) as u32,
-        Type: EVENT_FILTER_TYPE_EVENT_ID,
-    };
-    let mut params: ENABLE_TRACE_PARAMETERS = unsafe { zeroed() };
-    params.Version = 2; // ENABLE_TRACE_PARAMETERS_VERSION_2
-    params.EnableFilterDesc = &mut desc;
-    params.FilterDescCount = 1;
-    let rc = unsafe {
-        EnableTraceEx2(
-            handle,
-            &DXGKRNL_GUID,
-            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-            TRACE_LEVEL_INFORMATION as u8,
-            KEYWORD_PRESENT,
-            0,
-            0,
-            &params,
-        )
-    };
-    if rc != 0 {
-        // The session is stopped by `session` going out of scope here.
-        return Err(match rc {
-            5 => "access denied enabling the graphics provider".to_string(),
-            rc => format!("EnableTraceEx2 failed with Win32 error {rc}"),
-        });
-    }
-
     let (refresh_cap, present_cap, residency_cap) = caps(display_refresh_hz());
     let trace = Arc::new(GpuTrace {
         inner: Mutex::new(GpuInner { refresh_cap, present_cap, residency_cap, last_prune: qpc(), ..GpuInner::default() }),
         debug,
     });
-    Ok((session, trace.clone(), spawn_consumer(trace)))
-}
-
-fn spawn_consumer(trace: Arc<GpuTrace>) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("gpu-etw".into())
-        .spawn(move || unsafe {
-            let mut name = wide(SESSION_NAME);
-            let mut lf: EVENT_TRACE_LOGFILEW = zeroed();
-            lf.LoggerName = name.as_mut_ptr();
-            lf.Anonymous1.ProcessTraceMode =
-                PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-            lf.Anonymous2.EventRecordCallback = Some(events::on_event);
-            lf.Context = Arc::as_ptr(&trace) as *mut c_void;
-            let h = OpenTraceW(&mut lf);
-            if h.Value == u64::MAX {
-                return;
-            }
-            ProcessTrace(&h, 1, null(), null());
-            CloseTrace(h);
-        })
-        .expect("spawn gpu etw thread")
+    let consumer = manifest::spawn_consumer(SESSION_NAME, "gpu-etw", Some(events::on_event), trace.clone());
+    Ok((session, trace, consumer))
 }
 
 /// Pruning is driven by the newest timestamp seen, like the kernel session's rings.
@@ -784,7 +638,7 @@ mod tests {
 
     #[test]
     fn the_event_id_filter_is_a_filter_in_list_of_the_wanted_ids() {
-        let f = event_id_filter();
+        let f = manifest::event_id_filter(&WANTED);
         assert_eq!(f[0], 1, "FilterIn = TRUE, Reserved = 0");
         assert_eq!(f[1] as usize, WANTED.len());
         assert_eq!(&f[2..], &WANTED);

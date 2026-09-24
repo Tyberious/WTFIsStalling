@@ -19,6 +19,8 @@ use crate::procs::{process_name, ProcNames};
 use crate::quiet::Quieter;
 use crate::say;
 use crate::state::*;
+use crate::storport::split::{self as storsplit, Outcome, SplitTotals};
+use crate::storport::{ScsiAddr, StorTrace};
 use crate::switches::{self, ProbeVerdict, ProbeWindow, RanInstead};
 use crate::topology::{topology, Topology};
 use crate::util::{clock, fmt_dur, ms_to_ticks, plural, qpc, ticks_to_ms};
@@ -254,6 +256,12 @@ pub struct Analyzer {
     /// What it saw at each flagged moment. Kept as the moment is examined: its rings only hold a
     /// few seconds and the summary runs minutes later.
     pub(crate) gpu_marks: Vec<MarkGpu>,
+    /// The storage port driver's trace, when a session could be started for it (see `storport`).
+    pub(crate) storport: Option<Arc<StorTrace>>,
+    /// Where each disk's slow requests' time went, per disk; worked out as each is examined.
+    pub(crate) disk_split: HashMap<u32, SplitTotals>,
+    /// Each disk's address on its storage port, read once (see `disks::scsi_address`).
+    scsi_addrs: HashMap<u32, Option<ScsiAddr>>,
 }
 
 /// Everything ETW recorded around one incident, copied out so the lock is held briefly.
@@ -353,6 +361,9 @@ impl Analyzer {
             switch_gathers: Default::default(),
             gputrace: None,
             gpu_marks: Vec::new(),
+            storport: None,
+            disk_split: HashMap::new(),
+            scsi_addrs: HashMap::new(),
         }
     }
 
@@ -408,6 +419,9 @@ impl Analyzer {
             switch_gathers: Default::default(),
             gputrace: None,
             gpu_marks: Vec::new(),
+            storport: None,
+            disk_split: HashMap::new(),
+            scsi_addrs: HashMap::new(),
         }
     }
 
@@ -943,6 +957,36 @@ impl Analyzer {
     /// Records the graphics-kernel trace to read alongside the kernel one.
     pub fn set_gpu_trace(&mut self, trace: Arc<GpuTrace>) {
         self.gputrace = Some(trace);
+    }
+
+    /// Records the storage port driver's trace to read alongside the kernel one.
+    pub fn set_storage_trace(&mut self, trace: Arc<StorTrace>) {
+        self.storport = Some(trace);
+    }
+
+    /// A disk's address on its storage port, read once per disk with a zero-access handle.
+    pub(crate) fn scsi_addr(&mut self, disk: u32) -> Option<ScsiAddr> {
+        *self.scsi_addrs.entry(disk).or_insert_with(|| crate::disks::scsi_address(disk))
+    }
+
+    /// Where one slow request's time went, from the storage port driver's trace, or `None` when
+    /// there is no such trace. The totals per disk are kept as it goes.
+    fn storage_split(&mut self, slow: &IoRec) -> Option<Outcome> {
+        let trace = self.storport.clone()?;
+        let addr = self.scsi_addr(slow.disk);
+        let (start, end) = (slow.end - slow.dur, slow.end);
+        let slop = ms_to_ticks(storsplit::MATCH_SLOP_MS);
+        let window = {
+            let inner = trace.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Not reaching back to the start, or not yet past the end: say nothing either way.
+            (inner.covers(start - slop) && inner.caught_up(end + slop, qpc())).then(|| inner.window(start - slop, end + slop))
+        };
+        let outcome = match window {
+            Some(w) => storsplit::correlate(slow, &w, addr),
+            None => Outcome::NotCovered,
+        };
+        self.disk_split.entry(slow.disk).or_default().add(&outcome);
+        Some(outcome)
     }
 
     /// What the graphics-kernel trace saw in one window, or `None` when there is no such trace.
@@ -1498,12 +1542,20 @@ impl Analyzer {
         };
         // A slow request is examined only once the trace has reached far enough past its end for
         // the wake-ups it caused to be in the rings; see `diskstuck::LOOK_AFTER_MS`. Held for at
-        // most a few seconds, like a stall, and never at the end of the run.
-        if !last_call && self.shared.switches {
+        // most a few seconds, like a stall, and never at the end of the run. The storage port
+        // driver's trace is a separate session with its own buffers, so it is waited for too
+        // (see `StorInner::caught_up`), light mode included.
+        if !last_call {
             let (need, give_up, now) = (ms_to_ticks(diskstuck::LOOK_AFTER_MS + 50.0), ms_to_ticks(4000.0), qpc());
-            if let Some(at) =
-                notables.iter().position(|n| matches!(n, Notable::SlowIo(i) if latest < i.end + need && now - i.end < give_up))
-            {
+            let stor_need = ms_to_ticks(storsplit::MATCH_SLOP_MS);
+            let stor = self.storport.as_ref().map(|t| t.inner.lock().unwrap_or_else(|e| e.into_inner()));
+            let switches = self.shared.switches;
+            let waiting = |i: &IoRec| {
+                let kernel = switches && latest < i.end + need;
+                let storage = stor.as_ref().is_some_and(|s| !s.caught_up(i.end + stor_need, now));
+                (kernel || storage) && now - i.end < give_up
+            };
+            if let Some(at) = notables.iter().position(|n| matches!(n, Notable::SlowIo(i) if waiting(i))) {
                 self.held_notables = notables.split_off(at);
             }
         }
@@ -1657,7 +1709,13 @@ impl Analyzer {
                 thrashers = diskstuck::copies(t.into_iter().map(|((name, _), _)| name));
             }
         }
-        let request = diskstuck::request_text(kind, slow.op, path.as_deref()).map(|t| diskstuck::request_line(&t, &thrashers));
+        // Where its time went, when the storage port driver's trace could follow it; appended to
+        // the same line rather than adding a third one.
+        let timing = match self.storage_split(slow) {
+            Some(Outcome::Split(s)) => Some(storsplit::event_words(&s)),
+            _ => None,
+        };
+        let request = diskstuck::request_line_timed(kind, slow.op, path.as_deref(), &thrashers, timing.as_deref());
 
         // Who was stuck behind it. Nothing at all is said when the rings could not tell.
         let mut stuck_line = None;
@@ -2178,6 +2236,7 @@ mod tests {
             size: 4096,
             op: b'W',
             file: 0,
+            irp: 0,
             offset: 0,
             irp_flags: 0,
         }];
@@ -2198,8 +2257,19 @@ mod tests {
     /// nothing is said about it at all (not "nobody waited"), and the request is counted as unchecked.
     #[test]
     fn a_slow_request_names_who_waited_only_when_the_rings_cover_it() {
-        let slow =
-            IoRec { end: ms(1800.0), dur: ms(800.0), disk: 99, tid: 7, pid: 100, size: 4096, op: b'R', file: 0, offset: 0, irp_flags: 0x2 };
+        let slow = IoRec {
+            end: ms(1800.0),
+            dur: ms(800.0),
+            disk: 99,
+            tid: 7,
+            pid: 100,
+            size: 4096,
+            op: b'R',
+            file: 0,
+            irp: 0,
+            offset: 0,
+            irp_flags: 0x2,
+        };
         let waiter = |ts: f64| SwitchRec {
             ts: ms(ts),
             new_tid: 0,
@@ -2247,6 +2317,64 @@ mod tests {
         assert!(az.explain_io(&slow).stuck.is_none());
         assert_eq!((az.disk_behind[&99].checked, az.disk_behind[&99].uncovered), (0, 0));
         assert_eq!(az.disk_behind[&99].kinds[&diskstuck::Kind::PagedFile], 1, "what the request was is still known");
+    }
+
+    /// With the storage port driver's trace, the "Request:" line says where the time went, and
+    /// the disk's totals count how the request was matched. A trace that did not cover the request
+    /// says nothing on the line and counts it as not covered, never as "not matched".
+    #[test]
+    fn a_slow_request_says_where_its_time_went_when_the_storage_trace_follows_it() {
+        use crate::storport::{ReqRec, StorInner, StorTrace};
+        let slow = IoRec {
+            end: ms(1800.0),
+            dur: ms(800.0),
+            disk: 99,
+            tid: 7,
+            pid: 100,
+            size: 4096,
+            op: b'R',
+            file: 0,
+            irp: 0xFFFF_A000_0000_ABC0,
+            offset: 0,
+            irp_flags: 0,
+        };
+        let build = |session_started_ms: f64| {
+            let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(100, "explorer.exe")]), false);
+            Arc::get_mut(&mut az.shared).unwrap().switches = false;
+            az.scsi_addrs.insert(99, None); // no live IOCTL from a test
+            let mut inner = StorInner::new(1000, ms(session_started_ms));
+            let piece = ReqRec {
+                ts: ms(1799.9),
+                dur: ms(760.0),
+                irp: slow.irp,
+                bytes: 4096,
+                srb: 0x01,
+                cmd: 0x28,
+                retries: 2,
+                ..ReqRec::default()
+            };
+            inner.reqs.push_back(piece);
+            inner.latest_ts = ms(5000.0);
+            az.set_storage_trace(Arc::new(StorTrace { inner: Mutex::new(inner), debug: false }));
+            az
+        };
+
+        let mut az = build(0.0);
+        let w = az.explain_io(&slow);
+        let line = w.request.expect("a request line");
+        assert!(line.contains("760 ms inside the drive, 40.00 ms waiting in Windows; retried 2 times"), "{line}");
+        assert!(line.chars().count() <= diskstuck::LINE_WIDTH, "{line}");
+        let t = az.disk_split[&99];
+        assert_eq!((t.by_irp, t.retries, t.not_covered), (1, 2, 0));
+
+        let mut az = build(1500.0);
+        let w = az.explain_io(&slow);
+        assert!(!w.request.unwrap().contains("inside the drive"), "the session began after the request did");
+        assert_eq!((az.disk_split[&99].not_covered, az.disk_split[&99].unmatched), (1, 0));
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        az.explain_io(&slow);
+        assert!(az.disk_split.is_empty(), "no storage trace, nothing counted");
     }
 
     fn eight_cpu_analyzer() -> Analyzer {
@@ -2384,8 +2512,19 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         az.topo = crate::topology::Topology::build(&[8], &[]);
         let (start, end) = (ms(1000.0), ms(1886.0));
-        let victim =
-            IoRec { end: ms(1887.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0, offset: 0, irp_flags: 0 };
+        let victim = IoRec {
+            end: ms(1887.0),
+            dur: ms(878.0),
+            disk: 5,
+            tid: 1,
+            pid: 4,
+            size: 4096,
+            op: b'W',
+            file: 0,
+            irp: 0,
+            offset: 0,
+            irp_flags: 0,
+        };
         az.disk_slow.insert(5, vec![SlowSeen { end: victim.end, dur: victim.dur, victim: false }]);
         let stalls: Vec<Stall> = (0..8).map(|c| Stall { kind: StallKind::Kernel, cpu: Some(c), start, end, minor: false }).collect();
         let mut ev = evidence(vec![], vec![], HashMap::new());

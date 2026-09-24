@@ -402,18 +402,62 @@ pub fn stuck_line(victims: &[Victim], chains: &[(String, i64, String)], drive: &
     lines.iter().find(|l| l.chars().count() <= LINE_WIDTH).cloned().or_else(|| lines.first().map(|l| l.chars().take(LINE_WIDTH).collect()))
 }
 
+/// "the drive kept jumping between A and B", when there was a fight over the head at all.
+fn fight(thrash_with: &[String]) -> Option<String> {
+    // Two copies of one program are one name here, and still two things fighting over the head.
+    (thrash_with.len() >= 2 || thrash_with.iter().any(|n| n.ends_with(" copies)"))).then(|| {
+        let names: Vec<String> = thrash_with.iter().take(3).map(|n| clip(n)).collect();
+        format!("the drive kept jumping between {}", names.join(" and "))
+    })
+}
+
 /// "    Request: <text>", plus who the drive was jumping between when it fits.
 pub fn request_line(text: &str, thrash_with: &[String]) -> String {
     let base = format!("    Request: {text}");
-    // Two copies of one program are one name here, and still two things fighting over the head.
-    if thrash_with.len() >= 2 || thrash_with.iter().any(|n| n.ends_with(" copies)")) {
-        let names: Vec<String> = thrash_with.iter().take(3).map(|n| clip(n)).collect();
-        let with = format!("{base}; the drive kept jumping between {}", names.join(" and "));
+    if let Some(f) = fight(thrash_with) {
+        let with = format!("{base}; {f}");
         if with.chars().count() <= LINE_WIDTH {
             return with;
         }
     }
     base.chars().take(LINE_WIDTH).collect()
+}
+
+/// A few words for what the request was, for when the full sentence does not leave room.
+pub fn request_short(kind: Kind, op: u8) -> &'static str {
+    let read = op == b'R';
+    match kind {
+        Kind::Flush => "flush",
+        Kind::PagingFile if read => "paging-file read",
+        Kind::PagingFile => "paging-file write",
+        Kind::ProgramCode => "loading program code",
+        Kind::PagedFile if read => "read through the file cache",
+        Kind::PagedFile => "file cache writing out",
+        Kind::Bookkeeping => "file-system bookkeeping",
+        Kind::FileData if read => "ordinary read",
+        Kind::FileData => "ordinary write",
+    }
+}
+
+/// The "Request:" line with where the time went appended (`timing`, from the storage port
+/// driver's trace), or the plain `request_line` without it. `None` only for a flush with nothing
+/// to add, as before. Never wider than `LINE_WIDTH`: the full description gives way to the short
+/// one before the thrashing or the timing is dropped, and the timing, the one new measured fact,
+/// goes last.
+pub fn request_line_timed(kind: Kind, op: u8, path: Option<&str>, thrash_with: &[String], timing: Option<&str>) -> Option<String> {
+    let long = request_text(kind, op, path);
+    let Some(timing) = timing else { return long.map(|t| request_line(&t, thrash_with)) };
+    let short = request_short(kind, op);
+    let long = long.unwrap_or_else(|| short.to_string());
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(f) = fight(thrash_with) {
+        // The same fact in fewer words before it is given up; the finding totals it either way.
+        let brief = f.replacen("the drive kept jumping", "head jumping", 1);
+        candidates.extend([format!("{long}; {f}; {timing}"), format!("{short}; {f}; {timing}"), format!("{short}; {brief}; {timing}")]);
+    }
+    candidates.extend([format!("{long}; {timing}"), format!("{short}; {timing}"), timing.to_string()]);
+    let lines: Vec<String> = candidates.into_iter().map(|c| format!("    Request: {c}")).collect();
+    lines.iter().find(|l| l.chars().count() <= LINE_WIDTH).cloned().or_else(|| lines.last().map(|l| l.chars().take(LINE_WIDTH).collect()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -475,7 +519,7 @@ mod tests {
 
     fn io(start_ms: f64, dur_ms: f64, tid: u32) -> IoRec {
         let dur = ms(dur_ms);
-        IoRec { end: ms(start_ms) + dur, dur, disk: 1, tid, pid: 100, size: 4096, op: b'R', file: 0, offset: 0, irp_flags: 0 }
+        IoRec { end: ms(start_ms) + dur, dur, disk: 1, tid, pid: 100, size: 4096, op: b'R', file: 0, irp: 0, offset: 0, irp_flags: 0 }
     }
 
     fn off(ts: f64, tid: u32, reason: i8) -> SwitchRec {
@@ -642,6 +686,42 @@ mod tests {
         assert!(r.chars().count() <= LINE_WIDTH);
         let r = request_line("ordinary read of a file's contents", &["steam.exe".into(), "chrome.exe".into()]);
         assert!(r.ends_with("jumping between steam.exe and chrome.exe") && r.chars().count() <= LINE_WIDTH, "{r}");
+    }
+
+    /// Where the time went rides on the "Request:" line; every combination still fits the width,
+    /// and the timing is the last thing to go.
+    #[test]
+    fn the_timed_request_line_fits_and_keeps_the_timing() {
+        let timing = "1955 ms inside the drive, 45.00 ms waiting in Windows; retried 12 times";
+        let kinds = [Kind::PagingFile, Kind::ProgramCode, Kind::PagedFile, Kind::Bookkeeping, Kind::FileData, Kind::Flush];
+        let fighters = [vec![], vec!["steam.exe".to_string(), "qbittorrent.exe".to_string()], vec!["x".repeat(300), "y".repeat(300)]];
+        for kind in kinds {
+            for op in [b'R', b'W', b'F'] {
+                for thrash in &fighters {
+                    let line = request_line_timed(kind, op, Some(r"C:\$Mft"), thrash, Some(timing)).expect("a line with timing");
+                    assert!(line.chars().count() <= LINE_WIDTH, "{} chars: {line}", line.chars().count());
+                    assert!(line.ends_with(timing), "{line}");
+                }
+            }
+        }
+        // Short names: the fight stays, in fewer words; long ones give way to the timing.
+        let short_timing = "200 ms inside the drive, 5.00 ms waiting in Windows";
+        let ab = ["a.exe".to_string(), "b.exe".to_string()];
+        let line = request_line_timed(Kind::FileData, b'R', None, &ab, Some(short_timing)).unwrap();
+        assert_eq!(line, format!("    Request: ordinary read; head jumping between a.exe and b.exe; {short_timing}"));
+        let line = request_line_timed(Kind::FileData, b'R', None, &fighters[1], Some(short_timing)).unwrap();
+        assert_eq!(line, format!("    Request: ordinary read of a file's contents; {short_timing}"));
+        // Without timing it is exactly the old line, and a flush still has none.
+        assert_eq!(
+            request_line_timed(Kind::FileData, b'R', None, &[], None),
+            Some(request_line("ordinary read of a file's contents", &[]))
+        );
+        assert_eq!(request_line_timed(Kind::Flush, b'F', None, &[], None), None);
+        assert_eq!(
+            request_line_timed(Kind::Flush, b'F', None, &[], Some("9 ms inside the drive, 1 ms waiting in Windows")).unwrap(),
+            "    Request: flush; 9 ms inside the drive, 1 ms waiting in Windows"
+        );
+        println!("{}", request_line_timed(Kind::PagedFile, b'R', None, &fighters[1], Some(timing)).unwrap());
     }
 
     #[test]

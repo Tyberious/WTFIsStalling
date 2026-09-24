@@ -47,6 +47,11 @@ struct Args {
     /// a hitch a processor-side trace cannot see. Already off in --light mode
     #[arg(long)]
     no_gpu_trace: bool,
+    /// Don't trace the storage driver. A small trace session records how long each disk request
+    /// spent inside the drive versus waiting in Windows, and any retries and resets. One event per
+    /// disk request, so it stays on in --light mode
+    #[arg(long)]
+    no_storage_trace: bool,
     /// Measure more gently: probe every 2 ms and leave thread-switch and GPU tracing off, so the tool costs
     /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
     /// PC with 4 logical CPUs or fewer, or one running on battery
@@ -155,6 +160,7 @@ fn main() {
         profile: !args.no_profile,
         switches: !args.no_switches,
         gpu_trace: !args.no_gpu_trace,
+        storage_trace: !args.no_storage_trace,
         // Neither flag: decide from the machine itself, exactly as the GUI does.
         light: match (args.light, args.no_light) {
             (true, _) => Some(true),

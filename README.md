@@ -86,7 +86,8 @@ days old) by itself.
 | **Network filter drivers from other vendors** (VPNs, "network optimizers", security products) | Windows runs a filter's code inside its own networking files, so a stall in `NETIO.SYS` or `ndis.sys` can be another vendor's doing. The installed NDIS lightweight filters are read from the registry and the ones written by someone other than Microsoft are named on such a finding — and when they are all Microsoft's, that rules a whole class of software out |
 | **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
-| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth |
+| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth. For drives run by Windows' storage port driver (NVMe, SATA, UAS USB) it also says **where the time went**: how much was spent inside the drive (the drive, its cable or firmware) and how much waiting in Windows before reaching it (too much asked of the drive at once), with any retries; a drive that driver does not see (older USB "BOT" drives) is reported as not measured, never as zero |
+| **A drive being reset or retried while you watch** | The storage port driver's own events, live: requests it had to send again and resets of a drive or its controller, with the time and the disk. A reset during the run is rated high, the same as Windows' event 129, and one Windows also logged is reported once |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
 | **Graphics driver hangs** | "Display driver stopped responding and was reset" (event 4101) from the System event log, last 7 days |
@@ -210,6 +211,22 @@ Two independent sources, correlated on one clock (QPC):
   in light mode**, `wtfis-cli --no-gpu-trace` turns it off anywhere, and the cost block reports how
   many arrived. If the session cannot start — another profiler holding it, an older Windows — the run
   carries on and DETAILS says in one line that there is no frame-timing evidence.
+* **Storage-driver ETW trace.** A third real-time session on the same clock, enabled on
+  Microsoft-Windows-StorPort with an event-id filter listing five events: 201, one per disk request,
+  which says how long the layers below the storage port driver (miniport driver, controller, drive)
+  took; 209, a request being retried; and 1, 2 and 4, a drive, a target or a whole port being reset.
+  Each slow DiskIo request is matched to its storage-driver record by the request's I/O packet pointer
+  (falling back to same drive, same size, completed within a millisecond, and only when exactly one
+  record fits); a request split into several pieces counts the time any piece was inside the drive, so
+  pieces in flight together are not counted twice. The rest of the DiskIo time is time spent in Windows
+  before the request reached the drive. Which disk a record belongs to comes from
+  `IOCTL_SCSI_GET_ADDRESS` on the same zero-access handle the tool uses for every other disk query. It
+  stays **on in light mode**: measured at about 1,750 events a second under heavy disk load (against
+  roughly 370,000 for the kernel trace), it is one small event per disk request. The retry keywords it
+  needs also make the driver build its per-request command trace (about 3,500 events a second in all);
+  the id filter keeps those out of the session, but Microsoft documents that such a filter reduces what
+  is delivered, not what is generated. `wtfis-cli --no-storage-trace` turns it off, the cost block
+  reports how many events arrived, and a session that cannot start never stops the run.
 * **The machine itself, read once at the end.** Loaded kernel modules (for the hardware-access driver
   table), the installed NDIS network filters and their binaries (registry only), and every present PCI
   device's allocated interrupt resources and PCI device properties (cfgmgr32). All read-only, all
@@ -370,6 +387,7 @@ wtfis-cli --light            # measure more gently on a weak or battery-powered 
 wtfis-cli --no-light         # keep full measuring even there
 wtfis-cli --no-switches      # skip the thread-switch trace (the most expensive thing measured)
 wtfis-cli --no-gpu-trace     # skip the graphics-kernel trace (frame timing and video memory)
+wtfis-cli --no-storage-trace # skip the storage-driver trace (drive vs Windows time, retries, resets)
 wtfis-cli --compare WTFIsStalling-20260914-190210.wtfis   # compare with that run instead of the newest
 wtfis-cli --no-compare       # don't compare with an earlier run
 ```
@@ -385,6 +403,7 @@ wtfis-cli --no-compare       # don't compare with an earlier run
 | `--no-profile` | off | Don't sample the CPU (loses process attribution and firmware/SMI detection) |
 | `--no-switches` | off | Don't trace thread switches, the most expensive thing this tool records; already off in `--light` mode |
 | `--no-gpu-trace` | off | Don't trace the graphics kernel (frame timing and video memory pressure); already off in `--light` mode |
+| `--no-storage-trace` | off | Don't trace the storage port driver (time inside the drive vs waiting in Windows, retries, resets); stays on in `--light` mode, being one small event per disk request |
 | `--light` | auto | Measure more gently: probe every 2 ms instead of 1 ms, and leave thread-switch and graphics tracing off; on by itself on a PC with 4 logical CPUs or fewer, or one running on battery |
 | `--no-light` | off | Keep full measuring even on a small or unplugged PC (the opposite of `--light`) |
 | `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory | Report file path |

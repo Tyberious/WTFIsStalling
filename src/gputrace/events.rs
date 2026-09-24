@@ -8,7 +8,8 @@
 
 use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
-use super::layout;
+use crate::etw::{layout, manifest};
+
 use super::{GpuInner, GpuTrace, PresentRec, ResidentRec};
 use super::{EV_HSYNC_MULTIPLANE, EV_PRESENT, EV_RESIDENT_START, EV_RESIDENT_STOP, EV_VSYNC, EV_VSYNC_MULTIPLANE};
 
@@ -58,21 +59,7 @@ pub(super) unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
         };
         // Resolving a layout needs the record itself, so it happens here rather than in the
         // pure handler below.
-        let fields = if wanted_fields(at.id).is_empty() {
-            None
-        } else {
-            match inner.layouts.get(&(at.id, at.version)) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let mut buf = Vec::new();
-                    let resolved = layout::describe(rec, &mut buf)
-                        .map(|props| layout::field_offsets(&props, wanted_fields(at.id), at.ptr_size))
-                        .filter(|f| f.iter().all(Option::is_some));
-                    inner.layouts.insert((at.id, at.version), resolved.clone());
-                    resolved
-                }
-            }
-        };
+        let fields = manifest::resolve(&mut inner.layouts, rec, (at.id, at.version), wanted_fields(at.id), at.ptr_size);
         handle(trace, &mut inner, at, fields.as_deref(), data);
     }));
 }

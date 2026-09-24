@@ -226,12 +226,13 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
         (GUID_DISKIO, 10 | 11 | 14) => {
             let disk = rd_u32(d, 0)?;
             let irp_flags = rd_u32(d, 4).unwrap_or(0);
-            let (size, dur, tid, op, file, offset) = if opcode == 14 {
-                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F', 0, 0)
+            let (size, dur, tid, op, file, offset, irp) = if opcode == 14 {
+                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F', 0, 0, rd_u64(d, 16).unwrap_or(0))
             } else {
                 let file = rd_u64(d, 24).unwrap_or(0);
                 let offset = rd_u64(d, 16).unwrap_or(0) as i64;
-                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' }, file, offset)
+                let irp = rd_u64(d, 32).unwrap_or(0);
+                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' }, file, offset, irp)
             };
             if !(0..MAX_SANE).contains(&dur) {
                 return None;
@@ -240,7 +241,7 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
                 *inner.debug_irp_flags.entry((op, irp_flags)).or_default() += 1;
             }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
-            let r = IoRec { end: ts, dur, file, offset, disk, tid, pid, size, irp_flags, op };
+            let r = IoRec { end: ts, dur, file, irp, offset, disk, tid, pid, size, irp_flags, op };
             inner.ios.push_back(r);
             let st = inner.disks.entry(disk).or_default();
             st.count += 1;

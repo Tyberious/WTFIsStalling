@@ -580,6 +580,8 @@ pub struct RunData<'a> {
     pub gpu: &'a GpuLog,
     /// What the second (graphics-kernel) ETW session saw, and why it did not run when it did not.
     pub gpu_trace: crate::gputrace::GpuTraceReport,
+    /// What the storage port driver's session saw, and why it did not run when it did not.
+    pub storage_trace: crate::storport::StorageReport,
 }
 
 impl Analyzer {
@@ -609,6 +611,9 @@ impl Analyzer {
     /// * `storage::slow_disks` introduces "disk <n>" as a slow disk. `storage::event_log` and
     ///   `storage::drive_health` note on that key and only fall back to creating it (with a
     ///   different title) when the disk was not slow, so they must run after it.
+    /// * `storage::seen_live` (retries and resets the storage port driver's trace saw) notes on
+    ///   "disk <n>" and, for a reset, on the "storage controller" subject `storage::event_log`
+    ///   creates from an event 129, so the same reset is not reported twice: it runs after both.
     /// * `stalls::one_program_waits` introduces its own "waiting <program>" keys and notes on
     ///   nothing, so its only constraint is the group it runs under.
     /// * `hardware::whea` notes on the "CPU went dark ..." keys, which only exist if the two
@@ -651,6 +656,7 @@ impl Analyzer {
         storage::slow_disks(&mut cx);
         cx.found.in_group(Group::Health);
         storage::event_log(&mut cx);
+        storage::seen_live(&mut cx);
         storage::drive_health(&mut cx);
         cx.found.in_group(Group::OneProgram);
         gpu::driver_resets(&mut cx);
@@ -816,6 +822,7 @@ mod tests {
                 clock: &[],
                 gpu: &GpuLog::default(),
                 gpu_trace: Default::default(),
+                storage_trace: Default::default(),
             })
         };
 
@@ -879,6 +886,7 @@ mod tests {
             clock: &[],
             gpu: &GpuLog::default(),
             gpu_trace: Default::default(),
+            storage_trace: Default::default(),
         });
         let flagged_findings: Vec<&Finding> =
             summary.findings.iter().filter(|f| f.evidence.iter().any(|e| e.contains("of the 3 moments you flagged"))).collect();
@@ -930,6 +938,7 @@ mod tests {
             clock: &[],
             gpu: &GpuLog::default(),
             gpu_trace: Default::default(),
+            storage_trace: Default::default(),
         });
         let edge: Vec<&Finding> = summary.findings.iter().filter(|f| f.title.starts_with("msedge.exe")).collect();
         assert_eq!(edge.len(), 1, "one finding for the program, not one per process");
@@ -986,6 +995,7 @@ mod tests {
             clock: &[],
             gpu: &GpuLog::default(),
             gpu_trace: Default::default(),
+            storage_trace: Default::default(),
         });
         let f = |key: &str| summary.findings.iter().find(|f| f.key == key).unwrap_or_else(|| panic!("no finding for {key}"));
 
@@ -1090,6 +1100,7 @@ mod tests {
                 clock: &[],
                 gpu: &GpuLog::default(),
                 gpu_trace: Default::default(),
+                storage_trace: Default::default(),
             })
         };
 
@@ -1349,6 +1360,7 @@ mod tests {
             clock: &[],
             gpu: &GpuLog::default(),
             gpu_trace: Default::default(),
+            storage_trace: Default::default(),
         });
 
         let freeze = summary.findings.iter().find(|f| f.key == "whole-PC freeze").expect("one freeze finding");

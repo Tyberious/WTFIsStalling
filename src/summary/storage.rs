@@ -15,6 +15,8 @@ use crate::health::{self, DriveHealth};
 use crate::procs::known_worker;
 use crate::procs::process_name;
 use crate::state::LatStat;
+use crate::storport::split::{self as storsplit, SplitTotals};
+use crate::storport::{AddrTotals, ResetRec, StorageReport};
 use crate::util::{fmt_dur, ms_to_ticks, plural, ticks_to_ms};
 
 use super::ctx::{when_text, Ctx};
@@ -484,6 +486,7 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         }
         let key = format!("disk {n}");
         let why = cx.az.disk_why.get(n);
+        let busy = why.is_some_and(|w| w.main_cause() == Some(Cause::Busy));
         let logged = storage_log.iter().any(|e| e.disk == Some(*n));
         let on_disk: Vec<FileRow> = file_waits.iter().filter(|r| r.1 == *n).cloned().collect();
         let advice = disk_advice(&disk, why, logged, file_hint(&files::rank(&on_disk, 3)));
@@ -504,7 +507,133 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
                 cx.found.advise(&key, &advice);
             }
         }
+        // Where the slow time went, inside the drive or in Windows, from the storage port driver.
+        if cx.run.storage_trace.available {
+            let split = cx.az.disk_split.get(n).copied().unwrap_or_default();
+            let addr = cx.az.scsi_addr(*n);
+            let sentence = match storsplit::finding_sentence(&split, busy) {
+                Some(s) => Some(s),
+                None if cx.run.storage_trace.on_storport(addr, split.matched(), split.unmatched) == Some(false) => {
+                    Some(storsplit::NOT_MEASURED.to_string())
+                }
+                None => None,
+            };
+            if let Some(s) = sentence {
+                cx.found.note(&key, s);
+            }
+        }
     }
+}
+
+/// Resets past this many are counted rather than each given a time.
+const RESET_TIMES_SHOWN: usize = 3;
+
+/// What the storage port driver saw one drive go through while monitoring: requests it had to
+/// retry, reads and writes that came back failed, and resets. `None` when there was none of it.
+fn live_sentence(t: AddrTotals, resets: &[ResetRec], time: &dyn Fn(i64) -> String) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if t.retried > 0 {
+        parts.push(format!(
+            "Windows had to retry {} request{} to it ({} retr{} in all)",
+            t.retried,
+            plural(t.retried),
+            t.retries,
+            if t.retries == 1 { "y" } else { "ies" }
+        ));
+    }
+    if t.failed > 0 {
+        parts.push(format!("{} read{} or write{} came back failed", t.failed, plural(t.failed), plural(t.failed)));
+    }
+    if !resets.is_empty() {
+        let mut at: Vec<String> = resets.iter().take(RESET_TIMES_SHOWN).map(|r| time(r.ts)).collect();
+        if resets.len() > RESET_TIMES_SHOWN {
+            at.push(format!("{} more", resets.len() - RESET_TIMES_SHOWN));
+        }
+        parts.push(format!(
+            "Windows reset the drive {} time{} (at {}), and every request to it waits while that happens",
+            resets.len(),
+            plural(resets.len() as u64),
+            and_list(&at)
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("Seen live by Windows' storage driver while monitoring: {}.", parts.join("; ")))
+}
+
+const RETRY_ADVICE: &str = "A drive that needs requests sent again did not answer correctly the first time, which is an early \
+    warning sign. Check its health (SMART) with the maker's tool or CrystalDiskInfo, reseat or replace its cable (or move an M.2 \
+    drive to another slot), and update its firmware.";
+
+/// Retries, failed requests and resets the storage port driver's trace saw live, per drive
+/// (`storport`). Runs after `event_log`: a reset Windows also logged as event 129 is added to the
+/// finding that event already made instead of becoming a second one.
+///
+/// Severity: a reset while monitoring raises the drive to High, the same rule `event_log` applies
+/// to an event 129 during the run, because every program touching the drive waits through it.
+/// Retries and failed requests change nothing on a drive that is already a finding; on their own
+/// they are a Low lead (a warning sign, not a proven cause of anything felt).
+pub(super) fn seen_live(cx: &mut Ctx) {
+    let report = &cx.run.storage_trace;
+    if !report.available {
+        return;
+    }
+    let (resets_all, per_addr) = (report.resets.clone(), report.per_addr.clone());
+    // Event 129 names a controller, not a disk (see `evlog`), so a 129 logged during the run is
+    // taken as the same reset rather than as a second, separate problem.
+    let logged_129 = cx.storage_log.iter().any(|e| e.id == 129 && e.unix_time >= cx.run_start_unix);
+    for n in cx.az.disks.present() {
+        let Some(addr) = cx.az.scsi_addr(n) else { continue };
+        let totals = per_addr.iter().find(|(a, _)| *a == addr).map(|(_, t)| *t).unwrap_or_default();
+        let mut resets: Vec<ResetRec> = resets_all.iter().filter(|r| r.hits(addr)).copied().collect();
+        resets.sort_by_key(|r| r.ts);
+        let Some(mut text) = live_sentence(totals, &resets, &|ts| crate::util::clock().fmt(ts)) else { continue };
+        if !resets.is_empty() && logged_129 {
+            text.push_str(" Windows also logged a reset in its event log while monitoring (event 129).");
+        }
+        let key = format!("disk {n}");
+        let disk = cx.az.disks.get(n).clone();
+        if cx.found.note(&key, text.clone()) {
+            if !resets.is_empty() {
+                cx.found.raise(&key, Severity::High);
+                cx.found.advise(&key, CONTROLLER_RESET_ADVICE);
+            }
+        } else if !resets.is_empty() {
+            // Windows logged the same reset as event 129 against the controller: one finding.
+            if cx.found.note("storage controller", format!("{}: {text}", disk.title())) {
+                cx.found.raise("storage controller", Severity::High);
+            } else {
+                let title = format!("{}  -  Windows reset the drive while monitoring", disk.title());
+                cx.found.add(&key, Severity::High, title, text, CONTROLLER_RESET_ADVICE.to_string(), 0);
+            }
+        } else if totals.retried > 0 {
+            cx.found.add(
+                &key,
+                Severity::Low,
+                format!("{}  -  Windows had to retry requests to it", disk.title()),
+                text,
+                RETRY_ADVICE.into(),
+                0,
+            );
+        }
+        if !resets.is_empty() {
+            cx.found.measure(&key, Metric::flat("resets seen live", resets.len() as u32));
+        }
+    }
+}
+
+/// Disks the storage port driver never reported on, for DETAILS: "not measured", never "zero".
+pub(super) fn not_on_storport(az: &mut crate::analyze::Analyzer, report: &StorageReport, disks: &[u32]) -> Vec<u32> {
+    if !report.available {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for n in disks {
+        let split: SplitTotals = az.disk_split.get(n).copied().unwrap_or_default();
+        let addr = az.scsi_addr(*n);
+        if report.on_storport(addr, split.matched(), split.unmatched) == Some(false) {
+            out.push(*n);
+        }
+    }
+    out
 }
 
 /// Parts of Windows that can turn up doing disk work, beyond `known_worker`'s table: none of them
@@ -951,6 +1080,33 @@ mod tests {
         // Program code paging from a hard drive is worth moving; from an SSD it is not.
         assert!(behind_advice(&behind(), true).iter().any(|a| a.contains("to an SSD")));
         assert!(behind_advice(&behind(), false).is_empty());
+    }
+
+    #[test]
+    fn what_the_storage_driver_saw_live_is_said_in_one_sentence() {
+        use crate::storport::ResetKind;
+        let time = |ts: i64| format!("t{ts}");
+        assert_eq!(live_sentence(AddrTotals { requests: 900, ..AddrTotals::default() }, &[], &time), None, "a quiet drive says nothing");
+        let t = AddrTotals { requests: 900, failed: 1, retried: 5, retries: 8 };
+        let reset = |ts| ResetRec { ts, kind: ResetKind::LogicalUnit, port: 6, bus: Some(0), target: Some(0), lun: Some(0) };
+        let s = live_sentence(t, &[reset(1), reset(2)], &time).unwrap();
+        assert_eq!(
+            s,
+            "Seen live by Windows' storage driver while monitoring: Windows had to retry 5 requests to it (8 retries in all); 1 read or \
+             write came back failed; Windows reset the drive 2 times (at t1 and t2), and every request to it waits while that happens."
+        );
+        let many: Vec<ResetRec> = (0..5).map(reset).collect();
+        let s = live_sentence(AddrTotals::default(), &many, &time).unwrap();
+        assert!(s.contains("5 times (at t0, t1, t2 and 2 more)"), "{s}");
+        let one = live_sentence(AddrTotals { retried: 1, retries: 1, ..AddrTotals::default() }, &[], &time).unwrap();
+        assert!(one.contains("retry 1 request to it (1 retry in all)"), "{one}");
+        // The audience rule: nothing here or in the advice treats a part of Windows as something to close.
+        for text in [s, one, RETRY_ADVICE.to_string(), CONTROLLER_RESET_ADVICE.to_string(), storsplit::NOT_MEASURED.to_string()] {
+            let l = text.to_lowercase();
+            for bad in ["close", "end task", "uninstall", "pause"] {
+                assert!(!l.contains(bad), "{bad}: {text}");
+            }
+        }
     }
 
     #[test]

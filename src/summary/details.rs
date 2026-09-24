@@ -112,8 +112,14 @@ pub(super) fn tables(cx: &mut Ctx) {
     d!("");
     d!("THIS TOOL'S OWN COST  (what the measuring itself used)");
     let gpu_events = cx.run.gpu_trace.totals.available.then_some(cx.run.gpu_trace.totals.events);
-    for line in overhead.detail_lines(events, events_lost, cx.switch_events, gpu_events) {
+    let storage = &cx.run.storage_trace;
+    for line in overhead.detail_lines(events, events_lost, cx.switch_events, gpu_events, storage.available.then_some(storage.events)) {
         d!("{line}");
+    }
+    if let Some(why) = &storage.note {
+        d!("  The storage trace did not run: {why}. How slow disk time split between the drive and Windows is not measured.");
+    } else if storage.lost > 0 {
+        d!("  The storage trace lost {} events, so some slow requests could not be followed into the drive.", storage.lost);
     }
     if cx.switch_events.is_some() && !cx.scheduler_usable() {
         d!("Because some kernel events were lost, nothing in this report rests on the thread-switch trace: what it says about \
@@ -193,6 +199,12 @@ pub(super) fn tables(cx: &mut Ctx) {
             if !about.is_empty() {
                 d!("  disk {n} = {}", about.join("  |  "));
             }
+        }
+        // "Not measured", never an empty or zero split, for a drive the storage driver trace does
+        // not see (a USB 'BOT' drive, an older controller).
+        let numbers: Vec<u32> = disks.iter().map(|(n, _)| *n).collect();
+        for n in super::storage::not_on_storport(cx.az, &cx.run.storage_trace, &numbers) {
+            d!("  disk {n}: time inside the drive vs waiting in Windows not measured (the storage driver trace reports nothing for it)");
         }
     }
     let top_files = files::rank(file_waits, 8);
@@ -289,6 +301,82 @@ pub(super) fn tables(cx: &mut Ctx) {
         }
         for ((id, version), n) in gpu_debug.1 {
             d!("  not understood: id {id:>4} v{version}: {n} event(s) skipped");
+        }
+    }
+    // The storage port driver's trace: what an elevated run has to check is which pointer (if
+    // any) ties its records to the kernel's DiskIo records, and whether the status rule and the
+    // opcodes match what the drives really send.
+    let st = &cx.run.storage_trace;
+    if !st.debug_counts.is_empty() || !st.debug_unknown.is_empty() {
+        d!("");
+        d!("debug: StorPort events by (event id, version):");
+        for ((id, version), n) in &st.debug_counts {
+            let bad = st.debug_unknown.iter().any(|(k, _)| k == &(*id, *version));
+            d!("  id {id:>4} v{version}: {n}{}", if bad { "  NOT UNDERSTOOD" } else { "" });
+        }
+        let mut t = crate::storport::split::SplitTotals::default();
+        let mut per_disk: Vec<_> = cx.az.disk_split.iter().collect();
+        per_disk.sort_by_key(|(n, _)| **n);
+        for (_, s) in &per_disk {
+            t.merge(s);
+        }
+        d!(
+            "  slow requests matched by Irp {}, by OriginalIrp {}, by fallback {}; ambiguous {}, unmatched {}, not covered {}",
+            t.by_irp,
+            t.by_orig,
+            t.by_fallback,
+            t.ambiguous,
+            t.unmatched,
+            t.not_covered
+        );
+        d!("  matched in several pieces {}; clipped (port-driver time outside the request) {}", t.multi_piece, t.clipped);
+        for (n, s) in per_disk {
+            d!(
+                "  disk {n}: Irp {} OriginalIrp {} fallback {} unmatched {} ambiguous {} not covered {}; inside {} waiting {}",
+                s.by_irp,
+                s.by_orig,
+                s.by_fallback,
+                s.unmatched,
+                s.ambiguous,
+                s.not_covered,
+                fmt_dur(s.inside),
+                fmt_dur(s.waiting)
+            );
+        }
+        d!("  retries attached by Irp {}, by OriginalIrp {}, never attached {}", st.retry_by[0], st.retry_by[1], st.retry_by[2]);
+        let status: Vec<String> = st.debug_status.iter().map(|((srb, scsi), n)| format!("{srb:#04x}/{scsi:#04x}: {n}")).collect();
+        d!("  (SrbStatus/ScsiStatus): {}", status.join(", "));
+        let cmds: Vec<String> = st.debug_commands.iter().map(|(c, n)| format!("{c:#04x}: {n}")).collect();
+        d!("  commands: {}", cmds.join(", "));
+        for (a, t) in &st.per_addr {
+            d!(
+                "  port {} bus {} target {} lun {}: {} requests, {} failed, {} retried ({} retries)",
+                a.port,
+                a.bus,
+                a.target,
+                a.lun,
+                t.requests,
+                t.failed,
+                t.retried,
+                t.retries
+            );
+        }
+        for n in cx.az.disks.present() {
+            match cx.az.scsi_addr(n) {
+                Some(a) => d!("  disk {n} = port {} bus {} target {} lun {}", a.port, a.bus, a.target, a.lun),
+                None => d!("  disk {n}: no storage port address (IOCTL_SCSI_GET_ADDRESS refused)"),
+            }
+        }
+        for r in &st.resets {
+            d!(
+                "  reset {:?} at {}: port {} bus {:?} target {:?} lun {:?}",
+                r.kind,
+                crate::util::clock().fmt(r.ts),
+                r.port,
+                r.bus,
+                r.target,
+                r.lun
+            );
         }
     }
     cx.details = details;

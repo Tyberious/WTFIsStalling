@@ -4,8 +4,13 @@
 //! records into the shared state. The session uses the QPC clock (ClientContext = 1) and the
 //! consumer asks for raw timestamps, so every event time is directly comparable to
 //! QueryPerformanceCounter values taken by the latency probes.
+//!
+//! `manifest` and `layout` are the shared machinery for the separate sessions this tool starts for
+//! manifest providers (`gputrace`, `storport`), which cannot ride on this system logger.
 
 mod events;
+pub mod layout;
+pub mod manifest;
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};

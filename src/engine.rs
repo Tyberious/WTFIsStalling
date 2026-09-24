@@ -24,7 +24,7 @@ use crate::reg::hklm_str;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
 use crate::util::{self, ms_to_ticks, wide};
-use crate::{analyze, baseline, cpuclock, etw, gpu, gputrace, modules, overhead, probe, say, state};
+use crate::{analyze, baseline, cpuclock, etw, gpu, gputrace, modules, overhead, probe, say, state, storport};
 
 pub use crate::analyze::mark_now;
 
@@ -51,6 +51,10 @@ pub struct Config {
     /// Trace the graphics kernel in a second ETW session: frame cadence and video memory
     /// pressure, which a CPU-side trace cannot see at all. Off in light mode whatever this says.
     pub gpu_trace: bool,
+    /// Trace the storage port driver in its own session: where a slow disk request's time went
+    /// (inside the drive or waiting in Windows), retries and resets. ON in light mode too: it is
+    /// one small event per disk request, a tiny fraction of the kernel trace (see `storport`).
+    pub storage_trace: bool,
     /// Measure with the lighter settings (2 ms probes, slower CPU sampling). `None` lets the
     /// tool decide before the run from the CPU count and whether the PC is on battery, which is
     /// what the GUI always uses; `Some` overrides that either way.
@@ -74,6 +78,7 @@ impl Default for Config {
             profile: true,
             switches: true,
             gpu_trace: true,
+            storage_trace: true,
             light: None,
             log: LogTarget::Auto,
             compare: CompareMode::Auto,
@@ -380,6 +385,25 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         }
     }
 
+    // The storage port driver, likewise its own session, and likewise optional. ON in light mode:
+    // measured at ~1,750 events a second under heavy disk load against ~370,000 for the kernel
+    // trace, it costs next to nothing next to what light mode leaves off.
+    let (mut stor_session, mut stor_trace, mut stor_consumer) = (None, None, None);
+    let mut stor_note = (!cfg.storage_trace).then(|| "you asked for it with --no-storage-trace".to_string());
+    if cfg.storage_trace {
+        match storport::start(cfg.debug) {
+            Ok((session, trace, consumer)) => {
+                stor_session = Some(session);
+                stor_trace = Some(trace);
+                stor_consumer = Some(consumer);
+            }
+            Err(e) => {
+                say!("warning: the storage driver trace could not be started ({e}); where slow disk time went is not measured.");
+                stor_note = Some(e);
+            }
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
     let probe_stop = Arc::new(AtomicBool::new(false));
     let probe_stats = Arc::new(probe::ProbeStats::default());
@@ -401,6 +425,9 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     let mut analyzer = analyze::Analyzer::new(shared.clone(), rx, modules, session.profile, probe_stats.tids.clone());
     if let Some(trace) = &gpu_trace {
         analyzer.set_gpu_trace(trace.clone());
+    }
+    if let Some(trace) = &stor_trace {
+        analyzer.set_storage_trace(trace.clone());
     }
     say!(
         "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
@@ -469,6 +496,19 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     if let Some(h) = gpu_consumer {
         let _ = h.join();
     }
+    // Stopped first and read out after its consumer has drained, so the count and the lost count
+    // cover everything it delivered; the ring stays readable for the last analysis below.
+    let stor_lost = stor_session.take().map_or(0, |s| s.stop());
+    if let Some(h) = stor_consumer {
+        let _ = h.join();
+    }
+    let storage_report = match &stor_trace {
+        Some(trace) => {
+            trace.inner.lock().unwrap_or_else(|e| e.into_inner()).finished = true;
+            storport::StorageReport { lost: stor_lost, note: stor_note.take(), ..trace.report() }
+        }
+        None => storport::StorageReport { note: stor_note.take(), ..Default::default() },
+    };
     let lost = session.stop();
     match consumer.join() {
         Ok(Err(e)) => say!("ERROR: {e}"),
@@ -490,6 +530,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         clock: &clock_samples,
         gpu: &gpu_log,
         gpu_trace: gpu_report,
+        storage_trace: storage_report,
     });
     // Compare with the previous run and leave this run's numbers for the next one. Must happen
     // before the result is printed, so "what changed" is part of the result everywhere.

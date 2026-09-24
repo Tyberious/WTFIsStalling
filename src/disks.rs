@@ -184,6 +184,34 @@ impl Drop for Handle {
     }
 }
 
+/// The disk's address on its storage port (adapter port, bus, target, logical unit), which is how
+/// the storage port driver's events name a drive (see `storport`). `None` when the driver in front
+/// of the disk does not answer.
+///
+/// `IOCTL_SCSI_GET_ADDRESS` is `CTL_CODE(IOCTL_SCSI_BASE, 0x406, METHOD_BUFFERED, FILE_ANY_ACCESS)`:
+/// windows-sys gives 0x41018, whose access bits (14-15) are 0. For FILE_ANY_ACCESS "the I/O
+/// manager sends the IRP for any caller that has a handle to the file object", so the same
+/// zero-access handle as every other query here is enough; no read or write access is asked for.
+/// (A driver may still check more strictly; then this returns `None` and the drive is simply not
+/// mapped.) The request "must be directed to a class driver or to a PDO created by the port
+/// driver", which `\\.\PhysicalDriveN` (the disk class driver) is.
+/// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddscsi/ni-ntddscsi-ioctl_scsi_get_address
+/// https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/defining-i-o-control-codes
+pub fn scsi_address(number: u32) -> Option<crate::storport::ScsiAddr> {
+    use windows_sys::Win32::Storage::IscsiDisc::{IOCTL_SCSI_GET_ADDRESS, SCSI_ADDRESS};
+    const _: () = assert!(IOCTL_SCSI_GET_ADDRESS == 0x41018 && (IOCTL_SCSI_GET_ADDRESS >> 14) & 3 == 0, "FILE_ANY_ACCESS");
+    let h = Handle::open(&format!(r"\\.\PhysicalDrive{number}"))?;
+    let mut buf = [0u8; std::mem::size_of::<SCSI_ADDRESS>()];
+    let n = h.ioctl(IOCTL_SCSI_GET_ADDRESS, &[], &mut buf)?;
+    parse_scsi_address(&buf[..n])
+}
+
+/// SCSI_ADDRESS { Length: u32, PortNumber: u8, PathId: u8, TargetId: u8, Lun: u8 } (windows-sys,
+/// from ntddscsi.h). The port driver's events call PathId "Bus".
+fn parse_scsi_address(d: &[u8]) -> Option<crate::storport::ScsiAddr> {
+    (d.len() >= 8).then(|| crate::storport::ScsiAddr { port: d[4], bus: d[5], target: d[6], lun: d[7] })
+}
+
 fn query_disk(number: u32) -> DiskInfo {
     let mut info = DiskInfo { number, volumes: volumes_on(number), ..Default::default() };
     let Some(h) = Handle::open(&format!(r"\\.\PhysicalDrive{number}")) else { return info };
@@ -388,6 +416,28 @@ mod tests {
         assert_eq!(full.fullness(), "E: 95% full, F: 40% full");
         assert_eq!(full.nearly_full(), vec!['E']);
         assert_eq!((fmt_size(118_000_000_000), fmt_size(42_500_000)), ("118 GB".to_string(), "42 MB".to_string()));
+    }
+
+    #[test]
+    fn a_scsi_address_is_read_from_its_documented_layout() {
+        use crate::storport::ScsiAddr;
+        let mut d = [0u8; 8];
+        d[..4].copy_from_slice(&8u32.to_le_bytes());
+        d[4..].copy_from_slice(&[6, 0, 1, 2]);
+        assert_eq!(parse_scsi_address(&d), Some(ScsiAddr { port: 6, bus: 0, target: 1, lun: 2 }));
+        assert_eq!(parse_scsi_address(&d[..7]), None, "short: nothing, never a guess");
+        assert_eq!(std::mem::size_of::<windows_sys::Win32::Storage::IscsiDisc::SCSI_ADDRESS>(), 8);
+    }
+
+    /// Live, non-asserting: which disks answer IOCTL_SCSI_GET_ADDRESS through a zero-access handle
+    /// here. Works without administrator rights, which is also what this checks.
+    #[test]
+    fn live_scsi_addresses_can_be_read_with_a_zero_access_handle() {
+        for n in 0..16 {
+            if let Some(a) = scsi_address(n) {
+                println!("disk {n}: port {} bus {} target {} lun {}", a.port, a.bus, a.target, a.lun);
+            }
+        }
     }
 
     #[test]

@@ -42,14 +42,19 @@ pub struct FaultRec {
     pub file: u64,
 }
 
-/// One completed disk request. 56 bytes (see the size test): the ring is pruned by time
-/// (`Shared::keep`, 20 s), not by count, so its memory is the drives' request rate x 20 s x 56.
+/// One completed disk request. 64 bytes (see the size test): the ring is pruned by time
+/// (`Shared::keep`, 20 s), not by count, so its memory is the drives' request rate x 20 s x 64.
+/// At the ~1,750 requests a second measured under heavy disk load (2026-09-23) that is 2.2 MB.
 #[derive(Clone, Copy)]
 pub struct IoRec {
     pub end: i64,
     pub dur: i64,
     /// FileObject of the file, or 0 (flush events carry none). See `Inner::file_names`.
     pub file: u64,
+    /// `Irp`: the request's I/O request packet, a kernel pointer. Kept only so that the storage
+    /// port driver's record of the same request can be found (see `storport`); never printed.
+    /// https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1
+    pub irp: u64,
     /// `ByteOffset`: "Byte offset from the beginning of the physical disk". 0 for a flush, which
     /// carries none. https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1
     pub offset: i64,
@@ -521,9 +526,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<SwitchRec>(), 24);
         assert_eq!(std::mem::size_of::<ReadyRec>(), 24);
         const { assert!((SWITCH_CAP_MAX + READY_CAP_MAX) * 24 <= 96 << 20, "the two rings must stay under 96 MB") };
-        // Was 48 before IrpFlags and ByteOffset were kept (issue #20); the comment on IoRec
-        // states the bound in these terms.
-        assert_eq!(std::mem::size_of::<IoRec>(), 56);
+        // Was 48 before IrpFlags and ByteOffset were kept and 56 before Irp was (issue #20); the
+        // comment on IoRec states the bound in these terms.
+        assert_eq!(std::mem::size_of::<IoRec>(), 64);
     }
 
     /// Nothing may be read about who was stuck behind a request unless the rings reach back to
