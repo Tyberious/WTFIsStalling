@@ -2,9 +2,6 @@
 //! Windows logged about storage, and what each drive reports about its own health.
 
 use std::collections::HashMap;
-use std::mem::{size_of, zeroed};
-
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::disks::{fmt_size, DiskInfo};
 use crate::diskstuck::{top_counts, DiskBehind, Kind, STACK_KEYS_CAP};
@@ -28,16 +25,39 @@ const CONTROLLER_RESET_ADVICE: &str = "Every program waits, often for many secon
     chipset/storage driver, and set Power Options > PCI Express > Link State Power Management to Off. Event Viewer > Windows Logs > \
     System (event 129) shows which controller.";
 
-fn memory_load() -> u32 {
-    let mut mem: MEMORYSTATUSEX = unsafe { zeroed() };
-    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut mem) };
-    mem.dwMemoryLoad
-}
-
 /// One row of "which files waited on disk": (path already made public-safe, disk, requests,
 /// total wait, worst wait).
 pub(super) type FileRow = (String, u32, u64, i64, i64);
+
+/// One program's share of the waiting on one file, all its processes together: (image name, how
+/// many processes of it, requests, total wait). See `Ctx::file_programs`.
+pub(super) type ProgramRow = (String, u32, u64, i64);
+
+/// The programs behind one file's waiting, for DETAILS: "powershell.exe 2 copies, 53 s; Windows
+/// itself (System) 1.20 s". Image names only, and Windows' own parts marked (`shown`), because
+/// "System" issuing a request is the file cache writing on everyone's behalf, not a program.
+pub(super) fn programs_text(rows: &[ProgramRow], max: usize) -> Option<String> {
+    let parts: Vec<String> = rows
+        .iter()
+        .take(max)
+        .map(|(name, copies, _, total)| {
+            let copies = if *copies > 1 { format!(" {copies} copies") } else { String::new() };
+            format!("{}{copies}, {}", shown(name), fmt_dur(*total))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// "issued by powershell.exe (2 copies)", for the sentence in a disk's finding: the one or two
+/// programs that did most of that file's waiting.
+fn issued_by(rows: &[ProgramRow]) -> Option<String> {
+    let names: Vec<String> = rows
+        .iter()
+        .take(2)
+        .map(|(name, copies, ..)| if *copies > 1 { format!("{} ({copies} copies)", shown(name)) } else { shown(name) })
+        .collect();
+    (!names.is_empty()).then(|| format!("issued by {}", and_list(&names)))
+}
 
 /// What the files that waited on one disk change about the advice. Which file waited says
 /// something no latency number can: the paging file means memory, game data means the game.
@@ -51,14 +71,20 @@ fn file_hint(rows: &[FileRow]) -> FileHint {
     FileHint { paging: rows.iter().any(|r| files::is_paging_file(&r.0)), game: rows.iter().any(|r| files::is_game_asset(&r.0)) }
 }
 
-/// "Most of the waiting was for ...", naming the files that waited longest on one disk.
-fn files_sentence(rows: &[FileRow]) -> Option<String> {
+/// "Most of the waiting was for ...", naming the files that waited longest on one disk and, where
+/// the trace says, which program issued the requests.
+fn files_sentence(rows: &[FileRow], programs: &HashMap<(String, u32), Vec<ProgramRow>>) -> Option<String> {
     let top = files::rank(rows, 3);
     if top.is_empty() {
         return None;
     }
-    let list: Vec<String> =
-        top.iter().map(|(name, _, count, total, _)| format!("{name} ({count} request{}, {})", plural(*count), fmt_dur(*total))).collect();
+    let list: Vec<String> = top
+        .iter()
+        .map(|(name, disk, count, total, _)| {
+            let by = programs.get(&(name.clone(), *disk)).and_then(|p| issued_by(p)).map(|b| format!(", {b}")).unwrap_or_default();
+            format!("{name} ({count} request{}, {}{by})", plural(*count), fmt_dur(*total))
+        })
+        .collect();
     let mut sentence = format!("Most of the waiting was for: {}.", list.join(", "));
     // Name what the worst one actually is; almost nobody knows what $Mft or pagefile.sys are.
     if let Some(what) = files::explain(&top[0].0) {
@@ -393,14 +419,14 @@ pub(super) fn paging(cx: &mut Ctx) {
     }
     let mut faults_named: Vec<_> = faults_named.into_iter().collect();
     faults_named.sort_by_key(|(_, s)| std::cmp::Reverse(s.total));
-    let mem = memory_load();
+    let mem = crate::util::memory_load();
     for (name, s) in &faults_named {
         if s.total < ms_to_ticks(1000.0) && s.max < ms_to_ticks(200.0) {
             continue;
         }
         let share = ticks_to_ms(s.total) / (cx.run.elapsed_s.max(1.0) * 1000.0);
         let sev = paging_severity(s.total, s.max, cx.run.elapsed_s);
-        let advice = if mem >= 85 {
+        let advice = if mem >= crate::util::MEMORY_TIGHT_PCT {
             format!(
                 "Memory is {mem}% full, so Windows keeps pushing programs out to disk. Close memory-hungry programs \
                  (browsers with many tabs are the usual one) or add RAM."
@@ -476,7 +502,9 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         let disk = cx.az.disks.get(*n).clone();
         let victims = s.slow - slow;
         let discounted = if victims > 0 {
-            format!(" {victims} more happened while the whole PC was frozen and are counted there instead.")
+            format!(
+                " {victims} more were slowed down by a whole-PC freeze: they began after the PC had already stopped, so they are                  not counted against this drive."
+            )
         } else {
             String::new()
         };
@@ -499,7 +527,10 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         for sentence in why.map(|w| why_sentences(w, disk.spinning == Some(true))).unwrap_or_default() {
             cx.found.note(&key, sentence);
         }
-        if let Some(sentence) = files_sentence(&on_disk) {
+        if let Some(sentence) = files_sentence(&on_disk, &cx.file_programs) {
+            cx.found.note(&key, sentence);
+        }
+        if let Some(sentence) = freeze_sentence(&cx.az.incidents, *n) {
             cx.found.note(&key, sentence);
         }
         if let Some(behind) = cx.az.disk_behind.get(n).cloned() {
@@ -540,6 +571,35 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
             }
         }
     }
+}
+
+/// The whole-PC freezes that coincided with a slow request to disk `n`, said on the DISK's own
+/// finding too (issue #19), in the same correlation language as the freeze finding. Only requests
+/// that were already outstanding, or that merely overlapped: one that began after the PC had
+/// already stopped was slowed down BY the freeze (`diskwait::Role::Victim`), is not held against
+/// the drive, and is accounted for in the evidence line about discounted requests instead.
+fn freeze_sentence(incidents: &[crate::analyze::IncidentSummary], n: u32) -> Option<String> {
+    let mut count = 0usize;
+    let (mut waited, mut woke) = (0i64, false);
+    for c in incidents
+        .iter()
+        .filter(|i| !i.marked && i.class == crate::analyze::IncidentClass::Freeze)
+        .filter_map(|i| i.freeze.as_ref()?.coincided.as_ref())
+        .filter(|c| c.disk == Some(n) && c.role != crate::diskwait::Role::Victim)
+    {
+        count += 1;
+        waited = waited.max(c.waited);
+        woke |= c.woke;
+    }
+    if count == 0 {
+        return None;
+    }
+    let asleep = if woke { ", after it had been asleep" } else { "" };
+    Some(format!(
+        "The whole PC froze {count} time{} while a slow request to this drive was outstanding{asleep} (taking up to {}).          'Coincided' is all this says: this tool cannot tell which caused which. See the whole-PC freeze finding.",
+        plural(count as u64),
+        fmt_dur(waited)
+    ))
 }
 
 /// Resets past this many are counted rather than each given a time.
@@ -679,7 +739,7 @@ fn windows_part(name: &str) -> bool {
 
 /// A process as the disk finding names it: parts of Windows marked as such, so that nothing
 /// reads as "this program is the problem, close it".
-fn shown(name: &str) -> String {
+pub(super) fn shown(name: &str) -> String {
     if name.starts_with("System") {
         "Windows itself (System)".to_string()
     } else if windows_part(name) {
@@ -1061,11 +1121,59 @@ mod tests {
             row("D:\\SteamLibrary\\steamapps\\common\\Game\\game.pak", 1, 40, 910.0, 300.0),
             row("C:\\...\\notes.txt", 0, 1, 5.0, 5.0),
         ];
-        let s = files_sentence(&rows).expect("a sentence");
+        let s = files_sentence(&rows, &HashMap::new()).expect("a sentence");
         assert!(s.starts_with("Most of the waiting was for: C:\\pagefile.sys (1204 requests,"), "{s}");
         assert!(s.contains("game.pak (40 requests"), "{s}");
         assert!(s.contains("short of memory"), "the worst one is explained: {s}");
-        assert_eq!(files_sentence(&[]), None);
+        assert_eq!(files_sentence(&[], &HashMap::new()), None);
+    }
+
+    /// Issue #19: which program waited on which file. Two copies of one program add up under its
+    /// image name, and Windows' own file-cache writer is named as Windows, never as a program.
+    #[test]
+    fn the_program_behind_a_files_waiting_is_named_by_image_name_only() {
+        let image = r"G:\...\(a .mrimg file)";
+        let rows = vec![row(image, 0, 412, 53_000.0, 900.0), row(r"C:\pagefile.sys", 0, 10, 100.0, 20.0)];
+        let mut programs: HashMap<(String, u32), Vec<ProgramRow>> = HashMap::new();
+        programs.insert((image.to_string(), 0), vec![("powershell.exe".into(), 2, 400, ms_to_ticks(52_000.0))]);
+        programs.insert((r"C:\pagefile.sys".to_string(), 0), vec![("System (kernel threads)".into(), 1, 10, ms_to_ticks(100.0))]);
+        let s = files_sentence(&rows, &programs).expect("a sentence");
+        assert!(s.contains("(a .mrimg file) (412 requests, 53.0 s, issued by powershell.exe (2 copies))"), "{s}");
+        assert!(s.contains("pagefile.sys (10 requests, 100 ms, issued by Windows itself (System))"), "{s}");
+        assert!(!s.contains("pid"), "no process IDs: {s}");
+        assert_eq!(programs_text(&programs[&(image.to_string(), 0)], 3).as_deref(), Some("powershell.exe 2 copies, 52.0 s"));
+        assert_eq!(programs_text(&[], 3), None);
+    }
+
+    /// Issue #19: a freeze that coincided with a slow request on a disk is evidence on the DISK's
+    /// finding too, but one whose request only began once the PC had stopped is not.
+    #[test]
+    fn a_freeze_is_said_on_the_disk_it_coincided_with_but_never_blamed_on_a_victim() {
+        use crate::analyze::{Coincided, FreezeFacts, IncidentClass, IncidentSummary};
+        use crate::diskwait::Role;
+        let freeze = |disk, role| IncidentSummary {
+            class: IncidentClass::Freeze,
+            start: 0,
+            dur: ms_to_ticks(900.0),
+            culprit: "whole-PC freeze".into(),
+            marked: false,
+            cpus: (0..8).collect(),
+            on_cpu: None,
+            freeze: Some(FreezeFacts {
+                coincided: Some(Coincided { disk: Some(disk), role, waited: ms_to_ticks(2173.0), woke: true }),
+                ..FreezeFacts::default()
+            }),
+            busy_core: None,
+        };
+        let incidents = vec![freeze(6, Role::Trigger), freeze(6, Role::Overlap), freeze(2, Role::Victim), freeze(6, Role::Victim)];
+        let s = freeze_sentence(&incidents, 6).expect("disk 6 was outstanding during two freezes");
+        assert!(
+            s.starts_with("The whole PC froze 2 times while a slow request to this drive was outstanding, after it had been asleep"),
+            "{s}"
+        );
+        assert!(s.contains("up to 2173 ms") && s.contains("'Coincided' is all this says"), "{s}");
+        assert_eq!(freeze_sentence(&incidents, 2), None, "a request slowed down by the freeze is not the drive's doing");
+        assert_eq!(freeze_sentence(&incidents, 5), None);
     }
 
     /// Which file waited changes the answer: the paging file means memory, game data means the

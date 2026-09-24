@@ -97,6 +97,21 @@ pub fn local_stamp() -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
 }
 
+/// Memory in use at this moment, % (`MEMORYSTATUSEX::dwMemoryLoad`: "A number between 0 and 100
+/// that specifies the approximate percentage of physical memory that is in use").
+/// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex
+pub fn memory_load() -> u32 {
+    let mut mem: MEMORYSTATUSEX = unsafe { zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut mem) };
+    mem.dwMemoryLoad
+}
+
+/// Memory this full is where the report starts treating paging as a shortage rather than a
+/// program loading its data. A rule of thumb this tool has always used for its paging advice, not
+/// a Microsoft threshold.
+pub const MEMORY_TIGHT_PCT: u32 = 85;
+
 pub fn total_ram_bytes() -> u64 {
     let mut mem: MEMORYSTATUSEX = unsafe { zeroed() };
     mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
@@ -148,8 +163,11 @@ pub fn fmt_dur(t: i64) -> String {
         format!("{:.0} µs", ms * 1000.0)
     } else if ms < 100.0 {
         format!("{ms:.2} ms")
-    } else {
+    } else if ms < 10_000.0 {
         format!("{ms:.0} ms")
+    } else {
+        // "84718 ms" makes a reader count digits; totals over a run reach minutes.
+        format!("{:.1} s", ms / 1000.0)
     }
 }
 

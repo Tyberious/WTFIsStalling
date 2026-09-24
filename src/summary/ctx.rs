@@ -8,11 +8,12 @@ use crate::analyze::Analyzer;
 use crate::devices::DeviceMap;
 use crate::evlog::{self, DisplayReset, HardwareEvent, StorageEvent};
 use crate::files;
-use crate::state::{Beats, LatStat, RoutineStat};
+use crate::procs::process_name;
+use crate::state::{Beats, LatStat, PidWait, RoutineStat};
 use crate::util::{plural, unix_now};
 
 use super::stalls::DriverAgg;
-use super::storage::FileRow;
+use super::storage::{FileRow, ProgramRow};
 use super::{Findings, RunData};
 
 /// How far back the Windows event log is read, everywhere in the report.
@@ -58,6 +59,9 @@ pub(super) struct Ctx<'a> {
     pub named_files: usize,
     /// Every path already in drive-letter form and past the privacy rule.
     pub file_waits: Vec<FileRow>,
+    /// Which programs issued the requests behind each row of `file_waits`, keyed like
+    /// `files::rank` merges them (public path, disk). See `storage::ProgramRow`.
+    pub file_programs: HashMap<(String, u32), Vec<ProgramRow>>,
     pub fault_files: HashMap<String, Vec<(String, u64, i64)>>,
 
     // ---- this run in wall-clock terms
@@ -89,6 +93,14 @@ pub(super) struct Ctx<'a> {
     pub platform_lines: Vec<String>,
     /// The "where the waiting happened" block, built by `storage::slow_disks` from call stacks.
     pub stack_lines: Vec<String>,
+}
+
+/// Per program on one file: (its process IDs, requests, total wait).
+type ProgramTally = HashMap<String, (Vec<u32>, u64, i64)>;
+
+/// A process label that names a program: not a thread that ended before it could be named.
+fn nameable(label: &str) -> bool {
+    !(label.starts_with("unknown") || label.starts_with("pid ") || label == "Idle")
 }
 
 impl Ctx<'_> {
@@ -125,10 +137,13 @@ impl<'a> Ctx<'a> {
         // Files the trace named. Anything it never named is dropped here rather than carried
         // around as an unnamed row: "(file name not available)" repeated is noise, not evidence.
         let named_files = inner.file_names.len();
-        let raw_waits: Vec<(String, u32, u64, i64, i64)> = inner
+        let raw_waits: Vec<(FileRow, Vec<PidWait>)> = inner
             .file_wait
             .iter()
-            .filter_map(|(key, w)| inner.file_names.get(*key).map(|p| (p.to_string(), w.disk, w.count, w.total, w.max)))
+            .filter_map(|(key, f)| {
+                let w = f.wait;
+                inner.file_names.get(*key).map(|p| ((p.to_string(), w.disk, w.count, w.total, w.max), f.by_pid.clone()))
+            })
             .collect();
         let raw_fault_files: Vec<(u32, String, u64, i64)> = inner
             .fault_file
@@ -139,8 +154,34 @@ impl<'a> Ctx<'a> {
 
         // Every path becomes drive-letter form and passes the privacy rule ONCE, here, before any
         // section of the summary can see it. Nothing past this point ever touches a raw NT path.
-        let file_waits: Vec<FileRow> =
-            raw_waits.into_iter().map(|(p, d, c, t, m)| (files::public_path(&az.dos.to_dos(&p)), d, c, t, m)).collect();
+        let mut file_waits: Vec<FileRow> = Vec::new();
+        // Per (file, program): the processes, requests and waiting. Named here, once, the way the
+        // hard-fault tally is: by image name, so several processes of one program add up.
+        let mut by_program: HashMap<(String, u32), ProgramTally> = HashMap::new();
+        for ((p, d, c, t, m), pids) in raw_waits {
+            let shown = files::public_path(&az.dos.to_dos(&p));
+            for pw in pids {
+                let label = az.procs.label(pw.pid, 0);
+                if !nameable(&label) {
+                    continue;
+                }
+                let e = by_program.entry((shown.clone(), d)).or_default().entry(process_name(&label)).or_default();
+                if !e.0.contains(&pw.pid) {
+                    e.0.push(pw.pid);
+                }
+                e.1 += u64::from(pw.count);
+                e.2 += pw.total;
+            }
+            file_waits.push((shown, d, c, t, m));
+        }
+        let file_programs = by_program
+            .into_iter()
+            .map(|(file, progs)| {
+                let mut rows: Vec<ProgramRow> = progs.into_iter().map(|(name, (pids, c, t))| (name, pids.len() as u32, c, t)).collect();
+                rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+                (file, rows)
+            })
+            .collect();
         let mut fault_files: HashMap<String, Vec<(String, u64, i64)>> = HashMap::new();
         for (pid, path, count, total) in raw_fault_files {
             let shown = files::public_path(&az.dos.to_dos(&path));
@@ -171,6 +212,7 @@ impl<'a> Ctx<'a> {
             stacks,
             named_files,
             file_waits,
+            file_programs,
             fault_files,
             now_unix,
             now_qpc,

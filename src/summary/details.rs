@@ -220,6 +220,10 @@ pub(super) fn tables(cx: &mut Ctx) {
         d!("  {:<64} {:>5} {:>9} {:>12} {:>10}", "file", "disk", "requests", "total wait", "worst");
         for (name, disk, count, total, max) in &top_files {
             d!("  {name:<64} {disk:>5} {count:>9} {:>12} {:>10}", fmt_dur(*total), fmt_dur(*max));
+            // Which programs issued those requests (issue #19), image names only.
+            if let Some(who) = cx.file_programs.get(&(name.clone(), *disk)).and_then(|p| super::storage::programs_text(p, 3)) {
+                d!("      by program: {who}");
+            }
         }
         // Plain words for the ones nobody recognizes, once each.
         let mut explained: Vec<&str> = Vec::new();

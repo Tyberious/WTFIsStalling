@@ -4,7 +4,7 @@
 use crate::baseline::stable_key;
 use std::collections::HashMap;
 
-use crate::analyze::IncidentClass;
+use crate::analyze::{CoreHolder, IncidentClass};
 use crate::modules::knowledge;
 use crate::period;
 use crate::state::{Beats, BEAT_MS, KIND_ISR};
@@ -45,16 +45,57 @@ fn secs(ticks: &[i64]) -> Vec<f64> {
 ///   seconds (360 per hour) at 5 ms or more is continuous audio crackle; that is High.
 /// * So is anything that adds up to half a percent of the whole run, however it is distributed.
 /// * A couple an hour is a lead worth knowing (Low). Between the two, a suspect (Medium).
-fn stall_severity(n: u32, worst: i64, total: i64, run_s: f64) -> Severity {
-    let per_hour = f64::from(n) * 3600.0 / run_s.max(1.0);
-    let share = ticks_to_ms(total) / (run_s.max(1.0) * 1000.0);
-    if worst >= ms_to_ticks(100.0) || (per_hour >= 360.0 && worst >= ms_to_ticks(5.0)) || share >= 0.005 {
+///
+/// How many processors a stall held matters too (issue #19): a kernel-level stall on 1 of 32
+/// leaves 31 carrying on, so the PC as a whole kept responding. The two rules that stand for "the
+/// PC stopped responding" - one felt stall of 100 ms, half a percent of the run - therefore count
+/// each stall in proportion to its breadth (`breadth`), with a quarter of the processors or more
+/// counting in full. Rule of thumb, not a measurement. The crackle rule keeps the raw length:
+/// audio breaks up when the one core its work is on is held, however many others are free. And
+/// the raw length still makes a 50 ms hold at least a suspect, however narrow.
+fn stall_severity(t: &Tally, run_s: f64) -> Severity {
+    let per_hour = f64::from(t.n) * 3600.0 / run_s.max(1.0);
+    let share = ticks_to_ms(t.felt_total) / (run_s.max(1.0) * 1000.0);
+    if t.felt_worst >= ms_to_ticks(100.0) || (per_hour >= 360.0 && t.worst >= ms_to_ticks(5.0)) || share >= 0.005 {
         Severity::High
-    } else if per_hour >= 2.0 || worst >= ms_to_ticks(50.0) {
+    } else if per_hour >= 2.0 || t.worst >= ms_to_ticks(50.0) {
         Severity::Medium
     } else {
         Severity::Low
     }
+}
+
+/// Stalls blamed on one subject, with their lengths as measured and as weighted by `breadth`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Tally {
+    n: u32,
+    worst: i64,
+    total: i64,
+    /// Longest and total after weighting each stall by how many processors it held.
+    felt_worst: i64,
+    felt_total: i64,
+}
+
+impl Tally {
+    fn add(&mut self, dur: i64, breadth: f64) {
+        let felt = (dur as f64 * breadth) as i64;
+        self.n += 1;
+        self.total += dur;
+        self.worst = self.worst.max(dur);
+        self.felt_total += felt;
+        self.felt_worst = self.felt_worst.max(felt);
+    }
+}
+
+/// How much of "the PC" one stall held, 0-1: its processors against a quarter of this PC's. A
+/// CPU-starvation stall is PC-wide by definition (no core at all for a normal thread), and when
+/// the processor count is unknown the stall counts in full, which is how it was always judged.
+fn breadth(class: IncidentClass, held: usize, ncpu: usize) -> f64 {
+    if class == IncidentClass::Starvation || ncpu == 0 || held == 0 {
+        return 1.0;
+    }
+    let quarter = (ncpu as f64 / 4.0).max(1.0);
+    (held as f64 / quarter).min(1.0)
 }
 
 /// "14 stalls (worst 11.80 ms, 121 ms in total), about 14 per hour"
@@ -73,7 +114,10 @@ fn how_often(n: u32, worst: i64, total: i64, run_s: f64) -> String {
 /// inside them landed in was a bystander.
 pub(super) fn tally(cx: &mut Ctx) {
     let run_s = cx.run.elapsed_s;
-    let mut tally: HashMap<String, (u32, i64, i64)> = HashMap::new();
+    let ncpu = cx.az.ncpu();
+    let mut tally: HashMap<String, Tally> = HashMap::new();
+    // One or a few cores busy while the rest idled, per subject: (how many stalls, what held it).
+    let mut busy_cores: HashMap<String, (u32, Vec<String>)> = HashMap::new();
     // A verdict that rests on the context-switch trace has to fall back to the vaguer one when
     // that trace cannot be trusted; see `Ctx::scheduler_usable`.
     let usable = cx.scheduler_usable();
@@ -86,16 +130,24 @@ pub(super) fn tally(cx: &mut Ctx) {
         };
         // Keyed without the process ID: a browser runs a dozen processes, and four findings for
         // "msedge.exe" are one finding said four times.
-        let t = tally.entry(stable_key(culprit)).or_default();
-        t.0 += 1;
-        t.1 += i.dur;
-        t.2 = t.2.max(i.dur);
+        let key = stable_key(culprit);
+        tally.entry(key.clone()).or_default().add(i.dur, breadth(i.class, i.cpus.len(), ncpu));
+        if let Some(holder) = &i.busy_core {
+            let e = busy_cores.entry(key).or_default();
+            e.0 += 1;
+            if let Some(name) = holder_name(holder) {
+                if !e.1.contains(&name) {
+                    e.1.push(name);
+                }
+            }
+        }
     }
-    let mut tally: Vec<_> = tally.into_iter().collect();
-    tally.sort_by_key(|(_, t)| std::cmp::Reverse(t.1));
+    let mut tally: Vec<(String, Tally)> = tally.into_iter().collect();
+    tally.sort_by_key(|(_, t)| std::cmp::Reverse(t.total));
 
-    for (culprit, (n, total, worst)) in &tally {
-        let sev = stall_severity(*n, *worst, *total, run_s);
+    for (culprit, t) in &tally {
+        let (n, total, worst) = (&t.n, &t.total, &t.worst);
+        let sev = stall_severity(t, run_s);
         let stalls = how_often(*n, *worst, *total, run_s);
         if let Some(m) = culprit.strip_prefix("driver ") {
             let what = cx.az.modules.describe_short(m);
@@ -139,8 +191,8 @@ pub(super) fn tally(cx: &mut Ctx) {
                 sev,
                 "Threads were held up waiting for memory to come back from disk".into(),
                 format!(
-                    "During {stalls} the processors were idle and this tool's own thread was waiting for memory to be read \
-                         back from disk, which is what any program in the same position would be doing."
+                    "During {stalls} nothing was holding the processors: this tool's own measuring thread was waiting for \
+                         memory to be read back from disk, which is what any program in the same position would be doing."
                 ),
                 "See the paging findings in this report: close memory-hungry programs (a browser with many tabs is the usual \
                  one), or move the paging file to your fastest drive."
@@ -222,8 +274,29 @@ pub(super) fn tally(cx: &mut Ctx) {
         // The two numbers a next run is judged by: how often, and how bad at worst.
         cx.found.measure(culprit, Metric::count("stalls blamed", *n));
         cx.found.measure(culprit, Metric::ms("worst stall", ticks_to_ms(*worst)));
+        // Context only: a busy core next to idle ones does not say the waiting thread needed THAT
+        // core, and nothing in the trace shows it was limited to it, so no more is claimed.
+        if let Some((k, names)) = busy_cores.get(culprit) {
+            let with = if names.is_empty() { String::new() } else { format!(", busy with {}", names.join(" / ")) };
+            cx.found.note(
+                culprit,
+                format!(
+                    "In {k} of these, one core (or a few) was busy while the others idled{with}. An average over all of them hid that."
+                ),
+            );
+        }
     }
-    cx.tally = tally;
+    cx.tally = tally.into_iter().map(|(k, t)| (k, (t.n, t.total, t.worst))).collect();
+}
+
+/// How a busy core's holder is named in a finding: Windows' own parts marked as such, nothing
+/// said for "System", which is where every driver's work runs (see `wording::on_behalf_of`).
+fn holder_name(holder: &CoreHolder) -> Option<String> {
+    match holder {
+        CoreHolder::Program(label) => on_behalf_of(label),
+        CoreHolder::Driver(module) => Some(format!("interrupt handling in {module}")),
+        CoreHolder::Unnamed => None,
+    }
 }
 
 /// The moments the user flagged with "I felt it".
@@ -657,21 +730,58 @@ mod tests {
 
         // "[HIGH] consent.exe - 1 stall, 31 ms" was the worst of the old rules: a single blip
         // nobody felt, promoted because 31 ms is over a fixed 15 ms line.
-        assert_eq!(stall_severity(1, ms(31.6), ms(31.6), hour), Severity::Low);
+        assert_eq!(full(1, ms(31.6), ms(31.6), hour), Severity::Low);
         // The same one stall inside five minutes is twelve an hour, which is a suspect. That is
         // the rate changing, not the rule.
-        assert_eq!(stall_severity(1, ms(31.6), ms(31.6), short), Severity::Medium);
+        assert_eq!(full(1, ms(31.6), ms(31.6), short), Severity::Medium);
 
         // 55 network-filter stalls of 5-13 ms in 59 minutes: once a minute. Real, worth acting
         // on, but not a machine that is repeatedly or badly stalled.
-        assert_eq!(stall_severity(55, ms(13.52), ms(415.0), hour), Severity::Medium);
+        assert_eq!(full(55, ms(13.52), ms(415.0), hour), Severity::Medium);
         // The same 55 in five minutes is one every five seconds: continuous audio crackle.
-        assert_eq!(stall_severity(55, ms(13.52), ms(415.0), short), Severity::High);
+        assert_eq!(full(55, ms(13.52), ms(415.0), short), Severity::High);
 
         // One hold long enough to be seen is serious however rarely it happens...
-        assert_eq!(stall_severity(1, ms(900.0), ms(900.0), hour), Severity::High);
+        assert_eq!(full(1, ms(900.0), ms(900.0), hour), Severity::High);
         // ...and so is anything that adds up to half a percent of the run.
-        assert_eq!(stall_severity(300, ms(60.0), ms(18_000.0), hour), Severity::High);
+        assert_eq!(full(300, ms(60.0), ms(18_000.0), hour), Severity::High);
+    }
+
+    /// Severity for stalls that held every processor they could (breadth 1), which is how every
+    /// stall used to be judged: the expectations above are unchanged by the breadth rule.
+    fn full(n: u32, worst: i64, total: i64, run_s: f64) -> Severity {
+        stall_severity(&Tally { n, worst, total, felt_worst: worst, felt_total: total }, run_s)
+    }
+
+    /// Issue #19: a kernel-level stall on 1 of 32 processors and one on 30 of 32 must not rate the
+    /// same, while a starvation stall, a small PC and an unknown processor count keep full weight.
+    #[test]
+    fn a_stall_that_held_few_of_many_processors_counts_for_less() {
+        let ms = ms_to_ticks;
+        let hour = 3561.0;
+        let rate = |class, held, ncpu, dur_ms: f64, n: u32| {
+            let mut t = Tally::default();
+            for _ in 0..n {
+                t.add(ms(dur_ms), breadth(class, held, ncpu));
+            }
+            stall_severity(&t, hour)
+        };
+        // One 150 ms stall: on 30 of 32 processors it is the PC not responding...
+        assert_eq!(rate(IncidentClass::Kernel, 30, 32, 150.0, 1), Severity::High);
+        // ...on 1 of 32 the other 31 kept working: a suspect, never below one at that length.
+        assert_eq!(rate(IncidentClass::Kernel, 1, 32, 150.0, 1), Severity::Medium);
+        // A quarter of the processors counts in full; on a 4-thread laptop one core is a quarter.
+        assert_eq!(rate(IncidentClass::Kernel, 8, 32, 150.0, 1), Severity::High);
+        assert_eq!(rate(IncidentClass::Kernel, 1, 4, 150.0, 1), Severity::High);
+        // The share-of-run rule weighs breadth too: 300 x 60 ms on 1 of 32 is not half a percent.
+        assert_eq!(rate(IncidentClass::Kernel, 1, 32, 60.0, 300), Severity::Medium);
+        assert_eq!(rate(IncidentClass::Kernel, 16, 32, 60.0, 300), Severity::High);
+        // The crackle rule is about the one core audio runs on, so breadth does not soften it.
+        assert_eq!(rate(IncidentClass::Kernel, 1, 32, 6.0, 400), Severity::High);
+        // No core at all for a normal thread is PC-wide by definition; unknown counts stay whole.
+        assert_eq!(breadth(IncidentClass::Starvation, 0, 32), 1.0);
+        assert_eq!(breadth(IncidentClass::Kernel, 1, 0), 1.0);
+        assert_eq!(breadth(IncidentClass::Kernel, 1, 8), 0.5);
     }
 
     #[test]

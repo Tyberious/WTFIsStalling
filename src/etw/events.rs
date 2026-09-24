@@ -259,7 +259,13 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
             st.total += dur;
             st.max = st.max.max(dur);
             if file != 0 {
-                add_wait(&mut inner.file_wait, file, disk, dur);
+                // Per file, with the issuing process alongside (see `DiskFileWait`), so the report
+                // can say which program waited on which file.
+                inner
+                    .file_wait
+                    .entry(file)
+                    .or_insert_with(|| DiskFileWait { wait: FileWait { disk, ..FileWait::default() }, by_pid: Vec::new() })
+                    .add(pid, dur);
                 cap_by_wait(&mut inner.file_wait, FILE_WAIT_CAP);
             }
             if dur >= shared.io_warn {
@@ -507,14 +513,15 @@ mod tests {
         let io = inner.ios.back().expect("request recorded");
         assert_eq!((io.file, io.disk, io.op), (FILE_KEY, 1, b'R'));
         assert_eq!(inner.file_names.get(FILE_KEY), Some("\\Device\\HarddiskVolume3\\pagefile.sys"));
-        let w = inner.file_wait[&FILE_KEY];
+        let w = inner.file_wait[&FILE_KEY].wait;
         assert_eq!((w.disk, w.count, w.total), (1, 1, 300_000));
+        assert_eq!(inner.file_wait[&FILE_KEY].by_pid, vec![PidWait { pid: PID_UNKNOWN, count: 1, total: 300_000 }]);
         // The rundown at the end of the trace carries the same shape and a FileKey instead.
         handle(&sh, &mut inner, GUID_FILEIO, 36, 200, 0, &name_payload(7, "\\Device\\HarddiskVolume3\\$Mft"));
         assert_eq!(inner.file_names.get(7), Some("\\Device\\HarddiskVolume3\\$Mft"));
         // Repeating the same name (which the kernel does) must not throw the tally away.
         handle(&sh, &mut inner, GUID_FILEIO, 0, 300, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
-        assert_eq!(inner.file_wait[&FILE_KEY].count, 1);
+        assert_eq!(inner.file_wait[&FILE_KEY].wait.count, 1);
     }
 
     /// IrpFlags @4 and ByteOffset @16 are kept, and --debug counts the flag values seen.
@@ -548,12 +555,12 @@ mod tests {
         let mut inner = sh.inner.lock().unwrap();
         handle(&sh, &mut inner, GUID_FILEIO, 32, 100, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\big.log"));
         handle(&sh, &mut inner, GUID_DISKIO, 11, 5_000, 0, &io_payload(1, 4096, FILE_KEY, 900_000, 9));
-        assert_eq!(inner.file_wait[&FILE_KEY].total, 900_000);
+        assert_eq!(inner.file_wait[&FILE_KEY].wait.total, 900_000);
 
         handle(&sh, &mut inner, GUID_FILEIO, 32, 6_000, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\other.dat"));
         assert!(!inner.file_wait.contains_key(&FILE_KEY), "the old tally went with the old name");
         handle(&sh, &mut inner, GUID_DISKIO, 11, 7_000, 0, &io_payload(1, 4096, FILE_KEY, 10, 9));
-        assert_eq!(inner.file_wait[&FILE_KEY].total, 10, "the new file starts from zero");
+        assert_eq!(inner.file_wait[&FILE_KEY].wait.total, 10, "the new file starts from zero");
         assert_eq!(inner.file_names.get(FILE_KEY), Some("\\Device\\HarddiskVolume3\\other.dat"));
     }
 
@@ -570,6 +577,33 @@ mod tests {
         let w = inner.fault_file[&(42, FILE_KEY)];
         assert_eq!((w.count, w.max), (3, 200));
         assert_eq!(inner.faults.back().unwrap().file, FILE_KEY);
+    }
+
+    /// Issue #19: the per-file tally says which process issued the requests, bounded per file so
+    /// a file every process touches cannot grow it; the file's own totals still count everything.
+    #[test]
+    fn disk_waits_are_totaled_per_file_with_the_issuing_processes() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        for (pid, tid) in (100u32..110).zip(200u32..210) {
+            let mut thread = pid.to_le_bytes().to_vec();
+            thread.extend(tid.to_le_bytes());
+            handle(&sh, &mut inner, GUID_THREAD, 3, 10, 0, &thread);
+        }
+        // Two processes (think: two copies of powershell.exe) reading one image file...
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 1_000, 0, &io_payload(0, 65536, FILE_KEY, 300, 200));
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 2_000, 0, &io_payload(0, 65536, FILE_KEY, 500, 201));
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 3_000, 0, &io_payload(0, 65536, FILE_KEY, 100, 200));
+        let f = &inner.file_wait[&FILE_KEY];
+        assert_eq!((f.wait.count, f.wait.total), (3, 900));
+        assert_eq!(f.by_pid, vec![PidWait { pid: 100, count: 2, total: 400 }, PidWait { pid: 101, count: 1, total: 500 }]);
+        // ...and then every other process too: the list stops growing, the totals do not.
+        for tid in 202u32..210 {
+            handle(&sh, &mut inner, GUID_DISKIO, 10, 4_000, 0, &io_payload(0, 4096, FILE_KEY, 10, tid));
+        }
+        let f = &inner.file_wait[&FILE_KEY];
+        assert_eq!(f.by_pid.len(), FILE_WAIT_PIDS);
+        assert_eq!(f.wait.count, 11);
     }
 
     /// Flush events (DiskIo_TypeGroup3) have no FileObject field; nothing may be invented.

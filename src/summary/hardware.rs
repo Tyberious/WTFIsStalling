@@ -323,7 +323,7 @@ pub(super) fn cpu_throttling(cx: &mut Ctx) {
     let clock = cx.run.clock;
     let throttled: Vec<&ClockSample> = clock.iter().filter(|c| c.throttled()).collect();
     if throttled.len() >= 3.max(clock.len() / 20) {
-        let near = ms_to_ticks(1500.0);
+        let near = ms_to_ticks(crate::cpuclock::NEAR_MS);
         let hits = cx.az.incidents.iter().filter(|i| throttled.iter().any(|c| (c.ts - i.start).abs() <= near)).count();
         let share = throttled.len() as f64 / clock.len() as f64;
         let sev = if share >= 0.3 || (hits >= 2 && hits * 2 >= cx.az.incidents.len()) { Severity::High } else { Severity::Medium };

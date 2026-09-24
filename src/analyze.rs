@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
 use crate::diskstuck::{self, DiskBehind};
-use crate::diskwait::{self, Role};
+use crate::diskwait::{self, DiskWait, Role};
 use crate::diskwhy::{self, Cause, DiskWhy};
 use crate::files::{self, DosMap};
 use crate::gputrace::{GpuTrace, GpuWindow, MarkGpu};
@@ -153,6 +153,20 @@ pub(crate) struct IncidentSummary {
     pub(crate) on_cpu: Option<String>,
     /// Set on a `Freeze`; what the interrupt records say about it.
     pub(crate) freeze: Option<FreezeFacts>,
+    /// Set on a CPU-starvation stall where one or a few cores were busy while the others idled:
+    /// what held the (first) busy one. Context, never the culprit; see `pegged_cores`.
+    pub(crate) busy_core: Option<CoreHolder>,
+}
+
+/// What kept one busy core busy, as far as its CPU samples say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CoreHolder {
+    /// A process label ("SignalRgb.exe (32468)"), which held most of that core's samples.
+    Program(String),
+    /// A driver whose DPC/ISR code the samples on that core mostly landed in.
+    Driver(String),
+    /// Busy, but no single program or driver held most of it.
+    Unnamed,
 }
 
 /// Share of a stall's CPU samples one process must hold before the report will say the driver was
@@ -263,6 +277,10 @@ pub struct Analyzer {
     pub(crate) disk_split: HashMap<u32, SplitTotals>,
     /// Each disk's address on its storage port, read once (see `disks::scsi_address`).
     scsi_addrs: HashMap<u32, Option<ScsiAddr>>,
+    /// The once-a-second CPU clock samples, for "the processor was throttled at the time".
+    clock: Option<crate::cpuclock::Samples>,
+    /// Memory in use right now, %; `None` where it must not be read (tests).
+    mem_load: fn() -> Option<u32>,
 }
 
 /// Everything ETW recorded around one incident, copied out so the lock is held briefly.
@@ -365,6 +383,8 @@ impl Analyzer {
             storport: None,
             disk_split: HashMap::new(),
             scsi_addrs: HashMap::new(),
+            clock: None,
+            mem_load: || Some(crate::util::memory_load()),
         }
     }
 
@@ -423,11 +443,13 @@ impl Analyzer {
             storport: None,
             disk_split: HashMap::new(),
             scsi_addrs: HashMap::new(),
+            clock: None,
+            mem_load: || None,
         }
     }
 
     /// Logical CPUs on this PC, or 0 when the topology was never read (tests).
-    fn ncpu(&self) -> usize {
+    pub(crate) fn ncpu(&self) -> usize {
         self.topo.total()
     }
 
@@ -627,6 +649,7 @@ impl Analyzer {
 
         let mut freeze = None;
         let mut on_cpu = None;
+        let mut busy_core = None;
         let culprit = match class {
             IncidentClass::Freeze => {
                 let (culprit, mut facts) = self.verdict_freeze(kernel, &ev, ncpu, start, end);
@@ -639,9 +662,14 @@ impl Analyzer {
                 on_cpu = who;
                 culprit
             }
-            IncidentClass::Starvation => self.verdict_sched(&ev, start, end, &probes),
+            IncidentClass::Starvation => {
+                let (culprit, core) = self.verdict_sched(&ev, start, end, &probes);
+                busy_core = core;
+                culprit
+            }
         };
         self.print_io_context(&ev);
+        self.print_context(start, end);
         if let Some(w) = self.gpu_window(start - ms_to_ticks(100.0), end) {
             self.print_gpu(&w);
         }
@@ -653,7 +681,7 @@ impl Analyzer {
         if class == IncidentClass::Starvation {
             self.collect_waits(start - ms_to_ticks(100.0), end);
         }
-        self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, on_cpu, freeze });
+        self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, on_cpu, freeze, busy_core });
     }
 
     /// One `ProbeWindow` per late wake-up in this cluster, and the outcome of each.
@@ -710,7 +738,10 @@ impl Analyzer {
             }
             for (tid, prio, held) in v.instead.iter().take(3) {
                 let who = self.procs.label(self.pid_of(*tid), *tid);
-                say!("               Thread on that processor meanwhile: {who} (priority {prio}) for {}", fmt_dur(*held));
+                // The number stays; the band is added only where the documented ranges make it
+                // unambiguous (see `switches::priority_band`).
+                let band = switches::priority_band(*prio).map(|b| format!(": {b}")).unwrap_or_default();
+                say!("               Thread on that processor meanwhile: {who} (priority {prio}{band}) for {}", fmt_dur(*held));
             }
             if class != IncidentClass::Starvation {
                 say!("               No thread outranks a measuring thread, so what kept it off is interrupt-level work (a DPC or");
@@ -915,6 +946,7 @@ impl Analyzer {
         self.print_probes(&probes, IncidentClass::Kernel);
         let (culprit, on_cpu) = self.verdict_kernel(&cluster, &ev, &probes);
         self.print_io_context(&ev);
+        self.print_context(start, end);
         // The whole window the person flagged, not just the worst interruption in it: a hitch
         // someone feels is usually a program waiting, not a processor being held.
         self.collect_waits(from, to);
@@ -931,7 +963,20 @@ impl Analyzer {
             cpus,
             on_cpu,
             freeze: None,
+            busy_core: None,
         });
+    }
+
+    /// Throttling and memory pressure at the time of an incident, as one "Context:" line, and
+    /// only when either was present. Facts: coinciding is not causing.
+    fn print_context(&self, start: i64, end: i64) {
+        let throttled = self.clock.as_ref().and_then(|c| {
+            let samples = c.lock().unwrap_or_else(|e| e.into_inner());
+            crate::cpuclock::throttled_clause(&samples, start, end)
+        });
+        if let Some(line) = context_line(throttled, (self.mem_load)()) {
+            say!("{line}");
+        }
     }
 
     /// The three worst programs kept waiting, for the event-log entry of a flagged moment.
@@ -958,6 +1003,11 @@ impl Analyzer {
     /// Records the graphics-kernel trace to read alongside the kernel one.
     pub fn set_gpu_trace(&mut self, trace: Arc<GpuTrace>) {
         self.gputrace = Some(trace);
+    }
+
+    /// The CPU clock samples, so an incident can say whether the processor was throttled then.
+    pub fn set_cpu_clock(&mut self, samples: crate::cpuclock::Samples) {
+        self.clock = Some(samples);
     }
 
     /// Records the storage port driver's trace to read alongside the kernel one.
@@ -1147,15 +1197,39 @@ impl Analyzer {
 
     /// Returns the culprit, and the program that held the CPU through the stall when one clearly
     /// did. See `IncidentSummary::on_cpu`.
+    ///
+    /// A kernel-level stall gets the same three checks a whole-PC freeze always had (issue #19):
+    /// whether a slow disk request or the measuring thread's own hard page fault covered it
+    /// (`diskwait`), which interrupt sources kept arriving and which went silent, and whether the
+    /// timer DPCs that wake sleeping threads kept their usual rate (`continuity`). They add facts
+    /// to the event log. The verdict only changes where one of them changes the conclusion: the
+    /// measuring thread was itself waiting on a page fault, or no processor was held AND the timer
+    /// DPCs stopped.
     fn verdict_kernel(&mut self, stalls: &[Stall], ev: &Evidence, probes: &ProbeVerdict) -> (String, Option<String>) {
         let look = self.look(stalls, ev);
         let cpus = look.per_cpu.len();
+        let (start, end) = span_of(stalls);
         // Ordinary DPCs running right through the stall on most of the stalled CPUs means no CPU
         // was held at raised IRQL. Nothing below may then blame what a sample happened to land in.
         let could_be_held = look.held_share >= 0.5;
         let enough_samples = look.samples >= MIN_SAMPLES;
+        let (silent, continued, timer) = self.continuity(ev, start, end);
+        let own = self.probe_paging(stalls, ev);
+        // Only requests slow enough to be findings of their own: a 3 ms read that happens to overlap
+        // a 5 ms stall is ordinary traffic, not a coincidence worth a line.
+        let slow_ios: Vec<IoRec> = ev.ios.iter().filter(|i| i.dur >= self.shared.io_warn).copied().collect();
+        let wait = diskwait::explain(start, end, &slow_ios, &own.faults, own.pid);
+        // The measuring thread was not runnable at all: it was waiting for its own code or data to
+        // come back from disk. On at least half the stalled CPUs, like the driver rule in `look`.
+        let paging = own.cpus > 0 && own.cpus >= stalls.len().div_ceil(2);
 
-        let culprit = if let Some((module, on)) = &look.blame {
+        let culprit = if paging {
+            let where_ = if cpus > 1 { format!(" on {} of the {cpus} stalled CPUs", own.cpus) } else { String::new() };
+            say!("    VERDICT: the measuring thread itself was waiting for its own memory to be read back from disk (a hard page");
+            say!("             fault) for most of this{where_}, so nothing held the processor. That is paging, and any");
+            say!("             program in the same position waits the same way.");
+            "waiting on paging".to_string()
+        } else if let Some((module, on)) = &look.blame {
             let what = self.modules.describe_short(module);
             let where_ = if cpus > 1 { format!(" on {on} of the {cpus} stalled CPUs") } else { String::new() };
             say!("    VERDICT: {module} [{what}] kept the CPU in DPC/ISR code for most of the stall{where_}");
@@ -1192,6 +1266,13 @@ impl Analyzer {
             say!("    VERDICT: no CPU was held. Ordinary DPCs kept executing on the stalled CPU(s) right through this, which cannot");
             say!("             happen at raised IRQL, so the measuring thread was simply not woken: timer delivery or scheduling.");
             say!("             Whatever the CPU samples landed in was interrupted too, and is not the cause.");
+            // The one check that narrows "timer delivery or scheduling" down: the clock's own
+            // DPCs stopping everywhere. Kept going proves nothing about this thread's timer, so
+            // that case leaves the verdict alone and is only listed with the facts below.
+            if timer == Some(Flow::Silent) {
+                say!("             Timer DPCs (how the clock wakes sleeping threads) stopped across the PC during it, which points at");
+                say!("             timer delivery rather than scheduling.");
+            }
             // The scheduler trace says which of the two it was, when it can.
             not_woken_culprit(probes, "not woken (timers or scheduling)")
         } else {
@@ -1214,6 +1295,17 @@ impl Analyzer {
             "unexplained".to_string()
         };
 
+        for line in flow_lines("stall", &silent, &continued, timer) {
+            say!("{line}");
+        }
+        // The page fault is already the verdict; saying it again as a coincidence adds nothing.
+        if let Some(w) = wait.filter(|w| !(paging && w.disk.is_none())) {
+            let disk = w.disk.map(|d| self.disks.get(d).short());
+            for line in coincided_lines("stall", false, &w, disk.as_deref(), start) {
+                say!("{line}");
+            }
+        }
+
         // Who the CPU was actually running, whatever the verdict was. "Idle" is the processor
         // having nothing to do, and the tool's own process is already filtered out upstream.
         let on_cpu = look
@@ -1225,6 +1317,26 @@ impl Analyzer {
         self.print_routines(&look);
         self.print_on_cpu(&look.on_cpu_procs, &look.on_cpu_mods);
         (culprit, on_cpu)
+    }
+
+    /// Hard page faults taken by the measuring threads of the stalled CPUs, and on how many of
+    /// those CPUs such a fault covered at least half the stall (`diskwait`'s own bar).
+    fn probe_paging(&self, stalls: &[Stall], ev: &Evidence) -> ProbePaging {
+        let threads = self.probe_tids.all();
+        let (mut faults, mut cpus) = (Vec::new(), 0);
+        for s in stalls {
+            let Some(t) = s.cpu.and_then(|c| threads.iter().find(|t| t.cpu == Some(c))) else { continue };
+            let mine: Vec<FaultRec> = ev.faults.iter().filter(|f| f.tid == t.tid).copied().collect();
+            let mut spans: Vec<(i64, i64)> =
+                mine.iter().map(|f| (f.start.max(s.start), f.end.min(s.end))).filter(|(from, to)| to > from).collect();
+            if union_len(&mut spans) as f64 >= (s.end - s.start).max(1) as f64 * PAGING_COVER {
+                cpus += 1;
+            }
+            faults.extend(mine);
+        }
+        // Every fault here is a measuring thread's, so their process is the probes' own.
+        let pid = faults.first().map_or(0, |f| f.pid);
+        ProbePaging { faults, pid, cpus }
     }
 
     /// The whole machine stopped. Whatever the CPU samples landed in was stopped with it, so
@@ -1262,24 +1374,8 @@ impl Analyzer {
         // Which interrupt sources stopped and which carried on. This is the closest a CPU-side
         // trace gets to watching a bus or a controller stall.
         let (silent, continued, timer) = self.continuity(ev, start, end);
-        let say_list = |v: &[(String, f64)]| {
-            v.iter().map(|(n, s)| format!("{n} ({:.0}% of its usual rate)", s * 100.0)).collect::<Vec<_>>().join(", ")
-        };
-        if !silent.is_empty() {
-            say!("    Interrupt sources that STOPPED during the freeze: {}", say_list(&silent));
-        }
-        if !continued.is_empty() {
-            say!("    Interrupt sources that kept going:                {}", say_list(&continued));
-        }
-        if let Some(flow) = timer {
-            say!(
-                "    Timer DPCs (the clock that wakes threads): {}",
-                match flow {
-                    Flow::Silent => "stopped",
-                    Flow::Reduced => "well down",
-                    Flow::Continued => "unchanged",
-                }
-            );
+        for line in flow_lines("freeze", &silent, &continued, timer) {
+            say!("{line}");
         }
         facts.silent = silent;
         facts.continued = continued;
@@ -1293,32 +1389,9 @@ impl Analyzer {
         let own = std::process::id();
         if let Some(w) = diskwait::explain(start, end, &ev.ios, &ev.faults, own) {
             let woke = w.disk.is_some_and(|d| self.disk_why.get(&d).is_some_and(|why| why.count(Cause::WokeUp) > 0));
-            match (w.disk, w.role) {
-                (Some(d), Role::Trigger) => {
-                    say!(
-                        "    Coincided with: a {} request to {} that was already outstanding {} before the freeze began and ended",
-                        op_name(w.op),
-                        self.disks.get(d).short(),
-                        fmt_dur((start - (w.io_end - w.waited)).max(0))
-                    );
-                    say!("                    with it ({} in all). Correlation, not proof.", fmt_dur(w.waited));
-                }
-                (Some(d), Role::Victim) => {
-                    say!(
-                        "    Coincided with: a {} {} request to {}, which began after the freeze had already started,",
-                        fmt_dur(w.waited),
-                        op_name(w.op),
-                        self.disks.get(d).short()
-                    );
-                    say!("                    so the freeze is what made it slow, not the other way round.");
-                }
-                (Some(d), Role::Overlap) => say!(
-                    "    Coincided with: a {} {} request to {} that overlapped it. Correlation, not proof.",
-                    fmt_dur(w.waited),
-                    op_name(w.op),
-                    self.disks.get(d).short()
-                ),
-                (None, _) => say!("    Coincided with: this tool's own thread waiting {} for memory from disk", fmt_dur(w.waited)),
+            let disk = w.disk.map(|d| self.disks.get(d).short());
+            for line in coincided_lines("freeze", true, &w, disk.as_deref(), start) {
+                say!("{line}");
             }
             facts.coincided = Some(Coincided { disk: w.disk, role: w.role, waited: w.waited, woke });
         }
@@ -1389,15 +1462,21 @@ impl Analyzer {
         (silent, continued, intr::flow(&timer_reference, timer_in, stall_s).map(|(f, _)| f))
     }
 
-    fn verdict_sched(&mut self, ev: &Evidence, start: i64, end: i64, probes: &ProbeVerdict) -> String {
+    /// Returns the culprit, and what held the busy core when one or a few cores were busy while
+    /// the rest idled (see `pegged_cores`).
+    fn verdict_sched(&mut self, ev: &Evidence, start: i64, end: i64, probes: &ProbeVerdict) -> (String, Option<CoreHolder>) {
         let all: Vec<&(SampleRec, u32)> = ev.samples.iter().collect();
         let (procs, mods) = self.sample_breakdown(&all);
-        let idle = procs.iter().find(|(p, _)| p == "Idle").map(|(_, s)| *s).unwrap_or(0.0);
+        // Idle with interrupt-level time taken out. A DPC or ISR that runs on an idle processor
+        // interrupts the idle thread, so the profiler used to count that time as idle (issue #19).
+        let loads = core_loads(&ev.samples, &ev.execs);
+        let idle = idle_share(&loads);
         let busy: Vec<_> = procs.iter().filter(|(p, _)| p != "Idle").cloned().collect();
+        let saturated = idle < 0.25;
         let culprit = if !self.profile || all.is_empty() {
             say!("    VERDICT: all CPUs were busy, but CPU sampling is unavailable so the process can't be named");
             "CPU starvation (unattributed)".to_string()
-        } else if idle < 0.25 {
+        } else if saturated {
             let (top, share) = busy.first().cloned().unwrap_or(("?".into(), 0.0));
             say!(
                 "    VERDICT: CPUs were saturated ({:.0}% busy). Biggest consumer: {top} with {:.0}% of all CPU time",
@@ -1437,8 +1516,86 @@ impl Analyzer {
             );
             not_woken_culprit(probes, "scheduling delay with idle CPUs")
         };
+        // An average over every CPU hides one core pegged on an otherwise idle PC. Said as a fact:
+        // nothing in this trace shows whether the waiting thread was limited to that core, so the
+        // report does not suggest it was.
+        let mut holder = None;
+        if self.profile && !saturated {
+            if let Some(p) = pegged_cores(&loads) {
+                let (line, first) = self.pegged_line(&p, ev);
+                say!("{line}");
+                holder = Some(first);
+            }
+        }
         self.print_on_cpu(&busy, &mods);
-        culprit
+        (culprit, holder)
+    }
+
+    /// "    One core was busy while the others idled: CPU 3 was 97% busy (mostly X); the other 7
+    /// were 91% idle.", and what held the first of the busy cores.
+    fn pegged_line(&mut self, p: &Pegged, ev: &Evidence) -> (String, CoreHolder) {
+        let mut parts = Vec::new();
+        let mut first = None;
+        for (cpu, busy) in &p.cores {
+            let holder = self.core_holder(*cpu, ev);
+            let mostly = match &holder {
+                CoreHolder::Program(label) => format!(" (mostly {label})"),
+                CoreHolder::Driver(module) => format!(" (mostly DPC/ISR code in {module})"),
+                CoreHolder::Unnamed => String::new(),
+            };
+            parts.push(format!("CPU {} was {:.0}% busy{mostly}", self.cpu_label(*cpu), busy * 100.0));
+            first.get_or_insert(holder);
+        }
+        let head = if p.cores.len() == 1 {
+            "One core was busy while the others idled".to_string()
+        } else {
+            format!("{} cores were busy while the others idled", p.cores.len())
+        };
+        let line = format!("    {head}: {}; the other {} were {:.0}% idle.", parts.join(", "), p.others, p.others_idle * 100.0);
+        (line, first.unwrap_or(CoreHolder::Unnamed))
+    }
+
+    /// What one core's samples in this window mostly landed in: a driver's DPC/ISR code, a
+    /// program, or nothing in particular. Same bar as the verdicts (`SHARE_RULE`).
+    fn core_holder(&mut self, cpu: u16, ev: &Evidence) -> CoreHolder {
+        let on: Vec<&(SampleRec, u32)> = ev.samples.iter().filter(|(s, _)| s.cpu == cpu).collect();
+        let (Some(from), Some(to)) = (on.iter().map(|(s, _)| s.ts).min(), on.iter().map(|(s, _)| s.ts).max()) else {
+            return CoreHolder::Unnamed;
+        };
+        let spans = merged_spans(&ev.execs, cpu);
+        let n = on.len() as f64;
+        let mut interrupt = 0usize;
+        let mut by_thread: HashMap<(u32, u32), usize> = HashMap::new();
+        for (s, pid) in &on {
+            if in_spans(&spans, s.ts) {
+                interrupt += 1;
+            } else if s.tid != 0 {
+                *by_thread.entry((*pid, if *pid == PID_UNKNOWN { s.tid } else { 0 })).or_default() += 1;
+            }
+        }
+        if interrupt as f64 >= n * SHARE_RULE {
+            let mut by_module: HashMap<String, i64> = HashMap::new();
+            for e in ev.execs.iter().filter(|e| e.cpu == cpu) {
+                let overlap = e.end.min(to) - e.start.max(from);
+                if overlap > 0 {
+                    *by_module.entry(self.modules.name(e.routine)).or_default() += overlap;
+                }
+            }
+            return by_module
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map_or(CoreHolder::Unnamed, |(m, _)| CoreHolder::Driver(m));
+        }
+        let mut named: HashMap<String, usize> = HashMap::new();
+        for ((pid, tid), k) in by_thread {
+            *named.entry(self.procs.label(pid, tid)).or_default() += k;
+        }
+        let own = own_exe();
+        named
+            .into_iter()
+            .filter(|(label, k)| *k as f64 >= n * SHARE_RULE && !own.as_ref().is_some_and(|o| label.to_lowercase().starts_with(o)))
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .map_or(CoreHolder::Unnamed, |(label, _)| CoreHolder::Program(label))
     }
 
     /// Returns (share by process, share of kernel-mode samples by module), biggest first.
@@ -1953,6 +2110,195 @@ fn op_name(op: u8) -> &'static str {
     }
 }
 
+/// A measuring thread's own hard page fault has to cover this much of its stall before the stall
+/// is put down to paging: the same bar `diskwait` uses for a disk request.
+const PAGING_COVER: f64 = 0.5;
+
+/// The measuring threads' own hard page faults around a kernel-level stall; see `probe_paging`.
+struct ProbePaging {
+    faults: Vec<FaultRec>,
+    /// Their process (the probes' own), or 0 when there were none.
+    pid: u32,
+    /// Stalled CPUs whose measuring thread spent at least `PAGING_COVER` of the stall in a fault.
+    cpus: usize,
+}
+
+/// The event-log lines saying which interrupt sources stopped and which kept going during a
+/// stall or freeze, and what the timer DPCs did. `what` is "freeze" or "stall"; the freeze's
+/// lines are exactly what they always were.
+fn flow_lines(what: &str, silent: &[(String, f64)], continued: &[(String, f64)], timer: Option<Flow>) -> Vec<String> {
+    let say_list =
+        |v: &[(String, f64)]| v.iter().map(|(n, s)| format!("{n} ({:.0}% of its usual rate)", s * 100.0)).collect::<Vec<_>>().join(", ");
+    let stopped = format!("    Interrupt sources that STOPPED during the {what}: ");
+    let mut out = Vec::new();
+    if !silent.is_empty() {
+        out.push(format!("{stopped}{}", say_list(silent)));
+    }
+    if !continued.is_empty() {
+        out.push(format!("{:<width$}{}", "    Interrupt sources that kept going:", say_list(continued), width = stopped.len()));
+    }
+    if let Some(flow) = timer {
+        let said = match flow {
+            Flow::Silent => "stopped",
+            Flow::Reduced => "well down",
+            Flow::Continued => "unchanged",
+        };
+        out.push(format!("    Timer DPCs (the clock that wakes threads): {said}"));
+    }
+    out
+}
+
+/// The "Coincided with:" lines for a slow disk request (or the measuring thread's own page
+/// fault) overlapping a stall. `disk` is the drive's short name. Only a whole-PC freeze may say a
+/// request inside it was MADE slow by it: that stops every processor its answer could arrive on,
+/// while a stall on some of them does not.
+fn coincided_lines(what: &str, whole_pc: bool, w: &DiskWait, disk: Option<&str>, start: i64) -> Vec<String> {
+    let Some(disk) = disk.filter(|_| w.disk.is_some()) else {
+        return vec![format!("    Coincided with: this tool's own thread waiting {} for memory from disk", fmt_dur(w.waited))];
+    };
+    let (waited, op) = (fmt_dur(w.waited), op_name(w.op));
+    match w.role {
+        Role::Trigger => vec![
+            format!(
+                "    Coincided with: a {op} request to {disk} that was already outstanding {} before the {what} began and ended",
+                fmt_dur((start - (w.io_end - w.waited)).max(0))
+            ),
+            format!("                    with it ({waited} in all). Correlation, not proof."),
+        ],
+        Role::Victim if whole_pc => vec![
+            format!("    Coincided with: a {waited} {op} request to {disk}, which began after the {what} had already started,"),
+            format!("                    so the {what} is what made it slow, not the other way round."),
+        ],
+        Role::Victim => vec![
+            format!("    Coincided with: a {waited} {op} request to {disk}, which began after the {what} had already started and"),
+            "                    ended with it. Correlation, not proof.".to_string(),
+        ],
+        Role::Overlap => vec![format!("    Coincided with: a {waited} {op} request to {disk} that overlapped it. Correlation, not proof.")],
+    }
+}
+
+/// "    Context: ..." for one incident: throttling (see `cpuclock::throttled_clause`) and memory
+/// pressure, one short clause each and only when present. Memory is read when the incident is
+/// examined, a fraction of a second to a few seconds after it, and the line says so.
+fn context_line(throttled: Option<String>, mem_load: Option<u32>) -> Option<String> {
+    let mut parts: Vec<String> = throttled.into_iter().collect();
+    if let Some(load) = mem_load.filter(|l| *l >= crate::util::MEMORY_TIGHT_PCT) {
+        parts.push(format!("memory was {load}% in use when this was examined"));
+    }
+    (!parts.is_empty()).then(|| format!("    Context: {}.", parts.join("; ")))
+}
+
+/// This executable's file name, lowercased: its own threads are what gets interrupted, never a
+/// cause.
+fn own_exe() -> Option<String> {
+    std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()))
+}
+
+/// One logical CPU's profiler samples in a window, split three ways.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CoreLoad {
+    cpu: u16,
+    samples: u32,
+    /// The idle thread with no DPC or ISR running: the processor really had nothing to do.
+    idle: u32,
+    /// Inside a DPC or ISR on that processor, whichever thread it interrupted.
+    interrupt: u32,
+}
+
+impl CoreLoad {
+    fn busy(&self) -> f64 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            1.0 - f64::from(self.idle) / f64::from(self.samples)
+        }
+    }
+}
+
+/// One CPU's DPC/ISR spans, merged into sorted, disjoint intervals (ISRs nest inside DPCs).
+fn merged_spans(execs: &[ExecRec], cpu: u16) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = execs.iter().filter(|e| e.cpu == cpu).map(|e| (e.start, e.end)).collect();
+    spans.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (from, to) in spans {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+fn in_spans(spans: &[(i64, i64)], ts: i64) -> bool {
+    let i = spans.partition_point(|s| s.0 <= ts);
+    i > 0 && spans[i - 1].1 >= ts
+}
+
+/// Per CPU: how many samples, how many were really idle, how many landed in interrupt-level code.
+/// The profiler attributes a sample to whatever thread was current, so a DPC running on an idle
+/// processor shows up as the idle thread; the DPC/ISR records say when that was.
+fn core_loads(samples: &[(SampleRec, u32)], execs: &[ExecRec]) -> Vec<CoreLoad> {
+    let mut by_cpu: HashMap<u16, (Vec<(i64, i64)>, CoreLoad)> = HashMap::new();
+    for (s, _) in samples {
+        let (spans, load) =
+            by_cpu.entry(s.cpu).or_insert_with(|| (merged_spans(execs, s.cpu), CoreLoad { cpu: s.cpu, ..CoreLoad::default() }));
+        load.samples += 1;
+        if in_spans(spans, s.ts) {
+            load.interrupt += 1;
+        } else if s.tid == 0 {
+            load.idle += 1;
+        }
+    }
+    let mut out: Vec<CoreLoad> = by_cpu.into_values().map(|(_, l)| l).collect();
+    out.sort_by_key(|l| l.cpu);
+    out
+}
+
+/// Share of all samples in which the processor really had nothing to do.
+fn idle_share(loads: &[CoreLoad]) -> f64 {
+    let samples: u32 = loads.iter().map(|l| l.samples).sum();
+    if samples == 0 {
+        return 0.0;
+    }
+    f64::from(loads.iter().map(|l| l.idle).sum::<u32>()) / f64::from(samples)
+}
+
+/// A core this busy in the window was pegged: at most one sample in ten found it idle.
+const PEGGED_BUSY: f64 = 0.9;
+/// ...and the cores that were not have to have been idle at least this much on average, or it is
+/// a busy PC rather than one busy core.
+const OTHERS_IDLE: f64 = 0.5;
+
+/// One or a few cores pegged while the rest idled.
+#[derive(Clone, Debug, PartialEq)]
+struct Pegged {
+    /// (CPU, busy share), busiest first.
+    cores: Vec<(u16, f64)>,
+    /// How many other CPUs were judged, and their idle share together.
+    others: usize,
+    others_idle: f64,
+}
+
+/// "One or a few" is at most a quarter of the CPUs that could be judged (at least one), so a PC
+/// with most of its cores busy is not described as having one busy core. Only CPUs with at
+/// least `MIN_SAMPLES` samples are judged at all; a CPU with none (parked, or not sampled) is left
+/// out rather than counted as idle. Rules of thumb, stated in the README.
+fn pegged_cores(loads: &[CoreLoad]) -> Option<Pegged> {
+    let judged: Vec<&CoreLoad> = loads.iter().filter(|l| l.samples as usize >= MIN_SAMPLES).collect();
+    let (hot, rest): (Vec<&CoreLoad>, Vec<&CoreLoad>) = judged.iter().partition(|l| l.busy() >= PEGGED_BUSY);
+    if hot.is_empty() || rest.is_empty() || hot.len() > (judged.len() / 4).max(1) {
+        return None;
+    }
+    let (samples, idle) = rest.iter().fold((0u32, 0u32), |(s, i), l| (s + l.samples, i + l.idle));
+    let others_idle = f64::from(idle) / f64::from(samples.max(1));
+    if others_idle < OTHERS_IDLE {
+        return None;
+    }
+    let mut cores: Vec<(u16, f64)> = hot.iter().map(|l| (l.cpu, l.busy())).collect();
+    cores.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    Some(Pegged { cores, others: rest.len(), others_idle })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2264,14 +2610,14 @@ mod tests {
     fn sched_without_profiling_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(500, "app.exe")]), false);
         let ev = evidence(vec![], vec![sample(0, 1.0, USER_IP, 500)], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()).0, "CPU starvation (unattributed)");
     }
 
     #[test]
     fn sched_with_no_samples_is_unattributed() {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         let ev = evidence(vec![], vec![], HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "CPU starvation (unattributed)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()).0, "CPU starvation (unattributed)");
     }
 
     #[test]
@@ -2281,7 +2627,7 @@ mod tests {
         let mut samples: Vec<(SampleRec, u32)> = (0..8).map(|i| sample(0, i as f64, USER_IP, 500)).collect();
         samples.extend((0..2).map(|i| sample(0, i as f64, USER_IP, 0))); // Idle: 2/10 = 20% < 25%
         let ev = evidence(vec![], samples, HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()), "process app.exe (500)");
+        assert_eq!(az.verdict_sched(&ev, 0, ms(30.0), &no_probes()).0, "process app.exe (500)");
     }
 
     /// A late wake-up with idle CPUs is not "a scheduling quirk, ignore it": when a disk request
@@ -2297,7 +2643,7 @@ mod tests {
             s
         };
         let mut ev = evidence(vec![], idle_samples(), HashMap::new());
-        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "scheduling delay with idle CPUs");
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()).0, "scheduling delay with idle CPUs");
 
         ev.ios = vec![IoRec {
             end: ms(1883.0),
@@ -2312,7 +2658,7 @@ mod tests {
             offset: 0,
             irp_flags: 0,
         }];
-        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "disk 5");
+        assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()).0, "disk 5");
     }
 
     // --- the twin merge --------------------------------------------------------------------
@@ -2627,5 +2973,220 @@ mod tests {
         let (_, facts) = az.verdict_freeze(&stalls, &ev, 8, 0, ms(900.0));
         assert!(facts.silent.iter().any(|(s, _)| s == "Wdf01000.sys"), "{:?}", facts.silent);
         assert!(facts.continued.iter().any(|(s, _)| s == "dxgkrnl.sys"), "{:?}", facts.continued);
+    }
+
+    // --- issue #19: the freeze checks on kernel-level stalls ---------------------------------
+
+    /// The freeze's event-log lines are built by the helpers now shared with kernel-level stalls.
+    /// These are the exact strings the freeze printed before the helpers existed.
+    #[test]
+    fn the_freeze_lines_are_unchanged_by_the_shared_helpers() {
+        let silent = vec![("Wdf01000.sys".to_string(), 0.0)];
+        let continued = vec![("dxgkrnl.sys".to_string(), 0.68)];
+        assert_eq!(
+            flow_lines("freeze", &silent, &continued, Some(Flow::Silent)),
+            vec![
+                "    Interrupt sources that STOPPED during the freeze: Wdf01000.sys (0% of its usual rate)",
+                "    Interrupt sources that kept going:                dxgkrnl.sys (68% of its usual rate)",
+                "    Timer DPCs (the clock that wakes threads): stopped",
+            ]
+        );
+        assert!(flow_lines("freeze", &[], &[], None).is_empty());
+        let w = |disk, role, waited: f64, io_end: f64, op| DiskWait {
+            disk,
+            waited: ms(waited),
+            op,
+            own_fault: false,
+            role,
+            io_end: ms(io_end),
+        };
+        let start = ms(1000.0);
+        assert_eq!(
+            coincided_lines("freeze", true, &w(Some(6), Role::Trigger, 2100.0, 1900.0, b'W'), Some("disk 6 (I:)"), start),
+            vec![
+                "    Coincided with: a write request to disk 6 (I:) that was already outstanding 1200 ms before the freeze began and ended",
+                "                    with it (2100 ms in all). Correlation, not proof.",
+            ]
+        );
+        assert_eq!(
+            coincided_lines("freeze", true, &w(Some(5), Role::Victim, 878.0, 1887.0, b'W'), Some("disk 5"), start),
+            vec![
+                "    Coincided with: a 878 ms write request to disk 5, which began after the freeze had already started,",
+                "                    so the freeze is what made it slow, not the other way round.",
+            ]
+        );
+        assert_eq!(
+            coincided_lines("freeze", true, &w(Some(1), Role::Overlap, 900.0, 2500.0, b'R'), Some("disk 1"), start),
+            vec!["    Coincided with: a 900 ms read request to disk 1 that overlapped it. Correlation, not proof."]
+        );
+        assert_eq!(
+            coincided_lines("freeze", true, &w(None, Role::Victim, 880.0, 1882.0, b'R'), None, start),
+            vec!["    Coincided with: this tool's own thread waiting 880 ms for memory from disk"]
+        );
+        // A stall on some of the processors does not stop every path a request's answer could take,
+        // so it never says it made the request slow.
+        let kernel = coincided_lines("stall", false, &w(Some(5), Role::Victim, 878.0, 1887.0, b'W'), Some("disk 5"), start);
+        assert!(kernel.iter().all(|l| !l.contains("made it slow")), "{kernel:?}");
+        assert!(kernel.join(" ").contains("Correlation, not proof"), "{kernel:?}");
+    }
+
+    /// Steady Wdf01000 DPCs and timer DPCs for 5 s before, as in the field logs.
+    fn steady_reference() -> Vec<ExecRec> {
+        let mut r = Vec::new();
+        for i in 0..2500 {
+            r.push(dpc(0, -5000.0 + i as f64 * 2.0, 0.01, MOD_A + 0x10));
+            r.push(exec_rec(1, KIND_TIMER_DPC, -5000.0 + i as f64 * 2.0, 0.01, MOD_B + 0x10));
+        }
+        r
+    }
+
+    /// The field shape on a kernel-level stall that is not a whole-PC freeze: DPCs kept flowing on
+    /// the stalled CPU, the USB controller went quiet and so did the timer DPCs. The DPC-flow guard
+    /// still holds (no raised-IRQL claim) and the culprit is unchanged, so the tally is too; the
+    /// timer check only narrows the verdict's wording.
+    #[test]
+    fn a_kernel_stall_with_dpcs_flowing_gets_the_interrupt_and_timer_checks() {
+        let modules = ModuleMap::for_test(&[("Wdf01000.sys", MOD_A, 0x1000), ("ntoskrnl.exe", MOD_B, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[]), true);
+        let s = stall(3, 0.0, 400.0);
+        // Ordinary DPCs of another driver right through the stall on CPU 3; no Wdf01000, no timers.
+        let execs: Vec<ExecRec> = (0..400).map(|i| dpc(3, i as f64, 0.01, MOD_B + 0x20)).collect();
+        let mut ev = evidence(execs, vec![], HashMap::new());
+        ev.ref_execs = steady_reference();
+        ev.ref_seconds = 5.0;
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "not woken (timers or scheduling)");
+        let (silent, _, timer) = az.continuity(&ev, s.start, s.end);
+        assert!(silent.iter().any(|(n, _)| n == "Wdf01000.sys"), "{silent:?}");
+        assert_eq!(timer, Some(Flow::Silent));
+    }
+
+    /// A slow request that began after a kernel-level stall had started is reported as a
+    /// coincidence, but only a whole-PC freeze takes it off its drive's slow count.
+    #[test]
+    fn a_kernel_stall_never_marks_a_disk_request_as_its_victim() {
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), false);
+        let victim = IoRec {
+            end: ms(887.0),
+            dur: ms(878.0),
+            disk: 5,
+            tid: 1,
+            pid: 4,
+            size: 4096,
+            op: b'W',
+            file: 0,
+            irp: 0,
+            offset: 0,
+            irp_flags: 0,
+        };
+        az.disk_slow.insert(5, vec![SlowSeen { end: victim.end, dur: victim.dur, victim: false }]);
+        let mut ev = evidence(vec![], vec![], HashMap::new());
+        ev.ios = vec![victim];
+        let stalls = [stall(0, 0.0, 886.0), stall(1, 0.0, 886.0)];
+        assert_eq!(az.verdict_kernel(&stalls, &ev, &no_probes()).0, "unexplained", "a coincidence is not a culprit");
+        assert!(!az.disk_slow[&5][0].victim, "still counted against its drive");
+    }
+
+    /// The measuring thread itself took a hard page fault for most of the stall: nothing held the
+    /// processor, whatever the samples landed in.
+    #[test]
+    fn a_kernel_stall_where_the_measuring_thread_was_paging_is_put_down_to_paging() {
+        let modules = ModuleMap::for_test(&[("ntoskrnl.exe", MOD_A, 0x1000)]);
+        let mut az = Analyzer::for_test(modules, ProcNames::for_test(&[(4, "System (kernel threads)")]), false);
+        az.probe_tids.add(700, Some(2));
+        let s = stall(2, 0.0, 60.0);
+        // Samples that would otherwise read as "ntoskrnl.exe at raised IRQL".
+        let samples: Vec<(SampleRec, u32)> = (0..10).map(|i| sample(2, i as f64 * 5.0, MOD_A + 0x10, 4)).collect();
+        let mut ev = evidence(vec![], samples.clone(), HashMap::new());
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "driver ntoskrnl.exe");
+        ev.faults = vec![FaultRec { start: ms(1.0), end: ms(55.0), tid: 700, pid: 9000, bytes: 4096, file: 0 }];
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "waiting on paging");
+        // Another thread's fault, even in the same process, says nothing about this one.
+        ev.faults[0].tid = 701;
+        assert_eq!(az.verdict_kernel(&[s], &ev, &no_probes()).0, "driver ntoskrnl.exe");
+    }
+
+    // --- issue #19: one saturated core ------------------------------------------------------
+
+    /// A DPC running on an idle processor interrupts the idle thread; that time is not idle.
+    #[test]
+    fn interrupt_time_on_an_idle_core_is_not_counted_as_idle() {
+        let samples: Vec<(SampleRec, u32)> = (0..10).map(|i| sample(0, i as f64, KERNEL_SPACE + 0x10, 0)).collect();
+        let execs = vec![dpc(0, 0.0, 3.5, MOD_A), isr(0, 1.0, 0.5, MOD_B), dpc(0, 8.0, 0.5, MOD_A)];
+        let loads = core_loads(&samples, &execs);
+        assert_eq!(loads, vec![CoreLoad { cpu: 0, samples: 10, idle: 5, interrupt: 5 }]);
+        assert!((idle_share(&loads) - 0.5).abs() < 1e-9);
+        assert_eq!(merged_spans(&execs, 0), vec![(0, ms(3.5)), (ms(8.0), ms(8.5))], "nested spans merge");
+        assert_eq!(idle_share(&[]), 0.0);
+    }
+
+    fn load(cpu: u16, samples: u32, idle: u32) -> CoreLoad {
+        CoreLoad { cpu, samples, idle, interrupt: 0 }
+    }
+
+    #[test]
+    fn one_or_a_few_pegged_cores_are_told_from_a_busy_pc() {
+        // One of eight pegged, the rest ~90% idle.
+        let mut loads: Vec<CoreLoad> = (0..8).map(|c| load(c, 30, 27)).collect();
+        loads[3] = load(3, 30, 1);
+        let p = pegged_cores(&loads).expect("one pegged core");
+        assert_eq!((p.cores.len(), p.cores[0].0, p.others), (1, 3, 7));
+        assert!((p.others_idle - 0.9).abs() < 1e-9);
+        // Three of eight is more than "a few" (a quarter), and a PC where the rest are busy too
+        // is simply busy.
+        let mut three = loads.clone();
+        three[4] = load(4, 30, 0);
+        three[5] = load(5, 30, 0);
+        assert_eq!(pegged_cores(&three), None);
+        let busy: Vec<CoreLoad> = (0..8).map(|c| if c == 3 { load(c, 30, 0) } else { load(c, 30, 12) }).collect();
+        assert_eq!(pegged_cores(&busy), None);
+        // A core with too few samples is not judged at all, in either direction.
+        let mut thin = loads.clone();
+        thin[3] = load(3, 3, 0);
+        assert_eq!(pegged_cores(&thin), None);
+        // Exactly the bar: 9 of 10 busy is pegged.
+        let edge: Vec<CoreLoad> = vec![load(0, 10, 1), load(1, 10, 9)];
+        assert_eq!(pegged_cores(&edge).map(|p| p.cores[0].0), Some(0));
+        assert_eq!(pegged_cores(&[load(0, 30, 0)]), None, "one CPU has no others to idle");
+    }
+
+    /// A starvation stall on an otherwise idle 8-CPU PC with one core pegged by one program:
+    /// the average said "idle", and the report now also says which core was busy with what.
+    #[test]
+    fn a_starvation_stall_names_the_one_busy_core_and_what_held_it() {
+        let procs = ProcNames::for_test(&[(32468, "SignalRgb.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[("nvlddmkm.sys", MOD_A, 0x1000)]), procs, true);
+        az.topo = crate::topology::Topology::build(&[8], &[]);
+        let mut samples = Vec::new();
+        for cpu in 0..8u16 {
+            for i in 0..30 {
+                let pid = if cpu == 3 || i % 10 == 0 { 32468 } else { 0 };
+                samples.push(sample(cpu, i as f64, USER_IP, pid));
+            }
+        }
+        let ev = evidence(vec![], samples.clone(), HashMap::new());
+        let (culprit, holder) = az.verdict_sched(&ev, 0, ms(30.0), &no_probes());
+        assert_eq!(culprit, "scheduling delay with idle CPUs", "the culprit stays what the evidence supports");
+        assert_eq!(holder, Some(CoreHolder::Program("SignalRgb.exe (32468)".into())));
+
+        // The same core held by a driver's interrupt handling instead: the samples land in the idle
+        // thread, which the DPC records turn into "busy".
+        let idle_samples: Vec<(SampleRec, u32)> = samples.iter().map(|(s, _)| (SampleRec { tid: 0, ..*s }, 0)).collect();
+        let mut ev = evidence((0..30).map(|i| dpc(3, i as f64 - 0.1, 0.9, MOD_A + 0x10)).collect(), idle_samples, HashMap::new());
+        ev.execs.push(dpc(3, 29.0, 2.0, MOD_A + 0x10));
+        let (_, holder) = az.verdict_sched(&ev, 0, ms(30.0), &no_probes());
+        assert_eq!(holder, Some(CoreHolder::Driver("nvlddmkm.sys".into())));
+    }
+
+    // --- issue #19: per-incident context --------------------------------------------------------
+
+    #[test]
+    fn an_incident_states_throttling_and_memory_pressure_only_when_present() {
+        assert_eq!(context_line(None, Some(60)), None, "an ordinary amount of memory in use is not worth a line");
+        assert_eq!(context_line(None, None), None);
+        assert_eq!(context_line(None, Some(91)).as_deref(), Some("    Context: memory was 91% in use when this was examined."));
+        assert_eq!(
+            context_line(Some("the processor was being slowed down at the time".into()), Some(85)).as_deref(),
+            Some("    Context: the processor was being slowed down at the time; memory was 85% in use when this was examined.")
+        );
     }
 }

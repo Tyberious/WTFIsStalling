@@ -869,6 +869,7 @@ mod tests {
             cpus: vec![0],
             on_cpu: None,
             freeze: None,
+            busy_core: None,
         };
         az.incidents.push(flagged("CPU went dark (firmware SMI / hypervisor / interrupts off)"));
         az.incidents.push(flagged("unexplained"));
@@ -918,6 +919,7 @@ mod tests {
             cpus: Vec::new(),
             on_cpu: None,
             freeze: None,
+            busy_core: None,
         };
         for (i, pid) in [42216, 42980, 2308, 18996].into_iter().enumerate() {
             az.incidents.push(stall(&format!("process msedge.exe ({pid})"), 300 + i as i64));
@@ -1076,6 +1078,7 @@ mod tests {
                     probes: ProbeVerdict { late: 8, ..ProbeVerdict::default() },
                     ..FreezeFacts::default()
                 }),
+                busy_core: None,
             });
             // A short stall whose verdict came out of the switch trace.
             az.incidents.push(IncidentSummary {
@@ -1087,6 +1090,7 @@ mod tests {
                 cpus: vec![1],
                 on_cpu: None,
                 freeze: None,
+                busy_core: None,
             });
             let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
             az.summarize(RunData {
@@ -1320,6 +1324,7 @@ mod tests {
                         ProbeVerdict { queued: 8, on_idle_cpu: 8, ..ProbeVerdict::default() }
                     },
                 }),
+                busy_core: None,
             });
         }
         // The background layer: a network filter stalling one core every 60 s.
@@ -1333,6 +1338,7 @@ mod tests {
                 cpus: vec![5],
                 on_cpu: Some("iCUE.exe (4242)".into()),
                 freeze: None,
+                busy_core: None,
             });
         }
         // ...and a single 31 ms starvation stall, which used to be reported as HIGH.
@@ -1345,6 +1351,7 @@ mod tests {
             cpus: Vec::new(),
             on_cpu: None,
             freeze: None,
+            busy_core: None,
         });
 
         let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
@@ -1428,6 +1435,96 @@ mod tests {
         assert_eq!(crate::baseline::stable_key(&freeze.key), "whole-PC freeze");
         assert_eq!(freeze.metrics[0].label, "freezes per hour");
         assert!((freeze.metrics[0].value - 12.13).abs() < 0.1, "{:?}", freeze.metrics);
+    }
+
+    /// Issue #19: the DETAILS file table says which program waited on which file, two processes of
+    /// one program counted as copies of it, by image name only.
+    #[test]
+    fn the_file_table_says_which_program_waited_on_which_file() {
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use crate::state::{DiskFileWait, FileWait, PidWait};
+        use std::sync::atomic::AtomicBool;
+
+        let procs = ProcNames::for_test(&[(4100, "powershell.exe"), (4200, "powershell.exe"), (77, "steam.exe")]);
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), procs, true);
+        {
+            let mut inner = az.shared.inner.lock().unwrap();
+            inner.events = 1000;
+            inner.file_names.insert(0x10, "\\Device\\HarddiskVolume3\\Program Files\\Backup\\image.mrimg");
+            let by_pid = vec![
+                PidWait { pid: 4100, count: 20, total: ms_to_ticks(30_000.0) },
+                PidWait { pid: 4200, count: 18, total: ms_to_ticks(23_000.0) },
+                PidWait { pid: 77, count: 1, total: ms_to_ticks(5.0) },
+            ];
+            let wait = FileWait { disk: 0, count: 39, total: ms_to_ticks(53_005.0), max: ms_to_ticks(900.0) };
+            inner.file_wait.insert(0x10, DiskFileWait { wait, by_pid });
+        }
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
+        let summary = az.summarize(RunData {
+            elapsed_s: 300.0,
+            events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
+            storage_trace: Default::default(),
+        });
+        let details = summary.detail_lines();
+        let at = details.iter().position(|l| l.contains("image.mrimg")).expect("the file row");
+        assert_eq!(details[at + 1], "      by program: powershell.exe 2 copies, 53.0 s; steam.exe, 5.00 ms", "{details:?}");
+    }
+
+    /// Issue #19: starvation stalls with one core busy and the rest idle say so on their finding,
+    /// naming Windows' own parts as such and "System" not at all, and never as the culprit.
+    #[test]
+    fn a_busy_core_next_to_idle_ones_is_noted_on_the_finding() {
+        use crate::analyze::{CoreHolder, IncidentSummary};
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::AtomicBool;
+
+        let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+        let freq = crate::util::qpc_freq();
+        for (k, holder) in [CoreHolder::Program("SignalRgb.exe (32468)".into()), CoreHolder::Program("System (kernel threads)".into())]
+            .into_iter()
+            .enumerate()
+        {
+            az.incidents.push(IncidentSummary {
+                class: IncidentClass::Starvation,
+                start: qpc() - (100 + k as i64 * 30) * freq,
+                dur: ms_to_ticks(40.0),
+                culprit: "scheduling delay with idle CPUs".into(),
+                marked: false,
+                cpus: Vec::new(),
+                on_cpu: None,
+                freeze: None,
+                busy_core: Some(holder),
+            });
+        }
+        let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
+        let summary = az.summarize(RunData {
+            elapsed_s: 300.0,
+            events_lost: 0,
+            overhead: Overhead::default(),
+            light: None,
+            stats: &stats,
+            exec_warn: ms_to_ticks(1.0),
+            io_warn: ms_to_ticks(200.0),
+            clock: &[],
+            gpu: &GpuLog::default(),
+            gpu_trace: Default::default(),
+            storage_trace: Default::default(),
+        });
+        let f = summary.findings.iter().find(|f| f.key == "scheduling delay with idle CPUs").expect("the finding");
+        let said = f.evidence.join(" ");
+        assert!(said.contains("In 2 of these, one core (or a few) was busy while the others idled, busy with SignalRgb.exe."), "{said}");
+        assert!(!said.contains("System"), "{said}");
+        assert!(!summary.findings.iter().any(|f| f.title.starts_with("SignalRgb.exe")), "context, not a culprit");
     }
 
     #[test]

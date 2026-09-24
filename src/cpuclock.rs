@@ -36,6 +36,32 @@ impl ClockSample {
     }
 }
 
+/// A stall counts as happening "while throttled" when a throttled sample was taken this close to
+/// it. The clock is sampled once a second, so this is one sample either side with some slack.
+pub const NEAR_MS: f64 = 1500.0;
+
+/// What the clock samples around `[start, end]` say, as one short clause for the event log, or
+/// `None` when no sample that close was throttled. Facts only: throttling at the same moment is
+/// not a cause of the stall.
+pub fn throttled_clause(samples: &[ClockSample], start: i64, end: i64) -> Option<String> {
+    let near = crate::util::ms_to_ticks(NEAR_MS);
+    let hits: Vec<&ClockSample> = samples.iter().filter(|c| c.ts >= start - near && c.ts <= end + near && c.throttled()).collect();
+    if hits.is_empty() {
+        return None;
+    }
+    let busy: Vec<f64> = hits.iter().filter(|c| c.busy_cores > 0).map(|c| c.min_busy_perf).collect();
+    let cap = hits.iter().map(|c| c.limit).fold(100.0, f64::min);
+    let mut clause = "the processor was being slowed down at the time".to_string();
+    if !busy.is_empty() {
+        let slowest = busy.iter().copied().fold(f64::MAX, f64::min);
+        clause.push_str(&format!(" (busy cores at as little as {slowest:.0}% of rated speed"));
+        clause.push_str(&if cap < 99.5 { format!(", Windows capping it at {cap:.0}%)") } else { ")".to_string() });
+    } else if cap < 99.5 {
+        clause.push_str(&format!(" (Windows capping it at {cap:.0}%)"));
+    }
+    Some(clause)
+}
+
 pub type Samples = Arc<Mutex<Vec<ClockSample>>>;
 
 struct Counters {
@@ -109,6 +135,28 @@ mod tests {
         assert!(!s(4, 1, 100.0).throttled());
         assert!(s(4, 2, 100.0).throttled());
         assert!(s(0, 0, 80.0).throttled(), "an explicit OS performance cap always counts");
+    }
+
+    /// Per incident: said only when a sample that close to the stall was throttled, with the
+    /// numbers the sample carries.
+    #[test]
+    fn a_stall_says_it_was_throttled_only_when_a_nearby_sample_was() {
+        let ms = crate::util::ms_to_ticks;
+        let s = |ts, busy_cores, slow_cores, min_busy_perf, limit| ClockSample { ts, busy_cores, slow_cores, min_busy_perf, limit };
+        let (start, end) = (ms(10_000.0), ms(10_900.0));
+        let far = [s(ms(5_000.0), 4, 4, 40.0, 100.0), s(ms(10_500.0), 4, 0, 110.0, 100.0)];
+        assert_eq!(throttled_clause(&far, start, end), None, "throttled, but four seconds earlier");
+        let near = [s(ms(9_000.0), 4, 3, 45.0, 100.0)];
+        assert_eq!(
+            throttled_clause(&near, start, end).as_deref(),
+            Some("the processor was being slowed down at the time (busy cores at as little as 45% of rated speed)")
+        );
+        let capped = [s(ms(12_000.0), 0, 0, 100.0, 80.0)];
+        assert_eq!(
+            throttled_clause(&capped, start, end).as_deref(),
+            Some("the processor was being slowed down at the time (Windows capping it at 80%)")
+        );
+        assert_eq!(throttled_clause(&[], start, end), None);
     }
 
     /// The counters exist on every supported Windows; tolerate their absence (containers).

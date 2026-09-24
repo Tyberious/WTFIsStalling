@@ -53,6 +53,27 @@ const MAX_THREADS: usize = 20_000;
 /// Rows returned, worst first. Far more than any report shows, and enough to add up per process.
 const MAX_ROWS: usize = 512;
 
+/// Plain words for which band a thread priority (0-31, as `CSwitch` reports it) sits in.
+///
+/// Microsoft's base-priority table ("Scheduling Priorities",
+/// https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities) puts every
+/// priority class at 1-15 except REALTIME_PRIORITY_CLASS, which is 16-31; "Only the zero-page
+/// thread can have a priority of zero". "The system does not boost the priority of threads with a
+/// base priority level between 16 and 31" (".../procthread/priority-boosts").
+///
+/// Only the BAND is said, never the process's class: the number in a switch record is the dynamic
+/// priority, a 13 can be a HIGH_PRIORITY_CLASS thread or a boosted normal one, and the Multimedia
+/// Class Scheduler puts ordinary programs' audio and game threads at 16-26
+/// (".../procthread/multimedia-class-scheduler-service", "Thread Priorities"). So "the real-time
+/// range" is unambiguous and "a real-time program" would not be.
+pub fn priority_band(prio: i8) -> Option<&'static str> {
+    match prio {
+        16..=31 => Some("the real-time range, 16-31, above every ordinary thread"),
+        1..=15 => Some("the ordinary range, 1-15"),
+        _ => None,
+    }
+}
+
 /// Plain words for a `OldThreadWaitReason` (a KWAIT_REASON). The value table is Microsoft's, on
 /// the CSwitch class page; the wording is this tool's. `None` means "nothing worth saying": the
 /// report then gives the duration without naming a kind of wait, which is better than jargon.
@@ -500,6 +521,19 @@ pub fn waits(sw: &[SwitchRec], rd: &[ReadyRec], from: i64, to: i64) -> Vec<Threa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The band changes exactly where Microsoft's table does, between 15 and 16, and nothing is
+    /// said for values no documented class produces.
+    #[test]
+    fn a_priority_is_named_by_its_documented_band_at_the_15_16_boundary() {
+        assert_eq!(priority_band(15), Some("the ordinary range, 1-15"));
+        assert_eq!(priority_band(16), Some("the real-time range, 16-31, above every ordinary thread"));
+        assert_eq!(priority_band(1), Some("the ordinary range, 1-15"));
+        assert_eq!(priority_band(31), priority_band(16));
+        assert_eq!(priority_band(0), None, "the zero-page thread only");
+        assert_eq!(priority_band(-1), None, "a garbled record");
+        assert_eq!(priority_band(32), None);
+    }
 
     fn sw(ts: i64, cpu: u16, new_tid: u32, old_tid: u32, old_state: i8) -> SwitchRec {
         SwitchRec { ts, new_tid, old_tid, cpu, new_prio: 8, old_prio: 8, old_wait_reason: 0, old_wait_mode: 0, old_state }

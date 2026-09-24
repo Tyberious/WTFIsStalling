@@ -445,6 +445,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     if let Some(trace) = &stor_trace {
         analyzer.set_storage_trace(trace.clone());
     }
+    analyzer.set_cpu_clock(cpu_clock.clone());
     say!(
         "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
         analyzer.modules.len(),

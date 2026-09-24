@@ -86,7 +86,7 @@ days old) by itself.
 | **Network filter drivers from other vendors** (VPNs, "network optimizers", security products) | Windows runs a filter's code inside its own networking files, so a stall in `NETIO.SYS` or `ndis.sys` can be another vendor's doing. The installed NDIS lightweight filters are read from the registry and the ones written by someone other than Microsoft are named on such a finding — and when they are all Microsoft's, that rules a whole class of software out |
 | **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
-| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth. For drives run by Windows' storage port driver (NVMe, SATA, UAS USB) it also says **where the time went**: how much was spent inside the drive (the drive, its cable or firmware) and how much waiting in Windows before reaching it (too much asked of the drive at once), with any retries; a drive that driver does not see (older USB "BOT" drives) is reported as not measured, never as zero |
+| A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, with the program that issued the requests (by image name, several processes of one program counted as copies: "powershell.exe 2 copies"), and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth. For drives run by Windows' storage port driver (NVMe, SATA, UAS USB) it also says **where the time went**: how much was spent inside the drive (the drive, its cable or firmware) and how much waiting in Windows before reaching it (too much asked of the drive at once), with any retries; a drive that driver does not see (older USB "BOT" drives) is reported as not measured, never as zero |
 | **Antivirus, backup, cloud-sync or encryption software in the path of slow disk waits** | Each disk request and each slow hard page fault carries a *module-level* call stack: the drivers that were on it, never function names (those need Microsoft's symbol files, i.e. network access, which this tool does not have). So a slow request says which drivers it went through ("via FLTMGR.SYS -> Ntfs.sys -> WdFilter.sys"), with `--deep` a program stuck behind it also says which driver it was blocked in, and the disk finding totals the file-system filters in the path ("WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning) in 80%"). Filters are recognized from the load order group Windows registers them in, and named from Microsoft's documentation or the file's own version resource. Being in the path is never called the cause — every file access on Windows passes through several filters — and Microsoft Defender is never something to turn off: when it is in the path of most slow requests, the report points to Microsoft's documented folder exclusions, with Microsoft's warning |
 | **A drive being reset or retried while you watch** | The storage port driver's own events, live: requests it had to send again and resets of a drive or its controller, with the time and the disk. A reset during the run is rated high, the same as Windows' event 129, and one Windows also logged is reported once |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
@@ -188,6 +188,12 @@ hour-long run into a wall of HIGH: one 31 ms stall was HIGH because 31 is over 1
 judged on rates and shares — stalls per hour and the share of the run they cover, over-long DPC runs
 per hour, paging time as a percentage of the run, slow disk requests per hour — with one absolute
 exception, because a single interruption long enough to see is serious however rarely it happens.
+How many processors a kernel-level stall held counts too: a stall on 1 of 32 leaves the other 31
+working, so for the "long enough to see" and "share of the run" rules each stall counts in
+proportion to the processors it held, with a quarter of them or more counting in full (a rule of
+thumb; on a 4-thread laptop one core already is a quarter). The audio-crackle rule (a 5 ms stall
+every ten seconds) is not weighted, because audio breaks up when the one core its work is on is
+held, and a 50 ms hold on any core is still at least a suspect. Whole-PC freezes are always HIGH.
 
 ## How it works
 
@@ -308,7 +314,35 @@ with its rate inside it, which is the closest a CPU-side trace gets to watching 
 controller stall. A slow disk request that only began after the machine had already stopped is
 marked as a victim of the freeze and is not counted against its drive as well; one that was already
 outstanding well before the freeze began is reported as having coincided with it, and nothing more
-than that.
+than that — both in the freeze finding and, since the drive is where a reader will look, on that
+drive's own finding ("The whole PC froze 8 times while a slow request to this drive was
+outstanding ... 'Coincided' is all this says"). A drive whose slow request only began once the PC
+had stopped is never blamed for it: the drive finding says those were slowed down by the freeze.
+
+**Kernel-level stalls get the same checks.** A stall on some of the processors is checked the way a
+freeze is: which steady interrupt sources kept arriving and which went silent, whether the timer
+DPCs (how the clock wakes sleeping threads) kept their usual rate, and whether a slow disk request
+or the measuring thread's own hard page fault covered it. These are facts in the event log. The
+verdict changes in two cases only: the measuring thread was itself waiting for its own memory to be
+read back from disk (then nothing held the processor, and the stall is put down to paging), or no
+processor was held AND the timer DPCs stopped across the PC (which points at timer delivery rather
+than scheduling). A slow request that began inside a stall that did not stop every processor is
+reported as a coincidence and still counted against its drive.
+
+**One busy core.** For a CPU-starvation stall the idle share is worked out per processor, and time the
+profiler attributed to the idle thread while a DPC or ISR was running on it counts as busy, not idle.
+When one or a few cores (at most a quarter of those with enough samples) were at least 90% busy while
+the rest were at least half idle, the event log says "one core was busy while the others idled",
+with what held it (the program in most of its samples, or the driver whose interrupt handling they
+landed in), and the finding counts how often that was so. It does not claim the waiting thread was
+restricted to that core: nothing in the trace shows a thread's affinity.
+
+**Per-incident context.** A thread priority is printed with the documented band it falls in: 16-31 is
+the real-time range, 1-15 the ordinary one (Microsoft's "Scheduling Priorities" table). The band,
+not the program's priority class, because Windows' own multimedia scheduler lifts ordinary programs'
+audio and game threads into 16-26. Each incident also says, in one short "Context:" line and only when
+it was so, that the processor was being throttled within a second and a half of it, or that memory
+was at least 85% in use when it was examined.
 
 **Flagged moments.** Wake-up delays from 1 ms up are kept for 30 seconds even though they are far below
 the stall threshold. When you press "I felt it", the worst one in the 3 seconds before the press goes

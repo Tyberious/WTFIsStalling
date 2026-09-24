@@ -142,12 +142,69 @@ pub struct RoutineStat {
 }
 
 /// How long requests to one file waited over the whole run.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct FileWait {
     pub disk: u32,
     pub count: u64,
     pub total: i64,
     pub max: i64,
+}
+
+/// One process's share of the waiting on one file.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PidWait {
+    pub pid: u32,
+    pub count: u32,
+    pub total: i64,
+}
+
+/// How long disk requests to one file waited over the whole run, and which processes issued them.
+///
+/// Keyed by file, not by (process, file), so that the rundown check and a recycled file object
+/// stay one hash lookup each inside the ETW callback. The processes are a short list inside:
+/// at most `FILE_WAIT_PIDS` of them, and requests from any further process still count toward
+/// the file's totals, just unattributed. Memory: 56 bytes plus 16 per process listed, so at the
+/// `FILE_WAIT_CAP` of 8,192 files at most ~1.6 MB with hash-table overhead, typically a tenth of
+/// that (most files are read by one process). Process IDs, not names: naming happens once, in the
+/// summary, the way `fault_file` is named.
+#[derive(Default, Clone, Debug)]
+pub struct DiskFileWait {
+    pub wait: FileWait,
+    pub by_pid: Vec<PidWait>,
+}
+
+/// Processes listed per file; see `DiskFileWait`.
+pub const FILE_WAIT_PIDS: usize = 8;
+
+impl DiskFileWait {
+    pub fn add(&mut self, pid: u32, dur: i64) {
+        self.wait.count += 1;
+        self.wait.total += dur;
+        self.wait.max = self.wait.max.max(dur);
+        if let Some(p) = self.by_pid.iter_mut().find(|p| p.pid == pid) {
+            p.count += 1;
+            p.total += dur;
+        } else if self.by_pid.len() < FILE_WAIT_PIDS {
+            self.by_pid.push(PidWait { pid, count: 1, total: dur });
+        }
+    }
+}
+
+/// Anything whose waiting can be totaled, so one capping rule serves every per-file tally.
+pub trait Waited {
+    fn waited(&self) -> i64;
+}
+
+impl Waited for FileWait {
+    fn waited(&self) -> i64 {
+        self.total
+    }
+}
+
+impl Waited for DiskFileWait {
+    fn waited(&self) -> i64 {
+        self.wait.total
+    }
 }
 
 /// FileObject/FileKey -> NT path, filled from the kernel's FileIo name events.
@@ -197,16 +254,16 @@ impl FileNames {
 
 /// Keeps a per-file tally from growing without limit over a long run: when it goes over `cap`,
 /// only the half that waited longest is kept. Rare and bounded, so the ETW callback stays cheap.
-pub fn cap_by_wait<K: Copy + Eq + std::hash::Hash>(m: &mut HashMap<K, FileWait>, cap: usize) {
+pub fn cap_by_wait<K: Copy + Eq + std::hash::Hash, V: Waited>(m: &mut HashMap<K, V>, cap: usize) {
     if m.len() <= cap {
         return;
     }
-    let mut totals: Vec<i64> = m.values().map(|v| v.total).collect();
+    let mut totals: Vec<i64> = m.values().map(|v| v.waited()).collect();
     totals.sort_unstable();
     let cut = totals[totals.len() / 2];
     let mut room = cap / 2;
     m.retain(|_, v| {
-        if v.total <= cut || room == 0 {
+        if v.waited() <= cut || room == 0 {
             return false;
         }
         room -= 1;
@@ -331,7 +388,7 @@ pub struct Inner {
     /// File names, and the whole run's waiting totaled per file. The ring buffers above only
     /// reach 20 s back, so these are what the summary's file tables are built from.
     pub file_names: FileNames,
-    pub file_wait: HashMap<u64, FileWait>,
+    pub file_wait: HashMap<u64, DiskFileWait>,
     /// Hard-fault waiting per (process, file), for "mostly reading back <file>".
     pub fault_file: HashMap<(u32, u64), FileWait>,
 
