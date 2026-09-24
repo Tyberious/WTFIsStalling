@@ -696,7 +696,7 @@ mod tests {
         let kinds = [Kind::PagingFile, Kind::ProgramCode, Kind::PagedFile, Kind::Bookkeeping, Kind::FileData, Kind::Flush];
         let fighters = [vec![], vec!["steam.exe".to_string(), "qbittorrent.exe".to_string()], vec!["x".repeat(300), "y".repeat(300)]];
         for kind in kinds {
-            for op in [b'R', b'W', b'F'] {
+            for op in *b"RWF" {
                 for thrash in &fighters {
                     let line = request_line_timed(kind, op, Some(r"C:\$Mft"), thrash, Some(timing)).expect("a line with timing");
                     assert!(line.chars().count() <= LINE_WIDTH, "{} chars: {line}", line.chars().count());
