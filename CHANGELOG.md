@@ -3,7 +3,7 @@
 What changed in each release, in short. The full notes, with details and download verification, are on the
 [releases page](https://github.com/Tyberious/WTFIsStalling/releases). Dates are release dates.
 
-## Unreleased (0.9.0)
+## 0.9.0 (2026-09-24)
 
 ### Changed
 - Short kernel-level stalls get the checks whole-PC freezes already had: which device interrupts stopped or kept
