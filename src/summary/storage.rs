@@ -596,7 +596,7 @@ fn freeze_sentence(incidents: &[crate::analyze::IncidentSummary], n: u32) -> Opt
     }
     let asleep = if woke { ", after it had been asleep" } else { "" };
     Some(format!(
-        "The whole PC froze {count} time{} while a slow request to this drive was outstanding{asleep} (taking up to {}).          'Coincided' is all this says: this tool cannot tell which caused which. See the whole-PC freeze finding.",
+        "The whole PC froze {count} time{} while a slow request to this drive was outstanding{asleep} (taking up to {}). 'Coincided' is all this says: this tool cannot tell which caused which. See the whole-PC freeze finding.",
         plural(count as u64),
         fmt_dur(waited)
     ))
