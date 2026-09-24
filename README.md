@@ -274,7 +274,8 @@ a run. `wtfis-cli --light` turns it on by hand and `--no-light` keeps full measu
 
 **Context switches are the expensive part.** They are the highest-volume class the kernel logger has —
 tens of thousands of events a second on a busy PC — so they go into their own short ring buffer (six
-seconds of history, hard-capped at 14 MB whatever the machine does), they are **off in light mode**, and
+seconds of history, sized to the number of logical CPUs: about 14 MB on a typical PC, growing on
+many-core machines and capped at 96 MB), they are **off in light mode**, and
 `wtfis-cli --no-switches` turns them off anywhere. The cost block reports how many of them arrived and at
 what rate, so the price is visible next to what it bought. If Windows could not deliver every event,
 nothing in the report rests on them at all: one missing wake-up record would turn "woken on time" into
@@ -480,7 +481,7 @@ wtfis-cli --no-compare       # don't compare with an earlier run
 | `--deep` | off | Also record where every waiting thread was blocked (which drivers were on its call stack). Measured on a busy 32-thread PC: about 120,000 extra stack events a second and roughly twice the tool's own processor use, so it is opt-in; not in `--light` mode |
 | `--light` | auto | Measure more gently: probe every 2 ms instead of 1 ms, and leave thread-switch tracing, graphics tracing and call stacks off; on by itself on a PC with 4 logical CPUs or fewer, or one running on battery |
 | `--no-light` | off | Keep full measuring even on a small or unplugged PC (the opposite of `--light`) |
-| `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory | Report file path |
+| `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory, or `%TEMP%` if that can't be written | Report file path |
 | `--no-log` | off | Don't write a report file |
 | `--compare <file>` | newest run from this PC, up to 30 days old | Compare this run with a particular earlier one (the `.wtfis` file saved next to its report) |
 | `--no-compare` | off | Don't compare this run with an earlier one |
