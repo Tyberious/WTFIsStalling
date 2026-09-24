@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 use crate::summary::{Finding, Health, Severity};
 
 /// Bumped when the meaning of a key changes. Files with another version are ignored.
+///
+/// Still 1 after `MAX_METRICS` went from 2 to 8: more metrics on a `finding=` line is an addition,
+/// not a change of meaning. Files written by 0.7.0 and 0.8.0 (two metrics at most) read exactly as
+/// before, and those builds read a newer file too, because their parser already kept the first
+/// two metrics of a line and ignored the rest - the first being the one a finding is judged by.
 pub const FORMAT: u32 = 1;
 const MAGIC: &str = "wtfis-run";
 /// Extension of the data file written next to `WTFIsStalling-<timestamp>.txt`.
@@ -27,7 +32,14 @@ pub const EXT: &str = "wtfis";
 /// Older baselines are not offered: the PC has usually changed by then.
 pub const MAX_AGE_DAYS: i64 = 30;
 /// At most this many numbers per finding; the first one is the one it is judged by.
-pub const MAX_METRICS: usize = 2;
+///
+/// Counted from every `Findings::measure` call: the most any subject collects is 7, a graphics
+/// driver that was blamed for stalls (stalls blamed, worst stall), at a flagged moment (moments
+/// you flagged), for long DPC/ISR runs (worst DPC/ISR, long runs) and reset by Windows (resets
+/// while monitoring, in the last 7 days). A disk collects 5, throttling 3, everything else 1-2.
+/// 8 keeps all of them with one to spare; it caps the file, not what the comparison prints
+/// (see `compare::SHOWN_MOVES`).
+pub const MAX_METRICS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
@@ -468,6 +480,78 @@ pub(crate) mod tests {
         assert_eq!(parse(&text), Some(rec), "what was written must read back identically");
         // Numbers are written with a dot whatever the PC's regional settings say.
         assert!(text.contains("worst_wake_kernel_ms=11.802") && text.contains("stalls blamed;14.000;count;time"), "{text}");
+    }
+
+    /// A data file byte for byte as 0.7.0 and 0.8.0 wrote it (CRLF, at most two metrics a finding;
+    /// the lines are what `to_text` produced then, including a Windows-component finding and one
+    /// from the event log's look-back). It must load, and compare against a run of this build.
+    const OLD_FILE: &str = "wtfis-run 1\r\n\
+        tool=0.8.0\r\n\
+        time=1799990000\r\n\
+        when=2026-09-10 20:15\r\n\
+        machine=abc123\r\n\
+        seconds=300.0\r\n\
+        light=0\r\n\
+        stalls_kernel=14\r\n\
+        stalls_starve=3\r\n\
+        worst_wake_kernel_ms=11.802\r\n\
+        worst_wake_sched_ms=31.000\r\n\
+        marks=2\r\n\
+        marks_clean=0\r\n\
+        health=problem\r\n\
+        finding=driver nvlddmkm.sys|high|nvlddmkm.sys  -  NVIDIA GeForce RTX 5090|stalls blamed;14.000;count;time|worst stall;11.802;ms;fixed\r\n\
+        finding=disk 1|medium|Disk 1 (D:), ST4000DM004  -  responding slowly|slow requests;9.000;count;time|worst wait;840.000;ms;fixed\r\n\
+        finding=whea memory|medium|Corrected memory errors|errors while monitoring;0.000;count;fixed|in the last 7 days;4.000;count;back\r\n\
+        finding=waiting svchost.exe|low|svchost.exe  -  was held up|longest wait for a processor;120.000;ms;fixed\r\n";
+
+    #[test]
+    fn a_file_from_an_older_release_still_loads_and_compares() {
+        let old = parse(OLD_FILE).expect("a 0.8.0 file is still a baseline");
+        assert_eq!((old.tool.as_str(), old.machine.as_str(), old.stalls_kernel, old.health), ("0.8.0", "abc123", 14, Health::Problem));
+        assert_eq!(old.findings.len(), 4);
+        let gpu = &old.findings[0];
+        assert_eq!((gpu.key.as_str(), gpu.severity), ("driver nvlddmkm.sys", Severity::High));
+        assert_eq!(gpu.metrics, vec![Metric::count("stalls blamed", 14), Metric::ms("worst stall", 11.802)]);
+        assert_eq!(old.findings[2].metrics[1], Metric::logged("in the last 7 days", 4));
+        // Read back and written again, it is the same record: nothing about it was reinterpreted.
+        assert_eq!(parse(&to_text(&old)), Some(old.clone()));
+
+        // This build's run of the same GPU driver carries far more numbers than 0.8.0 kept.
+        let now = run(
+            300.0,
+            vec![finding(
+                "driver nvlddmkm.sys",
+                Severity::Medium,
+                vec![
+                    Metric::count("stalls blamed", 2),
+                    Metric::ms("worst stall", 11.5),
+                    Metric::flat("moments you flagged", 1),
+                    Metric::ms("worst DPC/ISR", 1.8),
+                    Metric::count("long runs", 5),
+                    Metric::flat("resets while monitoring", 0),
+                    Metric::logged("in the last 7 days", 1),
+                ],
+            )],
+        );
+        let lines = compare(&old, &now);
+        let gpu = lines.iter().find(|l| l.starts_with("- driver nvlddmkm.sys")).expect("the GPU driver is compared");
+        assert!(gpu.contains("better - stalls blamed 14 -> 2, worst stall 11.8 ms -> 11.5 ms"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("- Disk 1 (D:)") && l.contains("(last time: 9 slow requests)")), "{lines:?}");
+        assert_eq!(lines[2], "Stalls: 17 -> 2.", "{lines:?}");
+    }
+
+    #[test]
+    fn every_number_up_to_the_limit_survives_the_file_and_no_more() {
+        let many: Vec<Metric> = (0..MAX_METRICS + 2).map(|i| Metric::count(&format!("number {i}"), i as u32)).collect();
+        let rec = run(60.0, vec![finding("driver x.sys", Severity::High, many.clone())]);
+        let text = to_text(&rec);
+        let back = parse(&text).unwrap();
+        assert_eq!(back.findings[0].metrics, many[..MAX_METRICS].to_vec(), "the first MAX_METRICS, in order");
+        assert!(!text.contains(&format!("number {MAX_METRICS};")), "nothing past the limit is written: {text}");
+        // What a 0.8.0 build would do with this line: keep the first two, the primary first.
+        let line = text.lines().find(|l| l.starts_with("finding=")).unwrap();
+        let old_reader: Vec<Metric> = line.split('|').skip(3).filter_map(parse_metric).take(2).collect();
+        assert_eq!(old_reader, many[..2].to_vec());
     }
 
     #[test]

@@ -100,6 +100,28 @@ fn looks_back(f: &FindingRecord) -> bool {
     primary(f).is_some_and(|m| m.scaling == Scaling::LooksBack)
 }
 
+/// Numbers printed per finding in the comparison, however many the two runs share.
+///
+/// A finding can now carry up to `MAX_METRICS` (a graphics driver collects seven), and the block
+/// sits in the RESULT, where every bullet has to stay readable in a forum post: three moves wrap
+/// to about two lines at 100 columns, which is the most one bullet should take. The file keeps
+/// every number, so nothing is lost by printing fewer.
+pub const SHOWN_MOVES: usize = 3;
+
+/// Which of a finding's moves are printed, in which order.
+///
+/// The first is always the primary metric's (the first the two runs share): it is the one the
+/// finding's "better / worse / about the same" is judged by, so a reader must see its numbers.
+/// Then the moves that actually changed, because "stalls 14 -> 14, worst stall 11 ms -> 2 ms" is
+/// the telling part; unchanged ones only fill whatever room is left. Within each group the order
+/// is the order the numbers were measured in, which is also how telling they are.
+fn shown_moves(moves: &[(Change, String)]) -> Vec<String> {
+    let Some((first, rest)) = moves.split_first() else { return Vec::new() };
+    let changed = rest.iter().filter(|(c, _)| *c != Change::Same);
+    let same = rest.iter().filter(|(c, _)| *c == Change::Same);
+    std::iter::once(first).chain(changed).chain(same).take(SHOWN_MOVES).map(|(_, t)| t.clone()).collect()
+}
+
 /// The comparison block, ready to be indented and wrapped by the report. Lines starting with
 /// "- " are bullets. A pure function of the two records: everything here is unit tested.
 pub fn compare(prev: &RunRecord, now: &RunRecord) -> Vec<String> {
@@ -173,7 +195,7 @@ pub fn compare(prev: &RunRecord, now: &RunRecord) -> Vec<String> {
                 let numbers = if moves.is_empty() {
                     "it shows up differently this time, so there are no like-for-like numbers".to_string()
                 } else {
-                    moves.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join(", ")
+                    shown_moves(&moves).join(", ")
                 };
                 bullets.push(format!("- {title}: {word} - {numbers}.{}", caveat(n)));
                 if worth_a_verdict && !looks_back(n) {
@@ -444,6 +466,46 @@ mod tests {
         assert!(lonely.comparison.is_empty());
         attach(&mut lonely, &CompareMode::Auto, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finding with seven numbers in both runs still prints three: the primary one first (the
+    /// verdict rests on it), then the ones that moved, and unchanged ones only if there is room.
+    #[test]
+    fn a_finding_with_many_numbers_prints_the_primary_and_the_ones_that_moved() {
+        let gpu = |stalls, worst_dpc, long_runs| {
+            finding(
+                "driver nvlddmkm.sys",
+                Severity::High,
+                vec![
+                    Metric::count("stalls blamed", stalls),
+                    Metric::ms("worst stall", 11.0),
+                    Metric::flat("moments you flagged", 1),
+                    Metric::ms("worst DPC/ISR", worst_dpc),
+                    Metric::count("long runs", long_runs),
+                    Metric::flat("resets while monitoring", 0),
+                    Metric::logged("in the last 7 days", 1),
+                ],
+            )
+        };
+        let lines = compare(&run(300.0, vec![gpu(14, 9.0, 40)]), &run(300.0, vec![gpu(14, 1.2, 3)]));
+        let bullet = lines.iter().find(|l| l.starts_with("- driver nvlddmkm.sys")).unwrap();
+        assert_eq!(
+            bullet,
+            "- driver nvlddmkm.sys  -  something: about the same - stalls blamed 14 -> 14, worst DPC/ISR 9.0 ms -> 1.2 ms, long runs 40 -> 3.",
+            "the verdict word still comes from the primary number"
+        );
+        assert_eq!(bullet.matches(" -> ").count(), SHOWN_MOVES);
+
+        // Nothing moved: the first three, in the order they were measured.
+        let lines = compare(&run(300.0, vec![gpu(14, 9.0, 40)]), &run(300.0, vec![gpu(14, 9.0, 40)]));
+        let bullet = lines.iter().find(|l| l.starts_with("- driver nvlddmkm.sys")).unwrap();
+        assert!(bullet.ends_with("stalls blamed 14 -> 14, worst stall 11.0 ms -> 11.0 ms, moments you flagged 1 -> 1."), "{bullet}");
+
+        // Fewer shared numbers than the cap: all of them, as before.
+        assert_eq!(shown_moves(&[(Change::Same, "a".into())]), vec!["a".to_string()]);
+        assert!(shown_moves(&[]).is_empty());
+        let moved = [(Change::Same, "p".into()), (Change::Same, "s1".into()), (Change::Worse, "w".into()), (Change::Better, "b".into())];
+        assert_eq!(shown_moves(&moved), vec!["p".to_string(), "w".into(), "b".into()], "changed ones before unchanged ones");
     }
 
     #[test]

@@ -344,6 +344,21 @@ pub struct Victim {
     pub threads: usize,
     pub longest: i64,
     pub waited_in: Option<String>,
+    /// It was the program in front of the person while the request was outstanding (see
+    /// `foreground`). At most one victim has this, and `front_first` puts it first.
+    pub in_front: bool,
+}
+
+/// Marks the program that was in front (by name, as the victims are grouped) and moves it to the
+/// head of the list, keeping the others' order: a program the person was looking at waiting
+/// 40 ms matters more to them than a background one waiting 300. Nothing changes when it was not
+/// among them or when nobody knows what was in front.
+pub fn front_first(victims: &mut [Victim], front: Option<&str>) {
+    let Some(front) = front else { return };
+    if let Some(i) = victims.iter().position(|v| v.name == front) {
+        victims[i].in_front = true;
+        victims[..=i].rotate_right(1);
+    }
 }
 
 /// One stuck thread: its program, how long it waited, and where, if a call stack says.
@@ -361,7 +376,7 @@ pub fn by_program(stuck: &[StuckThread]) -> Vec<Victim> {
                     p.waited_in = inside.clone();
                 }
             }
-            None => v.push(Victim { name: name.clone(), threads: 1, longest: *waited, waited_in: inside.clone() }),
+            None => v.push(Victim { name: name.clone(), threads: 1, longest: *waited, waited_in: inside.clone(), in_front: false }),
         }
     }
     v.sort_by(|a, b| b.longest.cmp(&a.longest).then_with(|| a.name.cmp(&b.name)));
@@ -412,7 +427,10 @@ fn stuck_candidates(victims: &[Victim], chains: &[ChainText], drive: &str, with_
                 let t = if p.threads == 1 { "1 thread".to_string() } else { format!("{} threads", p.threads) };
                 let at = inside(&p.waited_in);
                 let at = if at.is_empty() { at } else { format!(",{at}") };
-                format!("{} ({t}, up to {}{at})", clip(&p.name), fmt_dur(p.longest))
+                // The program the person was looking at is said to be that, in words that never
+                // make a part of Windows sound like a program (see `foreground::subject`).
+                let who = if p.in_front { crate::foreground::subject(&clip(&p.name)) } else { clip(&p.name) };
+                format!("{who} ({t}, up to {}{at})", fmt_dur(p.longest))
             } else {
                 format!("{} ({})", clip(&p.name), p.threads)
             });
@@ -553,6 +571,8 @@ pub struct DiskBehind {
     pub uncovered: u32,
     /// Program -> (slow requests it was stuck behind, total wait).
     pub stuck: HashMap<String, (u32, i64)>,
+    /// Program -> of those, how many while it was the program in front of the person.
+    pub stuck_in_front: HashMap<String, u32>,
     /// (waiter, holder) -> (times, longest wait).
     pub chains: HashMap<(String, String), (u32, i64)>,
     /// Slow requests during which the drive was thrashing, and program -> how often it was involved.
@@ -597,10 +617,12 @@ impl DiskBehind {
         self.kinds.iter().filter(|(k, _)| pred(**k)).map(|(_, n)| *n).sum()
     }
 
-    /// Programs stuck behind this disk, most total waiting first.
-    pub fn top_stuck(&self, n: usize) -> Vec<(String, u32, i64)> {
-        let mut v: Vec<(String, u32, i64)> = self.stuck.iter().map(|(k, (c, t))| (k.clone(), *c, *t)).collect();
-        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    /// Programs stuck behind this disk: (name, times, total wait, times it was the program in
+    /// front). Any that were ever in front of the person first, then most total waiting first.
+    pub fn top_stuck(&self, n: usize) -> Vec<(String, u32, i64, u32)> {
+        let mut v: Vec<(String, u32, i64, u32)> =
+            self.stuck.iter().map(|(k, (c, t))| (k.clone(), *c, *t, self.stuck_in_front.get(k).copied().unwrap_or(0))).collect();
+        v.sort_by(|a, b| (b.3 > 0).cmp(&(a.3 > 0)).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
         v.truncate(n);
         v
     }
@@ -779,7 +801,7 @@ mod tests {
 
     #[test]
     fn stuck_lines_never_exceed_the_report_width() {
-        let v = |name: &str, threads, ms_: f64| Victim { name: name.into(), threads, longest: ms(ms_), waited_in: None };
+        let v = |name: &str, threads, ms_: f64| Victim { name: name.into(), threads, longest: ms(ms_), waited_in: None, in_front: false };
         let victims = vec![v("explorer.exe", 3, 2100.0), v("Discord.exe", 1, 900.0), v("steam.exe", 2, 40.0)];
         let chains = vec![("explorer.exe".to_string(), ms(1200.0), "System".to_string(), None)];
         let line = stuck_line(&victims, &chains, "disk 1 (D:)").unwrap();
@@ -892,6 +914,7 @@ mod tests {
             threads,
             longest: ms(ms_),
             waited_in: at.map(String::from),
+            in_front: false,
         };
         let victims = vec![v("explorer.exe", 3, 2100.0, Some("WdFilter.sys")), v("Discord.exe", 1, 900.0, None)];
         let line = stuck_line(&victims, &[], "disk 1 (D:)").unwrap();
@@ -923,7 +946,55 @@ mod tests {
     #[test]
     fn threads_add_up_per_program() {
         let p = by_program(&[("a.exe".into(), 5, None), ("b.exe".into(), 50, None), ("a.exe".into(), 70, Some("Ntfs.sys".into()))]);
-        assert_eq!(p[0], Victim { name: "a.exe".into(), threads: 2, longest: 70, waited_in: Some("Ntfs.sys".into()) });
+        assert_eq!(p[0], Victim { name: "a.exe".into(), threads: 2, longest: 70, waited_in: Some("Ntfs.sys".into()), in_front: false });
         assert_eq!(p[1].name, "b.exe");
+    }
+
+    /// The program in front of the person goes first on the "Stuck behind it" line, named as what
+    /// it was, however much longer a background program waited; explorer.exe is never called a
+    /// program. When it was not stuck, or nobody knows what was in front, nothing changes.
+    #[test]
+    fn the_program_in_front_is_named_first_among_those_stuck() {
+        let v = |name: &str, threads, ms_: f64| Victim { name: name.into(), threads, longest: ms(ms_), waited_in: None, in_front: false };
+        let all = vec![v("updater.exe", 2, 2100.0), v("Discord.exe", 1, 900.0), v("game.exe", 1, 40.0)];
+
+        let mut victims = all.clone();
+        front_first(&mut victims, Some("game.exe"));
+        assert_eq!(victims.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["game.exe", "updater.exe", "Discord.exe"]);
+        assert!(victims[0].in_front && !victims[1].in_front && !victims[2].in_front);
+        let line = stuck_line(&victims, &[], "disk 1 (D:)").unwrap();
+        assert_eq!(
+            line,
+            "    Stuck behind it: the program you were using, game.exe (1 thread, up to 40.00 ms), updater.exe (2), Discord.exe (1)"
+        );
+
+        let mut victims = vec![v("explorer.exe", 3, 700.0), v("steam.exe", 1, 60.0)];
+        front_first(&mut victims, Some("explorer.exe"));
+        let line = stuck_line(&victims, &[], "disk 1 (D:)").unwrap();
+        assert!(line.contains("what you were using, the Windows desktop or File Explorer (explorer.exe) (3 threads"), "{line}");
+        assert!(!line.contains("program you were using"), "{line}");
+
+        for front in [Some("chrome.exe"), None] {
+            let mut victims = all.clone();
+            front_first(&mut victims, front);
+            assert_eq!(victims, all, "{front:?}: not among them, or not known: untouched");
+        }
+        // However long the names, the line still fits.
+        let mut long = vec![v(&"g".repeat(40), 1, 5.0), v(&"h".repeat(40), 1, 9.0)];
+        front_first(&mut long, Some(&"h".repeat(40)));
+        let chains = vec![("x.exe".to_string(), ms(1200.0), "System".to_string(), None)];
+        assert!(stuck_line(&long, &chains, "disk 1 (D:)").unwrap().chars().count() <= LINE_WIDTH);
+    }
+
+    #[test]
+    fn a_disks_tally_lists_the_program_in_front_first() {
+        let mut b = DiskBehind::default();
+        b.stuck.insert("updater.exe".into(), (9, ms(5000.0)));
+        b.stuck.insert("game.exe".into(), (2, ms(80.0)));
+        b.stuck_in_front.insert("game.exe".into(), 2);
+        let top = b.top_stuck(3);
+        assert_eq!(top[0], ("game.exe".to_string(), 2, ms(80.0), 2));
+        assert_eq!(top[1].0, "updater.exe");
+        assert_eq!(top[1].3, 0);
     }
 }

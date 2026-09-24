@@ -524,7 +524,7 @@ impl Findings {
 
     /// Attaches the number this finding is measured by when two runs are compared. The first one
     /// attached is the one it is judged by, so the most telling number goes on first; the same
-    /// label twice keeps the larger value, and anything past the second is dropped.
+    /// label twice keeps the larger value, and anything past `MAX_METRICS` is dropped.
     pub(super) fn measure(&mut self, key: &str, metric: Metric) {
         let Some((_, f)) = self.0.iter_mut().find(|(k, _)| k == key) else { return };
         match f.metrics.iter().position(|m| m.label == metric.label) {
@@ -1039,6 +1039,59 @@ mod tests {
         assert!(summary.result_lines().iter().all(|l| l.chars().count() <= WIDTH), "{:?}", summary.result_lines());
     }
 
+    /// The program the person was looking at is reported first among the waiters, even when four
+    /// background programs waited longer (it would otherwise not make the four shown at all), and
+    /// is called that; explorer.exe in front is the desktop or File Explorer, never a program.
+    #[test]
+    fn the_program_you_were_using_leads_the_waiters() {
+        use crate::analyze::ProgramWait;
+        use crate::modules::ModuleMap;
+        use crate::procs::ProcNames;
+        use std::sync::atomic::AtomicBool;
+
+        let run = |waits: Vec<(&str, f64, u32)>| {
+            let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
+            az.wait_moments = 3;
+            for (name, ready, in_front) in waits {
+                az.program_waits
+                    .insert(name.into(), ProgramWait { ready: ms_to_ticks(ready), moments: 2, in_front, ..ProgramWait::default() });
+            }
+            let stats = ProbeStats { realtime: AtomicBool::new(true), ..ProbeStats::default() };
+            az.summarize(RunData {
+                elapsed_s: 400.0,
+                events_lost: 0,
+                overhead: Overhead::default(),
+                light: None,
+                stats: &stats,
+                exec_warn: ms_to_ticks(1.0),
+                io_warn: ms_to_ticks(200.0),
+                clock: &[],
+                gpu: &GpuLog::default(),
+                gpu_trace: Default::default(),
+                storage_trace: Default::default(),
+            })
+        };
+        let summary = run(vec![("a.exe", 400.0, 0), ("b.exe", 350.0, 0), ("c.exe", 300.0, 0), ("d.exe", 250.0, 0), ("game.exe", 40.0, 2)]);
+        let game = summary.findings.iter().find(|f| f.key == "waiting game.exe").expect("the program in front makes the list");
+        assert!(
+            game.evidence[0]
+                .contains("at 2 of the 3 moments this report examined closely (at 2 of them it was the program you were using)"),
+            "{:?}",
+            game.evidence
+        );
+        assert!(!summary.findings.iter().any(|f| f.key == "waiting d.exe"), "the fifth-longest background wait gives way");
+        assert!(!summary.findings.iter().find(|f| f.key == "waiting a.exe").unwrap().evidence[0].contains("you were using"));
+
+        let summary = run(vec![("explorer.exe", 90.0, 1)]);
+        let ex = summary.findings.iter().find(|f| f.key == "waiting explorer.exe").unwrap();
+        assert!(
+            ex.evidence[0].contains("(at 1 of them it was what you were using: the Windows desktop or File Explorer)"),
+            "{:?}",
+            ex.evidence
+        );
+        assert!(!format!("{} {}", ex.evidence.join(" "), ex.advice).contains("program you were using"), "{:?}", ex.evidence);
+    }
+
     /// Everything read from the thread-switch trace is a chain, so a gap in it can flip a
     /// conclusion rather than blur it. When events were lost, or switches were never traced at
     /// all, none of it may reach the report.
@@ -1266,12 +1319,15 @@ mod tests {
         f.measure("disk 1", Metric::count("slow requests", 3.0));
         f.measure("disk 1", Metric::count("slow requests", 9.0));
         f.measure("disk 1", Metric::ms("worst wait", 840.0));
-        f.measure("disk 1", Metric::secs("dropped", 1.0));
+        for i in 0..MAX_METRICS {
+            f.measure("disk 1", Metric::secs(&format!("more {i}"), 1.0));
+        }
         f.measure("nothing here", Metric::count("ignored", 1.0));
         let m = &f.0[0].1.metrics;
-        assert_eq!(m.len(), MAX_METRICS);
+        assert_eq!(m.len(), MAX_METRICS, "anything past the limit is dropped");
         assert_eq!((m[0].label.as_str(), m[0].value), ("slow requests", 9.0));
         assert_eq!(m[1].label, "worst wait");
+        assert_eq!(m[MAX_METRICS - 1].label, format!("more {}", MAX_METRICS - 3));
     }
 
     /// The 59-minute field report from issue #15, rebuilt from synthetic incidents: one

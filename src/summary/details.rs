@@ -25,6 +25,37 @@ fn provider_name(guid: u32) -> &'static str {
     }
 }
 
+/// Rows of the per-driver table this many at most; the rest are in no one's interest.
+const DRIVER_ROWS: usize = 12;
+
+/// The per-driver DPC/ISR table. The last column is which kind of interrupt the driver's handler
+/// actually ran for, as the trace saw it (see `interrupts::Observed`): a fact about this run, not
+/// the device's configuration, which DEVICE INTERRUPTS below reports.
+fn driver_table(drivers: &[(String, super::stalls::DriverAgg)]) -> Vec<String> {
+    let row = |cells: [&str; 8]| {
+        let [name, dpcs, worst_dpc, isrs, worst_isr, total, slow, kind] = cells;
+        format!("  {name:<24} {dpcs:>9} {worst_dpc:>10} {isrs:>9} {worst_isr:>10} {total:>11} {slow:>7}  {kind}").trim_end().to_string()
+    };
+    let mut out = vec![
+        String::new(),
+        "DRIVERS BY WORST DPC/ISR EXECUTION TIME  (healthy: DPC < 0.5 ms, ISR < 0.1 ms)".to_string(),
+        row(["driver", "DPCs", "worst DPC", "ISRs", "worst ISR", "total time", "slow", "ISRs arrived as"]),
+    ];
+    for (name, a) in drivers.iter().take(DRIVER_ROWS) {
+        out.push(row([
+            name,
+            &a.dpc_n.to_string(),
+            &fmt_dur(a.dpc_max),
+            &a.isr_n.to_string(),
+            &fmt_dur(a.isr_max),
+            &fmt_dur(a.total),
+            &a.over.to_string(),
+            a.isr_seen().map_or("", |k| k.words()),
+        ]));
+    }
+    out
+}
+
 /// What the measuring itself cost this PC.
 ///
 /// Always Low: this is about the measurement, not about the PC, so it must never decide the
@@ -159,23 +190,9 @@ pub(super) fn tables(cx: &mut Ctx) {
         }
     }
     if !drivers.is_empty() {
-        d!("");
-        d!("DRIVERS BY WORST DPC/ISR EXECUTION TIME  (healthy: DPC < 0.5 ms, ISR < 0.1 ms)");
-        d!("  {:<24} {:>9} {:>10} {:>9} {:>10} {:>11} {:>7}", "driver", "DPCs", "worst DPC", "ISRs", "worst ISR", "total time", "slow");
-        for (name, a) in drivers.iter().take(12) {
-            d!(
-                "  {:<24} {:>9} {:>10} {:>9} {:>10} {:>11} {:>7}",
-                name,
-                a.dpc_n,
-                fmt_dur(a.dpc_max),
-                a.isr_n,
-                fmt_dur(a.isr_max),
-                fmt_dur(a.total),
-                a.over
-            );
-        }
+        details.extend(driver_table(drivers));
         // Which device each third-party driver belongs to; Windows' own drivers need no legend.
-        for (name, _) in drivers.iter().take(12) {
+        for (name, _) in drivers.iter().take(DRIVER_ROWS) {
             if let (Some(title), Some(first)) = (device_map.device_title(name), device_map.get(name).first()) {
                 if !first.from_microsoft() {
                     d!("  {name} = {title}  |  {}", first.describe(today));
@@ -289,6 +306,13 @@ pub(super) fn tables(cx: &mut Ctx) {
         d!("  file names learned: {named_files}; files with a wait total: {}", file_waits.len());
         for (ts, initial) in debug_rejected {
             d!("  rejected DPC/ISR: event ts {ts}, InitialTime {initial}, now {}", qpc());
+        }
+    }
+    // Whether the foreground sampler saw anything from this (elevated) process.
+    if cx.az.shared.debug {
+        if let Some(line) = cx.az.foreground_debug() {
+            d!("");
+            d!("{line}");
         }
     }
     // The IrpFlags values actually seen, to check the bits `diskstuck` reads (0x2 paging, 0x40
@@ -447,4 +471,39 @@ pub(super) fn tables(cx: &mut Ctx) {
         }
     }
     cx.details = details;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::stalls::DriverAgg;
+    use super::*;
+    use crate::util::ms_to_ticks;
+
+    /// The per-driver table names which kind of interrupt each driver's handler ran for, and says
+    /// nothing for a driver that ran none.
+    #[test]
+    fn the_driver_table_says_which_kind_of_interrupt_fired() {
+        let agg = |line, msi| DriverAgg {
+            dpc_n: 10,
+            dpc_max: ms_to_ticks(0.2),
+            isr_n: line + msi,
+            isr_line_n: line,
+            isr_msi_n: msi,
+            isr_max: ms_to_ticks(0.05),
+            ..DriverAgg::default()
+        };
+        let rows = driver_table(&[
+            ("nvlddmkm.sys".to_string(), agg(0, 900)),
+            ("HDAudBus.sys".to_string(), agg(40, 0)),
+            ("odd.sys".to_string(), agg(2, 3)),
+            ("tcpip.sys".to_string(), agg(0, 0)),
+        ]);
+        assert!(rows[2].ends_with("ISRs arrived as"), "{rows:?}");
+        let row = |name: &str| rows.iter().find(|r| r.trim_start().starts_with(name)).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert!(row("nvlddmkm.sys").ends_with("  message-signaled"), "{rows:?}");
+        assert!(row("HDAudBus.sys").ends_with("  line-based"), "{rows:?}");
+        assert!(row("odd.sys").ends_with("  both kinds"), "{rows:?}");
+        assert!(row("tcpip.sys").ends_with(" 0"), "no ISRs, no kind, and no trailing blanks: {rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 118), "{rows:?}");
+    }
 }

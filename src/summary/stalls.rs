@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::analyze::{CoreHolder, IncidentClass};
 use crate::modules::knowledge;
 use crate::period;
-use crate::state::{Beats, BEAT_MS, KIND_ISR};
+use crate::state::{is_isr, Beats, BEAT_MS, KIND_ISR_MSI};
 use crate::util::{fmt_dur, ms_to_ticks, plural, qpc_freq, ticks_to_ms};
 
 use super::ctx::Ctx;
@@ -22,10 +22,21 @@ const DARK_ADVICE: &str = "Windows itself was frozen out, which points below the
 pub(super) struct DriverAgg {
     pub dpc_n: u64,
     pub dpc_max: i64,
+    /// Both ISR kinds together, and then apart: `isr_line_n` from the documented ISR event (67),
+    /// `isr_msi_n` from the message-signaled one (50). See `etw::events` for the sources.
     pub isr_n: u64,
+    pub isr_line_n: u64,
+    pub isr_msi_n: u64,
     pub isr_max: i64,
     pub total: i64,
     pub over: u64,
+}
+
+impl DriverAgg {
+    /// Which kind of interrupt its handler actually ran for, when it ran one at all.
+    pub fn isr_seen(&self) -> Option<crate::interrupts::Observed> {
+        crate::interrupts::Observed::from_counts(self.isr_line_n, self.isr_msi_n)
+    }
 }
 
 /// QPC ticks -> seconds, which is what the periodicity detector works in.
@@ -409,11 +420,15 @@ pub(super) fn one_program_waits(cx: &mut Ctx) {
     let moments = cx.az.wait_moments;
     let mut rows: Vec<(String, crate::analyze::ProgramWait)> =
         cx.az.program_waits.iter().map(|(name, w)| (name.clone(), w.clone())).collect();
-    rows.sort_by_key(|(name, w)| (std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
+    // A program the person was looking at when it was kept waiting goes first, whatever waited
+    // longer in the background: that is the one they felt (issue #19).
+    rows.sort_by_key(|(name, w)| (w.in_front == 0, std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
     // A report that lists twenty waiting programs says nothing; the worst few say it all.
     for (name, w) in rows.iter().take(4) {
         let key = format!("waiting {name}");
-        let when = format!("at {} of the {moments} moment{} this report examined closely", w.moments, plural(u64::from(moments)));
+        let front =
+            if w.in_front > 0 { format!(" (at {} of them it was {})", w.in_front, crate::foreground::role(name)) } else { String::new() };
+        let when = format!("at {} of the {moments} moment{} this report examined closely{front}", w.moments, plural(u64::from(moments)));
         let severity =
             if w.ready >= ms_to_ticks(BAD_READY_MS) || w.blocked >= ms_to_ticks(BAD_BLOCKED_MS) { Severity::Medium } else { Severity::Low };
         let (evidence, advice) = if w.ready >= w.blocked {
@@ -498,9 +513,14 @@ pub(super) fn long_dpc_isr(cx: &mut Ctx) {
     let mut mods: HashMap<String, DriverAgg> = HashMap::new();
     for ((routine, kind), st) in &routines {
         let a = mods.entry(cx.az.modules.name(*routine)).or_default();
-        if *kind == KIND_ISR {
+        if is_isr(*kind) {
             a.isr_n += st.count;
             a.isr_max = a.isr_max.max(st.max);
+            if *kind == KIND_ISR_MSI {
+                a.isr_msi_n += st.count;
+            } else {
+                a.isr_line_n += st.count;
+            }
         } else {
             a.dpc_n += st.count;
             a.dpc_max = a.dpc_max.max(st.max);

@@ -15,6 +15,7 @@ pub mod engine;
 pub mod etw;
 pub mod evlog;
 pub mod files;
+pub mod foreground;
 pub mod gpu;
 pub mod gputrace;
 pub mod health;

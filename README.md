@@ -74,7 +74,7 @@ days old) by itself.
 | --- | --- |
 | **The whole PC stopping** (cursor and sound gone for a moment) | A kernel-level stall that holds every logical CPU at the same instant for 100 ms or more is its own kind of incident, counted once even though both probes see it. Nothing that happened to be on the CPUs is blamed for it: they were stopped too. Instead the report says how often it happens and how long it lasts, whether the processors were idle or busy, **which device interrupts stopped and which kept arriving** during it, whether the timer interrupts that wake threads stopped, and what coincided with it (a slow request to a drive, a drive that had been asleep, a page fault) — in correlation language, with the number that coincided with *nothing* said just as plainly |
 | **Whether a stalled thread was ever woken at all** | Every context switch and thread wake-up is traced, so for each stall the report reconstructs what the scheduler did to its own measuring threads: they were never made runnable until it was over (nothing woke them — the timer, the clock, firmware or power management, below Windows' scheduling and below every driver), or they were made runnable **on time** and then not given a processor (the scheduler or the platform — and when the processor had nothing else to do at all, plainly so), or they ran and had to wait for something again. The whole-PC freeze finding counts the freezes each way: "in 9 of them the measuring threads were never made runnable, in 3 they were made runnable on time and left waiting" |
-| **A program kept waiting** at a moment you flagged | At each moment you flag, and at each CPU-starvation stall, the threads that spent longest ready-but-not-running and longest blocked, per program: how long, what held the processor instead, and which program's thread woke a blocked one ("blocked for 45 ms, woken by a thread in audiodg.exe"). Only waits long enough to feel (25 ms ready, 50 ms blocked), and never a program that chose to sleep. It says how long and by what, never **which** lock or **why**, and it is capped at medium severity for exactly that reason |
+| **A program kept waiting** at a moment you flagged | At each moment you flag, and at each CPU-starvation stall, the threads that spent longest ready-but-not-running and longest blocked, per program: how long, what held the processor instead, and which program's thread woke a blocked one ("blocked for 45 ms, woken by a thread in audiodg.exe"). Only waits long enough to feel (25 ms ready, 50 ms blocked), and never a program that chose to sleep. **The program you were using comes first**: once a second the tool notes which process owns the window in front (its process ID only, never a window title), so when that program was among those kept waiting it is named first and called that ("the program you were using, game.exe, was ready to run but got no processor for 40 ms"), and at a moment you flagged the report also says when it was *not* kept waiting. It says how long and by what, never **which** lock or **why**, and it is capped at medium severity for exactly that reason |
 | A misbehaving **driver** (GPU, network, Wi-Fi, USB, audio, storage, RGB/monitoring tools...) | Long DPC/ISR routines, attributed to the exact `.sys` file and named after the device it drives ("NVIDIA GeForce RTX 5090", "Realtek PCIe 5GbE Family Controller"), with the driver's version, date and age, and advice for the usual suspects |
 | **Firmware / BIOS / SMI**, hypervisor, or a driver running with interrupts off | The CPU "goes dark": a stall with no OS-visible activity and missing profiler interrupts |
 | A **program** starving the CPU | A normal-priority thread can't get a core; the report names who was on the CPUs |
@@ -84,7 +84,7 @@ days old) by itself.
 | **Utilities that talk to the motherboard hardware directly** (RGB, fan, monitoring, overclocking) | The kernel drivers they install are matched against a table where every row carries a published source — Microsoft's vulnerable-driver blocklist, a CVE record, a vendor advisory or an upstream project's own source tree — and the report names the product ("SignalRGB (SignalIo.sys)"), not just the file. Low severity by itself, because several of these at once is the normal case; attached as **context** to a whole-PC freeze, a "CPU went dark" or a periodic finding, where it makes "fully exit these one at a time" name the products actually installed. The mechanism is explained from primary sources only: an I/O write can be turned into a firmware interrupt that stops **every** processor core, which Microsoft describes as "latency spikes of 100 microseconds or more" and says Windows cannot intervene in. The report says plainly that it cannot prove that happened — reading the processor's own counter needs a kernel driver, and this tool ships none |
 | **Which program a driver was working for** | A driver runs because something asked it to, and the CPU samples inside a stall say who. When one program held the processor through most of a driver's stalls, the finding says so ("its stalls happened while iCUE.exe was on the processor, in 9 of the 11 of them") — worded so that Windows' own components are never described as something to close |
 | **Network filter drivers from other vendors** (VPNs, "network optimizers", security products) | Windows runs a filter's code inside its own networking files, so a stall in `NETIO.SYS` or `ndis.sys` can be another vendor's doing. The installed NDIS lightweight filters are read from the registry and the ones written by someone other than Microsoft are named on such a finding — and when they are all Microsoft's, that rules a whole class of software out |
-| **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry |
+| **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry. The per-driver table also says which kind of interrupt each driver's handler actually ran for during the run, and where that contradicts the configuration of the one device (or all same-kind devices) it serves, DETAILS says so in one line. A cap on the number of message-signaled interrupts (`MessageNumberLimit`) is shown where the registry holds one; the tool only reads it |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, with the program that issued the requests (by image name, several processes of one program counted as copies: "powershell.exe 2 copies"), and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth. For drives run by Windows' storage port driver (NVMe, SATA, UAS USB) it also says **where the time went**: how much was spent inside the drive (the drive, its cable or firmware) and how much waiting in Windows before reaching it (too much asked of the drive at once), with any retries; a drive that driver does not see (older USB "BOT" drives) is reported as not measured, never as zero |
 | **Antivirus, backup, cloud-sync or encryption software in the path of slow disk waits** | Each disk request and each slow hard page fault carries a *module-level* call stack: the drivers that were on it, never function names (those need Microsoft's symbol files, i.e. network access, which this tool does not have). So a slow request says which drivers it went through ("via FLTMGR.SYS -> Ntfs.sys -> WdFilter.sys"), with `--deep` a program stuck behind it also says which driver it was blocked in, and the disk finding totals the file-system filters in the path ("WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning) in 80%"). Filters are recognized from the load order group Windows registers them in, and named from Microsoft's documentation or the file's own version resource. Being in the path is never called the cause — every file access on Windows passes through several filters — and Microsoft Defender is never something to turn off: when it is in the path of most slow requests, the report points to Microsoft's documented folder exclusions, with Microsoft's warning |
@@ -237,8 +237,16 @@ Two independent sources, correlated on one clock (QPC):
   reports how many events arrived, and a session that cannot start never stops the run.
 * **The machine itself, read once at the end.** Loaded kernel modules (for the hardware-access driver
   table), the installed NDIS network filters and their binaries (registry only), and every present PCI
-  device's allocated interrupt resources and PCI device properties (cfgmgr32). All read-only, all
-  cheap, and none of it needs anything the tool is not already allowed to do.
+  device's allocated interrupt resources and PCI device properties (cfgmgr32), with the two
+  message-signaled-interrupt values Windows keeps for it (`MSISupported`, `MessageNumberLimit`). All
+  read-only, all cheap, and none of it needs anything the tool is not already allowed to do.
+* **The program in front, once a second.** Which process owns the foreground window
+  (`GetForegroundWindow`, `GetWindowThreadProcessId`): the process ID and nothing else — window
+  titles and class names are never read, because a title can be a document or a web page. When
+  Windows hands back no window (Microsoft documents that it can), or the lock screen is in front, the
+  moment is recorded as unknown and nothing is guessed; this tool's own window is skipped, since you brought it to the
+  front to press "I felt it!". It is one sleeping thread and two calls a second, too little for the
+  cost block to show.
 * **Latency probes.** A helper process in the REALTIME priority class runs one thread per CPU at
   priority 31, pinned, waking every millisecond (every 2 ms in light mode) and measuring how late each
   wake-up was. Each probe thread reports its own thread id to the parent, which is what lets the
@@ -347,6 +355,20 @@ was at least 85% in use when it was examined.
 **Flagged moments.** Wake-up delays from 1 ms up are kept for 30 seconds even though they are far below
 the stall threshold. When you press "I felt it", the worst one in the 3 seconds before the press goes
 through the same verdict logic as a full stall; if there is none, the CPU side is cleared for that hitch.
+The programs kept waiting in those 3 seconds are listed with the program that was in front when the
+interruption began named first, or a short line saying it was not kept waiting. The same program leads
+the "stuck behind it" list of a slow disk request and, at a CPU-starvation stall, gets a line of its
+own when it was kept waiting. When explorer.exe was in front, the report says the Windows desktop or
+File Explorer, not a program.
+
+**Which kind of interrupt fired.** The kernel logs an interrupt handler under one of two event
+types: 67, the one Microsoft documents as the ISR event, and 50, which Microsoft does not document on
+Learn but which its own TraceEvent library parses as an ISR and which independent reverse engineering
+names the message-signaled interrupt event. The two are counted apart per driver, so the driver table
+says "message-signaled", "line-based" or "both kinds" for what its handler actually ran for — an
+inference from those sources, which the DEVICE INTERRUPTS cross-check against Windows' own
+configuration can confirm or contradict on a real PC. Which device an interrupt came from is not in
+the event, so a driver serving several devices of different kinds is never judged.
 
 **P-cores and E-cores.** On hybrid processors (Intel 12th gen and later) Windows reports an efficiency
 class per logical CPU. Stalls are then labeled with the kind of core they hit ("on CPU 17 (E-core)"), and
@@ -407,8 +429,9 @@ probe stalls.
 
 **Before and after.** Every run writes a small text file of its numbers beside the report
 (`WTFIsStalling-<date>.wtfis`): run length, stall counts, worst wake-up delays, the verdict, and for
-each finding its subject, severity and the one or two numbers that measure it (stalls blamed, worst
-DPC/ISR time, slow requests, seconds throttled...). Nothing else: no prose, no event log, and nothing
+each finding its subject, severity and the numbers that measure it, up to eight (stalls blamed, worst
+DPC/ISR time, slow requests, seconds throttled...), the first being the one it is judged by. Files from
+earlier versions, which kept two, still load and compare. Nothing else: no prose, no event log, and nothing
 that identifies the PC or the person. The file carries a machine id that is only a hash of the
 processor model, the board model and the amount of memory — the same three things the report header
 prints — so runs from another PC in the same folder are never mixed in; no serial number, user name or
@@ -420,7 +443,8 @@ comparison into the RESULT block. Runs whose lengths differ by more than 25% are
 and the report says so; a run shorter than a minute, and a change of light mode between the two runs,
 are both called out, because they make the numbers less comparable. A number has to move by more than
 20% *and* by more than a small absolute floor before it counts as a change, so ordinary run-to-run
-variation reads as "about the same". Findings that only exist because of the event log's 7-day
+variation reads as "about the same". Each finding prints at most three of its numbers: the one it is
+judged by, then the ones that moved. Findings that only exist because of the event log's 7-day
 look-back (hardware errors, crashes, storage resets) are compared on what happened *while monitoring*
 and are marked as unable to answer yet, and low-severity, informational findings never decide the
 overall verdict. A problem that is absent from the second run is reported as "did not show up this
@@ -525,6 +549,11 @@ policy the project commits to.)*
   your user name, never your folder names. Anything else keeps only its drive and file name
   (`D:\...\name.ext`), and network paths lose the server and share. Long paths are shortened.
   The rule lives in one function, `files::public_path`, and every path in the report passes through it.
+
+## Changes
+
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md); the full notes are on the
+[releases page](https://github.com/Tyberious/WTFIsStalling/releases).
 
 ## Contributing
 

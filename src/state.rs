@@ -7,13 +7,25 @@ use std::sync::Mutex;
 pub const KIND_DPC: u8 = 0;
 pub const KIND_TIMER_DPC: u8 = 1;
 pub const KIND_THREADED_DPC: u8 = 2;
+/// PerfInfo event type 67, the documented ISR event. Called "line-based" only by elimination;
+/// see the comment on the ISR opcodes in `etw::events`.
 pub const KIND_ISR: u8 = 3;
+/// PerfInfo event type 50, undocumented on Learn; the message-signaled interrupt hook by the
+/// sources cited in `etw::events`. Kept apart from `KIND_ISR` so the report can say which kind of
+/// interrupt a driver's handler actually ran for.
+pub const KIND_ISR_MSI: u8 = 4;
+
+/// Both ISR kinds. Anything that tells a DPC from an ISR must ask this, not compare with one kind.
+pub fn is_isr(k: u8) -> bool {
+    k == KIND_ISR || k == KIND_ISR_MSI
+}
 
 pub fn kind_name(k: u8) -> &'static str {
     match k {
         KIND_DPC => "DPC",
         KIND_TIMER_DPC => "timer DPC",
         KIND_THREADED_DPC => "threaded DPC",
+        KIND_ISR_MSI => "ISR (MSI)",
         _ => "ISR",
     }
 }

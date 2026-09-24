@@ -124,6 +124,61 @@ pub struct ProgramWait {
     pub woken_by: Option<String>,
     /// How many of the examined moments this program was kept waiting at.
     pub moments: u32,
+    /// ...and at how many of those it was the program in front of the person (see `foreground`).
+    pub in_front: u32,
+}
+
+/// Keeps the longer ready-wait and the longer block of `into` and `w`, each with what went with it.
+fn merge_wait(into: &mut ProgramWait, w: &ProgramWait) {
+    if w.ready > into.ready {
+        into.ready = w.ready;
+        into.instead = w.instead.clone();
+        into.instead_idle = w.instead_idle;
+    }
+    if w.blocked > into.blocked {
+        into.blocked = w.blocked;
+        into.blocked_reason = w.blocked_reason;
+        into.woken_by = w.woken_by.clone();
+    }
+}
+
+/// The event-log lines for the programs kept waiting at one flagged moment: at most three, and
+/// the program in front of the person first when it was one of them, whatever waited longer.
+/// When it was not among them, one short line says so - at a flagged moment that is the question
+/// the person has ("was it my game?"). `front` is `None` when that is not known: then nothing is
+/// said about it at all.
+pub(crate) fn wait_lines(rows: &[(String, ProgramWait)], front: Option<&str>) -> Vec<String> {
+    let mut ordered: Vec<&(String, ProgramWait)> = rows.iter().collect();
+    let at = front.and_then(|f| ordered.iter().position(|(name, _)| name == f));
+    if let Some(i) = at {
+        ordered[..=i].rotate_right(1);
+    }
+    let mut out = Vec::new();
+    for (name, w) in ordered.into_iter().take(3) {
+        let who = if front == Some(name.as_str()) { format!("{},", crate::foreground::subject(name)) } else { name.clone() };
+        if w.ready > 0 {
+            let instead = if w.instead_idle {
+                " while the processor had nothing else to do".to_string()
+            } else {
+                w.instead.as_ref().map(|i| format!(" while {i} held the processor")).unwrap_or_default()
+            };
+            out.push(format!("    Kept waiting: {who} was ready to run but got no processor for {}{instead}", fmt_dur(w.ready)));
+        }
+        if w.blocked > 0 {
+            let why = switches::wait_reason_name(w.blocked_reason).map(|r| format!(" ({r})")).unwrap_or_default();
+            let by = w.woken_by.as_ref().map(|b| format!(", woken by {b}")).unwrap_or_default();
+            out.push(format!("    Kept waiting: {who} was blocked for {}{why}{by}", fmt_dur(w.blocked)));
+        }
+    }
+    if let (Some(front), None) = (front, at) {
+        let subject = crate::foreground::subject_capitalized(front);
+        out.push(if rows.is_empty() {
+            format!("    {subject}, was not kept waiting in that window.")
+        } else {
+            format!("    {subject}, was not among the programs kept waiting.")
+        });
+    }
+    out
 }
 
 /// A storage event that overlapped a freeze. Never a cause, only a coincidence.
@@ -279,6 +334,8 @@ pub struct Analyzer {
     scsi_addrs: HashMap<u32, Option<ScsiAddr>>,
     /// The once-a-second CPU clock samples, for "the processor was throttled at the time".
     clock: Option<crate::cpuclock::Samples>,
+    /// Which process owned the foreground window, once a second (see `foreground`).
+    foreground: Option<crate::foreground::Log>,
     /// Memory in use right now, %; `None` where it must not be read (tests).
     mem_load: fn() -> Option<u32>,
 }
@@ -384,6 +441,7 @@ impl Analyzer {
             disk_split: HashMap::new(),
             scsi_addrs: HashMap::new(),
             clock: None,
+            foreground: None,
             mem_load: || Some(crate::util::memory_load()),
         }
     }
@@ -444,6 +502,7 @@ impl Analyzer {
             disk_split: HashMap::new(),
             scsi_addrs: HashMap::new(),
             clock: None,
+            foreground: None,
             mem_load: || None,
         }
     }
@@ -679,7 +738,16 @@ impl Analyzer {
         // A normal-priority thread that could not get a processor is exactly the position an app
         // or a game is in, so the same window is worth asking who else was kept waiting.
         if class == IncidentClass::Starvation {
-            self.collect_waits(start - ms_to_ticks(100.0), end);
+            let front = self.front_program(start, start);
+            let rows = self.collect_waits(start - ms_to_ticks(100.0), end, front.as_deref()).unwrap_or_default();
+            // Only the program in front is worth a line at every such stall; the rest are totaled
+            // in the findings. Saying it did NOT wait is kept for the moments the person flagged.
+            let mine: Vec<(String, ProgramWait)> = rows.into_iter().filter(|(name, _)| Some(name.as_str()) == front.as_deref()).collect();
+            if !mine.is_empty() {
+                for line in wait_lines(&mine, front.as_deref()) {
+                    say!("{line}");
+                }
+            }
         }
         self.incidents.push(IncidentSummary { class, start, dur: worst, culprit, marked: false, cpus, on_cpu, freeze, busy_core });
     }
@@ -787,16 +855,21 @@ impl Analyzer {
     /// The window is its own, not the one the DPC/sample evidence was gathered over: a flagged
     /// moment reaches three seconds back and a little past the mark, while the evidence around it
     /// is cut to the worst interruption inside that. Both are right for what they answer.
-    fn collect_waits(&mut self, from: i64, to: i64) {
-        let Some((sw, rd)) = self.gather_switches(from, to) else { return };
+    ///
+    /// Returns THIS window's programs, worst first (the run totals are kept in `program_waits`),
+    /// or `None` when the switch rings do not cover it. `front` is the program in front of the
+    /// person then, whose count of such moments is kept too.
+    fn collect_waits(&mut self, from: i64, to: i64, front: Option<&str>) -> Option<Vec<(String, ProgramWait)>> {
+        let (sw, rd) = self.gather_switches(from, to)?;
         self.wait_moments += 1;
         let rows = switches::waits(&sw, &rd, from, to);
         let ready_floor = ms_to_ticks(switches::FELT_READY_MS);
         let blocked_floor = ms_to_ticks(switches::FELT_BLOCKED_MS);
         let blocked_ceiling = ms_to_ticks(switches::MAX_BLOCKED_MS);
         let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
-        // Every program named in one window is counted once, however many of its threads waited.
-        let mut seen: HashSet<String> = HashSet::new();
+        // Per program in this window: its threads' worst waits merged, so every program named is
+        // counted once however many of its threads waited.
+        let mut here: HashMap<String, ProgramWait> = HashMap::new();
         for w in rows {
             let ready = if w.ready >= ready_floor { w.ready } else { 0 };
             let long_enough = w.blocked >= blocked_floor && w.blocked <= blocked_ceiling;
@@ -827,22 +900,31 @@ impl Analyzer {
                 let pid = self.pid_of(tid);
                 (pid != PID_UNKNOWN && pid != 0).then(|| process_name(&self.procs.label(pid, tid)))
             });
-            let fresh = seen.insert(name.clone());
-            let e = self.program_waits.entry(name).or_default();
-            if fresh {
-                e.moments += 1;
-            }
-            if ready > e.ready {
-                e.ready = ready;
-                e.instead = instead_name;
-                e.instead_idle = instead_idle;
-            }
-            if blocked > e.blocked {
-                e.blocked = blocked;
-                e.blocked_reason = w.blocked_reason;
-                e.woken_by = woken_by;
-            }
+            let e = here.entry(name.clone()).or_default();
+            e.moments = 1;
+            e.in_front = u32::from(front == Some(name.as_str()));
+            merge_wait(
+                e,
+                &ProgramWait {
+                    instead: instead_name,
+                    instead_idle,
+                    ready,
+                    blocked,
+                    blocked_reason: w.blocked_reason,
+                    woken_by,
+                    ..ProgramWait::default()
+                },
+            );
         }
+        for (name, w) in &here {
+            let e = self.program_waits.entry(name.clone()).or_default();
+            e.moments += 1;
+            e.in_front += w.in_front;
+            merge_wait(e, w);
+        }
+        let mut rows: Vec<(String, ProgramWait)> = here.into_iter().collect();
+        rows.sort_by_key(|(name, w)| (std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
+        Some(rows)
     }
 
     /// "4" on an ordinary PC; "4 (E-core)" where the cores are not all the same. Nothing is
@@ -948,9 +1030,15 @@ impl Analyzer {
         self.print_io_context(&ev);
         self.print_context(start, end);
         // The whole window the person flagged, not just the worst interruption in it: a hitch
-        // someone feels is usually a program waiting, not a processor being held.
-        self.collect_waits(from, to);
-        self.print_waits();
+        // someone feels is usually a program waiting, not a processor being held. Only THIS
+        // window's waiters (not the run's so far), with the program that was in front when the
+        // worst interruption began named first.
+        let front = self.front_program(from, start);
+        if let Some(rows) = self.collect_waits(from, to, front.as_deref()) {
+            for line in wait_lines(&rows, front.as_deref()) {
+                say!("{line}");
+            }
+        }
         let mut cpus: Vec<u16> = cluster.iter().filter_map(|s| s.cpu).collect();
         cpus.sort_unstable();
         cpus.dedup();
@@ -979,27 +1067,6 @@ impl Analyzer {
         }
     }
 
-    /// The three worst programs kept waiting, for the event-log entry of a flagged moment.
-    fn print_waits(&mut self) {
-        let mut rows: Vec<(String, ProgramWait)> = self.program_waits.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        rows.sort_by_key(|(name, w)| (std::cmp::Reverse(w.ready.max(w.blocked)), name.clone()));
-        for (name, w) in rows.iter().take(3) {
-            if w.ready > 0 {
-                let instead = if w.instead_idle {
-                    " while the processor had nothing else to do".to_string()
-                } else {
-                    w.instead.as_ref().map(|i| format!(" while {i} held the processor")).unwrap_or_default()
-                };
-                say!("    Kept waiting: {name} was ready to run but got no processor for {}{instead}", fmt_dur(w.ready));
-            }
-            if w.blocked > 0 {
-                let why = switches::wait_reason_name(w.blocked_reason).map(|r| format!(" ({r})")).unwrap_or_default();
-                let by = w.woken_by.as_ref().map(|b| format!(", woken by {b}")).unwrap_or_default();
-                say!("    Kept waiting: {name} was blocked for {}{why}{by}", fmt_dur(w.blocked));
-            }
-        }
-    }
-
     /// Records the graphics-kernel trace to read alongside the kernel one.
     pub fn set_gpu_trace(&mut self, trace: Arc<GpuTrace>) {
         self.gputrace = Some(trace);
@@ -1008,6 +1075,47 @@ impl Analyzer {
     /// The CPU clock samples, so an incident can say whether the processor was throttled then.
     pub fn set_cpu_clock(&mut self, samples: crate::cpuclock::Samples) {
         self.clock = Some(samples);
+    }
+
+    /// The once-a-second record of which process owned the foreground window.
+    pub fn set_foreground(&mut self, log: crate::foreground::Log) {
+        self.foreground = Some(log);
+    }
+
+    /// The program in front of the person at `at` (looking back to `from`), by program name, or
+    /// `None` when that is not known or is nothing anyone was "using" (see `foreground::usable`).
+    pub(crate) fn front_program(&mut self, from: i64, at: i64) -> Option<String> {
+        let pid = {
+            let log = self.foreground.as_ref()?;
+            let samples = log.lock().unwrap_or_else(|e| e.into_inner());
+            crate::foreground::in_front(&samples, from, at)?
+        };
+        let name = process_name(&self.procs.label(pid, 0));
+        crate::foreground::usable(&name).then_some(name)
+    }
+
+    /// --debug only: what the foreground sampler recorded, by program name, so an elevated live
+    /// run shows whether the calls work from an elevated process (all "unknown" means they do not).
+    pub(crate) fn foreground_debug(&mut self) -> Option<String> {
+        use crate::foreground::Front;
+        let samples = self.foreground.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (mut unknown, mut own) = (0usize, 0usize);
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        for s in &samples {
+            match s.front {
+                Front::Unknown => unknown += 1,
+                Front::Own => own += 1,
+                Front::Pid(pid) => *by_name.entry(process_name(&self.procs.label(pid, 0))).or_default() += 1,
+            }
+        }
+        let mut top: Vec<(String, usize)> = by_name.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let list: Vec<String> = top.iter().take(6).map(|(n, c)| format!("{n} {c}")).collect();
+        Some(format!(
+            "debug: program in front (sampled once a second): {} samples, {unknown} unknown, {own} this tool; {}",
+            samples.len(),
+            list.join(", ")
+        ))
     }
 
     /// Records the storage port driver's trace to read alongside the kernel one.
@@ -1138,7 +1246,7 @@ impl Analyzer {
                     r.0 += overlap;
                     r.1 = r.1.max(e.end - e.start);
                     r.2 += 1;
-                    if e.kind != KIND_ISR {
+                    if !is_isr(e.kind) {
                         dpc_starts.push(e.start.max(s.start));
                     }
                 }
@@ -1927,6 +2035,9 @@ impl Analyzer {
                 named.push((name, s.waited, at));
             }
             victims = diskstuck::by_program(&named);
+            // The program in front of the person while the request was outstanding goes first.
+            let front = self.front_program(start, slow.end);
+            diskstuck::front_first(&mut victims, front.as_deref());
             for c in &found {
                 if self.pid_of(c.waiter) == SYSTEM_PID {
                     continue;
@@ -1962,6 +2073,9 @@ impl Analyzer {
             let e = behind.stuck.entry(v.name.clone()).or_default();
             e.0 += 1;
             e.1 += v.longest;
+            if v.in_front {
+                *behind.stuck_in_front.entry(v.name.clone()).or_default() += 1;
+            }
         }
         for (w, t, h, _) in &chains {
             let e = behind.chains.entry((w.clone(), h.clone())).or_default();
@@ -2735,6 +2849,71 @@ mod tests {
         assert!(az.explain_io(&slow).stuck.is_none());
         assert_eq!((az.disk_behind[&99].checked, az.disk_behind[&99].uncovered), (0, 0));
         assert_eq!(az.disk_behind[&99].kinds[&diskstuck::Kind::PagedFile], 1, "what the request was is still known");
+
+        // The same request with the foreground recorded: explorer.exe in front is the desktop or
+        // File Explorer, never "the program you were using"; the disk's tally counts it.
+        use crate::foreground::{Front, Sample};
+        let mut az = build(0.0, true);
+        az.set_foreground(Arc::new(Mutex::new(vec![Sample { ts: ms(1500.0), front: Front::Pid(100) }])));
+        let w = az.explain_io(&slow);
+        assert_eq!(
+            w.stuck.as_deref(),
+            Some("    Stuck behind it: what you were using, the Windows desktop or File Explorer (explorer.exe) (1 thread, up to 700 ms)")
+        );
+        assert_eq!(az.disk_behind[&99].stuck_in_front["explorer.exe"], 1);
+        // Locked screen or UAC prompt: unknown, and the line is exactly as without a sampler.
+        let mut az = build(0.0, true);
+        az.set_foreground(Arc::new(Mutex::new(vec![Sample { ts: ms(1500.0), front: Front::Unknown }])));
+        assert_eq!(az.explain_io(&slow).stuck.as_deref(), Some("    Stuck behind it: explorer.exe (1 thread, up to 700 ms)"));
+        assert!(az.disk_behind[&99].stuck_in_front.is_empty());
+    }
+
+    /// At a flagged moment the program in front is named first among those kept waiting, whatever
+    /// waited longer; when it was not among them one short line says so; when nobody knows what
+    /// was in front, nothing is said about it.
+    #[test]
+    fn a_flagged_moment_names_the_program_in_front_first_or_says_it_did_not_wait() {
+        let w = |ready: f64, blocked: f64| ProgramWait {
+            ready: ms(ready),
+            blocked: ms(blocked),
+            blocked_reason: 13,
+            instead: Some("MsMpEng.exe".into()),
+            moments: 1,
+            ..ProgramWait::default()
+        };
+        let rows = vec![
+            ("updater.exe".to_string(), w(300.0, 0.0)),
+            ("Discord.exe".to_string(), w(90.0, 0.0)),
+            ("game.exe".to_string(), w(40.0, 0.0)),
+        ];
+
+        let lines = wait_lines(&rows, Some("game.exe"));
+        assert_eq!(
+            lines[0],
+            "    Kept waiting: the program you were using, game.exe, was ready to run but got no processor for 40.00 ms while MsMpEng.exe held the processor"
+        );
+        assert!(lines[1].contains("updater.exe") && lines[2].contains("Discord.exe") && lines.len() == 3, "{lines:?}");
+
+        let lines = wait_lines(&rows, Some("chrome.exe"));
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains("updater.exe"), "the usual order when the program in front did not wait: {lines:?}");
+        assert_eq!(lines[3], "    The program you were using, chrome.exe, was not among the programs kept waiting.");
+
+        let lines = wait_lines(&[], Some("explorer.exe"));
+        assert_eq!(
+            lines,
+            ["    What you were using, the Windows desktop or File Explorer (explorer.exe), was not kept waiting in that window."]
+        );
+
+        let lines = wait_lines(&rows, None);
+        assert_eq!(lines.len(), 3, "unknown (locked screen, UAC prompt): nothing is said about it");
+        assert!(lines.iter().all(|l| !l.contains("you were using")), "{lines:?}");
+        assert!(wait_lines(&[], None).is_empty());
+
+        // A blocked wait carries the same subject.
+        let rows = vec![("game.exe".to_string(), w(0.0, 120.0))];
+        let lines = wait_lines(&rows, Some("game.exe"));
+        assert!(lines[0].starts_with("    Kept waiting: the program you were using, game.exe, was blocked for 120 ms"), "{lines:?}");
     }
 
     /// With the storage port driver's trace, the "Request:" line says where the time went, and

@@ -9,8 +9,8 @@ use crate::diskwhy::{Cause, DiskWhy};
 use crate::evlog;
 use crate::files;
 use crate::health::{self, DriveHealth};
-use crate::procs::known_worker;
 use crate::procs::process_name;
+use crate::procs::{known_worker, windows_part};
 use crate::stacks;
 use crate::state::LatStat;
 use crate::storport::split::{self as storsplit, SplitTotals};
@@ -713,30 +713,6 @@ pub(super) fn not_on_storport(az: &mut crate::analyze::Analyzer, report: &Storag
     out
 }
 
-/// Parts of Windows that can turn up doing disk work, beyond `known_worker`'s table: none of them
-/// is something a person can close or run "one at a time".
-const WINDOWS_PARTS: &[&str] = &[
-    "explorer.exe",
-    "lsass.exe",
-    "services.exe",
-    "wininit.exe",
-    "winlogon.exe",
-    "smss.exe",
-    "sihost.exe",
-    "runtimebroker.exe",
-    "searchhost.exe",
-    "fontdrvhost.exe",
-    "ctfmon.exe",
-    "taskhostw.exe",
-    "spoolsv.exe",
-    "memory compression",
-];
-
-fn windows_part(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    name.starts_with("System") || known_worker(name).is_some_and(|w| w.windows) || WINDOWS_PARTS.contains(&lower.as_str())
-}
-
 /// A process as the disk finding names it: parts of Windows marked as such, so that nothing
 /// reads as "this program is the problem, close it".
 pub(super) fn shown(name: &str) -> String {
@@ -796,8 +772,15 @@ fn behind_sentences(b: &DiskBehind, sched: bool) -> Vec<String> {
     if sched {
         let top = b.top_stuck(3);
         if !top.is_empty() {
-            let list: Vec<String> =
-                top.iter().map(|(name, times, total)| format!("{}: behind {times}, {} in total", shown(name), fmt_dur(*total))).collect();
+            // The program the person was looking at comes first and is called that, however much
+            // longer something in the background waited (`DiskBehind::top_stuck`).
+            let list: Vec<String> = top
+                .iter()
+                .map(|(name, times, total, front)| {
+                    let was = if *front > 0 { format!(" ({}, at {front} of them)", crate::foreground::role(name)) } else { String::new() };
+                    format!("{}{was}: behind {times}, {} in total", shown(name), fmt_dur(*total))
+                })
+                .collect();
             out.push(format!("Stuck behind them (waiting until they completed): {}.", list.join("; ")));
         } else if b.checked > 0 {
             out.push(format!("No program was seen stopped waiting for any of the {} that could be checked.", b.checked));

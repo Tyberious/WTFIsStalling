@@ -24,7 +24,7 @@ use crate::reg::hklm_str;
 use crate::summary::{RunData, Summary};
 use crate::topology::topology;
 use crate::util::{self, ms_to_ticks, wide};
-use crate::{analyze, baseline, cpuclock, etw, gpu, gputrace, modules, overhead, probe, say, state, storport};
+use crate::{analyze, baseline, cpuclock, etw, foreground, gpu, gputrace, modules, overhead, probe, say, state, storport};
 
 pub use crate::analyze::mark_now;
 
@@ -426,6 +426,8 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     probe::spawn_scheduler_probe(cfg.sched_stall_ms, tx.clone(), probe_stop.clone(), probe_stats.clone());
     let cpu_clock = cpuclock::spawn(probe_stop.clone());
     let gpu_log = gpu::spawn(probe_stop.clone());
+    // Which program is in front, once a second: process ID only, never a window title.
+    let foreground = foreground::spawn(probe_stop.clone());
     let mut probe_child = match probe::spawn_kernel_probes(cfg.stall_ms, probe_ms, tx, probe_stats.clone()) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -446,6 +448,7 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         analyzer.set_storage_trace(trace.clone());
     }
     analyzer.set_cpu_clock(cpu_clock.clone());
+    analyzer.set_foreground(foreground);
     say!(
         "Monitoring {} kernel modules; stall thresholds {} ms kernel-level / {} ms CPU-starvation. Reproduce the hitch now.",
         analyzer.modules.len(),

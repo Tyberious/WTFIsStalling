@@ -149,12 +149,23 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
         //
         // Opcodes 66-69 are documented on https://learn.microsoft.com/en-us/windows/win32/etw/perfinfo
         //   66 Threaded DPC (Learn spells the type name "ThreadDPC"), 67 ISR, 68 DPC, 69 DPC timer.
-        // Opcode 50 is NOT documented by Microsoft: there is no ISR-MSI class on Learn and 50 is
-        // absent from the PerfInfo opcode table. It is treated as an ISR here on the strength of
-        // Geoff Chappell's hook-id table, which lists 0x0F32 = PERFINFO_LOG_TYPE_MSI_INTERRUPT for
-        // Windows 7 and later - reputable reverse engineering, not a primary source:
-        // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntwmi/wmi_trace_packet/hookid.htm
-        // The sanity bounds below are what guards against that assumption being wrong.
+        // The ISR class page (https://learn.microsoft.com/en-us/windows/win32/etw/isr) declares
+        // only [EventType{67}, EventTypeName{"ISR"}], "the event type class for interrupt service
+        // routine (ISR) events"; it says nothing about line-based or message-signaled interrupts.
+        // Opcode 50 is NOT documented by Microsoft on Learn: no class names it and 50 is absent
+        // from the PerfInfo opcode table. Two other sources:
+        //   * Microsoft's own TraceEvent library (PerfView) registers its ISR template for BOTH 67
+        //     and 50 (KernelTraceEventParser.cs, `PerfInfoISR`), and its ISRTraceData reads an
+        //     extra `Message` field when the payload is long enough - code, not documentation:
+        //     https://github.com/microsoft/perfview/blob/main/src/TraceEvent/Parsers/KernelTraceEventParser.cs
+        //   * Geoff Chappell's hook-id table lists 0x0F32 = PERFINFO_LOG_TYPE_MSI_INTERRUPT (6.1 and
+        //     later) next to 0x0F43 = PERFINFO_LOG_TYPE_INTERRUPT (5.1 and later) - reputable
+        //     reverse engineering, not a primary source:
+        //     https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntwmi/wmi_trace_packet/hookid.htm
+        // So 50 is kept apart as "message-signaled", and 67 is called "line-based" only by
+        // elimination (the plain interrupt hook, which predates MSI). Both are inferences; the
+        // DEVICE INTERRUPTS cross-check in the report is what shows them right or wrong on a PC.
+        // The sanity bounds below guard the payload reads either way.
         (GUID_PERFINFO, 50 | 66..=69) => {
             let start = rd_u64(d, 0)? as i64;
             let routine = rd_u64(d, 8)?;
@@ -167,7 +178,8 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
             }
             let kind = match opcode {
                 66 => KIND_THREADED_DPC,
-                50 | 67 => KIND_ISR,
+                50 => KIND_ISR_MSI,
+                67 => KIND_ISR,
                 68 => KIND_DPC,
                 _ => KIND_TIMER_DPC,
             };
@@ -428,8 +440,27 @@ mod tests {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
         handle(&sh, &mut inner, GUID_PERFINFO, 50, 9_002_000, 0, &exec_payload(9_000_000, 0xFFFF_F800_0000_1000));
-        assert_eq!(inner.execs.back().unwrap().kind, KIND_ISR);
+        let kind = inner.execs.back().unwrap().kind;
+        assert_eq!(kind, KIND_ISR_MSI);
+        assert!(is_isr(kind), "an MSI ISR is still an ISR everywhere a DPC is told from an ISR");
         assert!(matches!(inner.notable.as_slice(), [Notable::LongExec(_)]));
+    }
+
+    /// Opcode 50 (the MSI hook) and 67 (the documented ISR event) from ONE routine stay two
+    /// tallies, so the report can say which kind actually fired.
+    #[test]
+    fn the_two_isr_opcodes_are_tallied_apart_per_routine() {
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        let routine = 0xFFFF_F800_0000_2000;
+        handle(&sh, &mut inner, GUID_PERFINFO, 50, 1_000_100, 0, &exec_payload(1_000_000, routine));
+        handle(&sh, &mut inner, GUID_PERFINFO, 50, 2_000_300, 1, &exec_payload(2_000_000, routine));
+        handle(&sh, &mut inner, GUID_PERFINFO, 67, 3_000_200, 1, &exec_payload(3_000_000, routine));
+        assert_eq!(inner.routines[&(routine, KIND_ISR_MSI)].count, 2);
+        assert_eq!(inner.routines[&(routine, KIND_ISR_MSI)].max, 300);
+        assert_eq!(inner.routines[&(routine, KIND_ISR)].count, 1);
+        assert!(!is_isr(KIND_DPC) && !is_isr(KIND_TIMER_DPC) && !is_isr(KIND_THREADED_DPC));
+        assert_eq!((kind_name(KIND_ISR), kind_name(KIND_ISR_MSI)), ("ISR", "ISR (MSI)"));
     }
 
     #[test]

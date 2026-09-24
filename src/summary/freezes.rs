@@ -286,9 +286,9 @@ pub(super) fn whole_pc(cx: &mut Ctx) {
              High performance. Those are also the settings a 'latency tweak' guide most often changes.",
         );
     }
-    // Per hour rather than a raw count, so a 5-minute run and an hour-long one compare. Only two
-    // metrics are kept per finding (`MAX_METRICS`), so how many freezes had no wake-up is left to
-    // the evidence above rather than taking the place of one of these.
+    // Per hour rather than a raw count, so a 5-minute run and an hour-long one compare. How many
+    // freezes had no wake-up stays in the evidence above: it is a share of these, not a number a
+    // fix would be judged by.
     cx.found.measure(FREEZE_KEY, Metric::flat("freezes per hour", per_hour));
     cx.found.measure(FREEZE_KEY, Metric::ms("worst freeze", ticks_to_ms(worst)));
 }

@@ -122,6 +122,10 @@ pub struct PciInterrupt {
     pub mode: IrqMode,
     pub support: Support,
     pub opt_in: MsiOptIn,
+    /// `MessageNumberLimit`, when the registry holds one: "a REG_DWORD value that specifies the
+    /// maximum number of MSIs to allocate" (same Learn page as `MsiOptIn`). Read, never written,
+    /// and shown only where it is set: Microsoft documents no default for it being absent.
+    pub message_limit: Option<u32>,
     /// How many interrupt resources the device holds. A device on MSI-X can hold dozens.
     pub allocations: usize,
 }
@@ -178,6 +182,75 @@ pub fn opt_in_of(value: Option<u32>) -> MsiOptIn {
     }
 }
 
+/// Which kind of interrupt a driver's handler was seen running for in the kernel trace: ISR events
+/// with PerfInfo event type 50 (the message-signaled hook) or 67 (the documented ISR event, by
+/// elimination the line-based kind). See `etw::events` for what is and is not documented.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Observed {
+    Message,
+    Line,
+    Both,
+}
+
+impl Observed {
+    /// From the two counts; `None` when the driver ran no interrupt handler at all.
+    pub fn from_counts(line: u64, message: u64) -> Option<Observed> {
+        match (line > 0, message > 0) {
+            (true, true) => Some(Observed::Both),
+            (true, false) => Some(Observed::Line),
+            (false, true) => Some(Observed::Message),
+            (false, false) => None,
+        }
+    }
+
+    /// Plain words for a table cell.
+    pub fn words(self) -> &'static str {
+        match self {
+            Observed::Message => "message-signaled",
+            Observed::Line => "line-based",
+            Observed::Both => "both kinds",
+        }
+    }
+}
+
+/// Where the configuration and the trace disagree about one driver, the line that says so.
+///
+/// Only drivers whose devices are ALL in the interrupt list and ALL on the same mode are judged:
+/// a driver that serves several devices on different modes, or a device this list does not have
+/// (not PCI, no interrupt resources, or signals that disagreed), could be where an interrupt came
+/// from, and which device's interrupt a handler ran for is not in the event. So nothing is said
+/// about those rather than guessing. `served` is the instance ids of the present devices the
+/// driver serves (from the device registry).
+pub fn disagreement(driver: &str, served: &[&str], devices: &[PciInterrupt], seen: Observed) -> Option<String> {
+    let mine: Vec<&PciInterrupt> = served.iter().filter_map(|id| devices.iter().find(|d| d.instance_id.eq_ignore_ascii_case(id))).collect();
+    if mine.is_empty() || mine.len() != served.len() {
+        return None;
+    }
+    let mode = mine[0].mode;
+    if mine.iter().any(|d| d.mode != mode) {
+        return None;
+    }
+    let configured = match mode {
+        IrqMode::LineBased => Observed::Line,
+        IrqMode::Message => Observed::Message,
+    };
+    if seen == configured {
+        return None;
+    }
+    let what = if mine.len() == 1 { format!("its device ({}) is", mine[0].name) } else { format!("all {} of its devices are", mine.len()) };
+    let config_words = match mode {
+        IrqMode::LineBased => "on a line-based interrupt",
+        IrqMode::Message => "on message-signaled interrupts",
+    };
+    Some(format!(
+        "  {driver}: Windows' configuration says {what} {config_words}, but the trace saw its interrupt handler run for {} interrupts.",
+        match seen {
+            Observed::Both => "both kinds of",
+            other => other.words(),
+        }
+    ))
+}
+
 /// Every present PCI device, with the interrupt mode it is actually using.
 ///
 /// Devices that take no interrupt at all (most bridges), and devices whose two signals disagree,
@@ -203,16 +276,16 @@ pub fn devices() -> Vec<PciInterrupt> {
                 .or_else(|| reg::hklm_path(&key, "DeviceDesc"))
                 .map(|d| clean_desc(&d))
                 .unwrap_or_else(|| instance_id.clone());
-            let msi = reg::hklm_dword(
-                &format!(r"{key}\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"),
-                "MSISupported",
-            );
+            // Both values live in the device's hardware key; read-only (`reg` never writes).
+            let props = format!(r"{key}\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties");
+            let msi = reg::hklm_dword(&props, "MSISupported");
             out.push(PciInterrupt {
                 instance_id,
                 name,
                 mode: first,
                 support: hardware_support(devnode_u32(devinst, &DEVPKEY_PCI_INTERRUPT_SUPPORT)),
                 opt_in: opt_in_of(msi),
+                message_limit: reg::hklm_dword(&props, "MessageNumberLimit"),
                 allocations: modes.len(),
             });
         }
@@ -319,12 +392,68 @@ mod tests {
             mode,
             support,
             opt_in: MsiOptIn::NotRecorded,
+            message_limit: None,
             allocations: 1,
         };
         assert!(dev(IrqMode::LineBased, Support::HasMessage).legacy_despite_hardware());
         assert!(!dev(IrqMode::LineBased, Support::Unknown).legacy_despite_hardware(), "unknown hardware is not evidence");
         assert!(!dev(IrqMode::LineBased, Support::LineOnly).legacy_despite_hardware(), "nothing to say: the hardware has no choice");
         assert!(!dev(IrqMode::Message, Support::HasMessage).legacy_despite_hardware());
+    }
+
+    #[test]
+    fn what_the_trace_saw_is_read_from_the_two_counts() {
+        assert_eq!(Observed::from_counts(0, 0), None, "no interrupt handler ran: nothing to say");
+        assert_eq!(Observed::from_counts(5, 0), Some(Observed::Line));
+        assert_eq!(Observed::from_counts(0, 9), Some(Observed::Message));
+        assert_eq!(Observed::from_counts(1, 1), Some(Observed::Both));
+        assert_eq!(Observed::Message.words(), "message-signaled");
+        assert_eq!(Observed::Line.words(), "line-based");
+    }
+
+    fn pci(id: &str, name: &str, mode: IrqMode) -> PciInterrupt {
+        PciInterrupt {
+            instance_id: id.into(),
+            name: name.into(),
+            mode,
+            support: Support::HasMessage,
+            opt_in: MsiOptIn::NotRecorded,
+            message_limit: None,
+            allocations: 1,
+        }
+    }
+
+    /// A disagreement is one fact line, and only where it cannot be about the wrong device.
+    #[test]
+    fn configuration_and_trace_are_compared_only_where_the_device_is_certain() {
+        let devices = [
+            pci(r"PCI\VEN_10DE&DEV_1\3&1", "NVIDIA GeForce RTX 5090", IrqMode::Message),
+            pci(r"PCI\VEN_1022&DEV_2\3&2", "High Definition Audio Controller", IrqMode::LineBased),
+            pci(r"PCI\VEN_1022&DEV_2\3&3", "High Definition Audio Controller", IrqMode::LineBased),
+            pci(r"PCI\VEN_144D&DEV_3\4&1", "Standard NVM Express Controller", IrqMode::Message),
+        ];
+        // One device, configured line-based, handler seen on the MSI event: said, naming the device.
+        let line = disagreement("gpu.sys", &[r"PCI\VEN_1022&DEV_2\3&2"], &devices, Observed::Message).expect("a disagreement");
+        assert!(line.contains("its device (High Definition Audio Controller) is on a line-based interrupt"), "{line}");
+        assert!(line.contains("message-signaled interrupts"), "{line}");
+        // ...and the other way round, with the id in another case (the registry is case-blind).
+        let line = disagreement("nvlddmkm.sys", &[r"pci\ven_10de&dev_1\3&1"], &devices, Observed::Line).unwrap();
+        assert!(line.contains("on message-signaled interrupts, but the trace saw") && line.ends_with("line-based interrupts."), "{line}");
+        // Two devices on the same mode: still certain, and counted.
+        let both = [r"PCI\VEN_1022&DEV_2\3&2", r"PCI\VEN_1022&DEV_2\3&3"];
+        let line = disagreement("HDAudBus.sys", &both, &devices, Observed::Both).unwrap();
+        assert!(line.contains("all 2 of its devices are") && line.contains("both kinds of interrupts"), "{line}");
+        // Agreement says nothing.
+        assert_eq!(disagreement("HDAudBus.sys", &both, &devices, Observed::Line), None);
+        assert_eq!(disagreement("stornvme.sys", &[r"PCI\VEN_144D&DEV_3\4&1"], &devices, Observed::Message), None);
+        // A driver serving devices on different modes: which one fired is not in the event.
+        let mixed = [r"PCI\VEN_10DE&DEV_1\3&1", r"PCI\VEN_1022&DEV_2\3&2"];
+        assert_eq!(disagreement("x.sys", &mixed, &devices, Observed::Line), None);
+        assert_eq!(disagreement("x.sys", &mixed, &devices, Observed::Message), None);
+        // A device the interrupt list does not have (not PCI, or no interrupt resources) could be
+        // the one that fired: nothing is said.
+        assert_eq!(disagreement("x.sys", &[r"PCI\VEN_1022&DEV_2\3&2", r"ACPI\PNP0303\0"], &devices, Observed::Message), None);
+        assert_eq!(disagreement("Wdf01000.sys", &[], &devices, Observed::Message), None, "serves no device of its own");
     }
 
     /// Prints what this machine really has. No count asserted: CI runners have no PCI devices.
@@ -335,6 +464,9 @@ mod tests {
         println!("{} PCI devices hold interrupt resources ({:?})", found.len(), start.elapsed());
         for d in found.iter().filter(|d| d.mode == IrqMode::LineBased) {
             println!("  LINE-BASED  {:<52} hardware={:?} MSISupported={:?}", d.name, d.support, d.opt_in);
+        }
+        for d in found.iter().filter(|d| d.message_limit.is_some()) {
+            println!("  MessageNumberLimit = {:?} on {}", d.message_limit, d.name);
         }
         println!("  on message-signaled interrupts: {}", found.iter().filter(|d| d.mode == IrqMode::Message).count());
         println!("  line-based although the hardware offers MSI: {}", found.iter().filter(|d| d.legacy_despite_hardware()).count());

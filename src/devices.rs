@@ -76,11 +76,16 @@ impl DeviceDriver {
 #[derive(Default)]
 pub struct DeviceMap {
     by_file: HashMap<String, Vec<DeviceDriver>>,
+    /// Driver file -> the instance ids (`<bus>\<device>\<instance>`) of every present device it
+    /// serves, identical names not folded. The same form `interrupts` keys PCI devices by, so the
+    /// two can be matched without comparing display names.
+    by_instance: HashMap<String, Vec<String>>,
 }
 
 impl DeviceMap {
     pub fn load() -> DeviceMap {
         let mut by_file: HashMap<String, Vec<DeviceDriver>> = HashMap::new();
+        let mut by_instance: HashMap<String, Vec<String>> = HashMap::new();
         let mut service_files: HashMap<String, Option<String>> = HashMap::new();
         for bus in reg::subkeys(ENUM) {
             for device in reg::subkeys(&format!(r"{ENUM}\{bus}")) {
@@ -95,6 +100,10 @@ impl DeviceMap {
                     if !present(&format!(r"{bus}\{device}\{instance}")) {
                         continue;
                     }
+                    // Every instance, nameless ones included and before names are folded: two
+                    // identical controllers are one row in a title but two devices whose
+                    // interrupts are compared.
+                    by_instance.entry(file.clone()).or_default().push(format!(r"{bus}\{device}\{instance}"));
                     let Some(name) =
                         reg::hklm_path(&key, "FriendlyName").or_else(|| reg::hklm_path(&key, "DeviceDesc")).map(|d| clean_desc(&d))
                     else {
@@ -114,12 +123,22 @@ impl DeviceMap {
                 }
             }
         }
-        DeviceMap { by_file }
+        DeviceMap { by_file, by_instance }
     }
 
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, file: &str, devices: Vec<DeviceDriver>) {
         self.by_file.insert(file.to_lowercase(), devices);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_instances_for_test(&mut self, file: &str, ids: &[&str]) {
+        self.by_instance.insert(file.to_lowercase(), ids.iter().map(|s| s.to_string()).collect());
+    }
+
+    /// The instance ids of every present device `driver_file` serves.
+    pub fn instances(&self, driver_file: &str) -> &[String] {
+        self.by_instance.get(&driver_file.to_lowercase()).map_or(&[], |v| v.as_slice())
     }
 
     pub fn len(&self) -> usize {

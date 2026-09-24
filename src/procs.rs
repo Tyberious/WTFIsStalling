@@ -198,6 +198,31 @@ pub fn known_worker(process: &str) -> Option<Worker> {
     table.iter().find(|(k, _)| p.starts_with(k)).map(|(_, v)| Worker { ..*v })
 }
 
+/// Parts of Windows that can turn up doing disk work or in front of the person, beyond
+/// `known_worker`'s table: none of them is something a person can close or run "one at a time".
+const WINDOWS_PARTS: &[&str] = &[
+    "explorer.exe",
+    "lsass.exe",
+    "services.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "smss.exe",
+    "sihost.exe",
+    "runtimebroker.exe",
+    "searchhost.exe",
+    "fontdrvhost.exe",
+    "ctfmon.exe",
+    "taskhostw.exe",
+    "spoolsv.exe",
+    "memory compression",
+];
+
+/// Is this program name a part of Windows (never to be worded as something to close)?
+pub fn windows_part(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    name.starts_with("System") || known_worker(name).is_some_and(|w| w.windows) || WINDOWS_PARTS.contains(&lower.as_str())
+}
+
 pub fn pid_of_thread(tid: u32) -> Option<u32> {
     if tid == 0 {
         return Some(0);

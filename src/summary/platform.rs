@@ -17,6 +17,7 @@ use crate::util::plural;
 
 use super::ctx::Ctx;
 use super::freezes::FREEZE_KEY;
+use super::stalls::DriverAgg;
 use super::{Findings, Metric, Severity};
 
 pub(super) const HW_TOOLS_KEY: &str = "hardware-access tools";
@@ -297,7 +298,8 @@ const LEGACY_IRQ_ADVICE: &str = "This is normally the device maker's own choice,
 pub(super) fn legacy_interrupts(cx: &mut Ctx) {
     let devices = interrupts::devices();
     let legacy: Vec<PciInterrupt> = devices.iter().filter(|d| d.legacy_despite_hardware()).cloned().collect();
-    irq_table(&mut cx.platform_lines, &devices, &legacy);
+    let disagree = trace_vs_configuration(&cx.drivers, &cx.device_map, &devices);
+    irq_table(&mut cx.platform_lines, &devices, &legacy, &disagree);
     let device_map = std::mem::take(&mut cx.device_map);
     note_legacy_interrupts(&mut cx.found, &device_map, &legacy);
     cx.device_map = device_map;
@@ -405,7 +407,22 @@ fn and_list(names: &[&str], max: usize) -> String {
     }
 }
 
-fn irq_table(out: &mut Vec<String>, devices: &[PciInterrupt], legacy: &[PciInterrupt]) {
+/// Drivers whose interrupt handler the trace saw running for one kind of interrupt while Windows'
+/// configuration puts their devices on the other: one fact line each, for DEVICE INTERRUPTS. Which
+/// device a handler ran for is not in the event, so `interrupts::disagreement` only judges a
+/// driver whose devices all share one mode and are all known here.
+fn trace_vs_configuration(drivers: &[(String, DriverAgg)], device_map: &DeviceMap, devices: &[PciInterrupt]) -> Vec<String> {
+    drivers
+        .iter()
+        .filter_map(|(name, a)| {
+            let seen = a.isr_seen()?;
+            let served: Vec<&str> = device_map.instances(name).iter().map(String::as_str).collect();
+            interrupts::disagreement(name, &served, devices, seen)
+        })
+        .collect()
+}
+
+fn irq_table(out: &mut Vec<String>, devices: &[PciInterrupt], legacy: &[PciInterrupt], disagree: &[String]) {
     if devices.is_empty() {
         return;
     }
@@ -418,8 +435,36 @@ fn irq_table(out: &mut Vec<String>, devices: &[PciInterrupt], legacy: &[PciInter
     ));
     if legacy.is_empty() {
         out.push("  No device is on a shared line while its own hardware offers the newer kind.".into());
-        return;
+    } else {
+        legacy_rows(out, legacy);
     }
+    // Only where the registry holds one: Microsoft documents what the value means, and no default
+    // for it being absent, so an absent one is not a finding and is not printed.
+    // Identical controllers with the same value are one row: a PC with four NVMe drives shows
+    // "Standard NVM Express Controller (4)" once, not four times (seen on the development PC).
+    let mut limited: Vec<(&str, u32, usize)> = Vec::new();
+    for d in devices {
+        let Some(limit) = d.message_limit else { continue };
+        match limited.iter_mut().find(|(name, l, _)| *name == d.name && *l == limit) {
+            Some(row) => row.2 += 1,
+            None => limited.push((&d.name, limit, 1)),
+        }
+    }
+    if !limited.is_empty() {
+        out.push("  Windows setting that caps how many message-signaled interrupts a device may get (MessageNumberLimit):".into());
+        for (name, limit, n) in limited {
+            let name: String = name.chars().take(44).collect();
+            let name = if n > 1 { format!("{name} ({n})") } else { name };
+            out.push(format!("  {name:<50} {limit}"));
+        }
+    }
+    if !disagree.is_empty() {
+        out.push("  What the trace saw against that configuration:".into());
+        out.extend(disagree.iter().cloned());
+    }
+}
+
+fn legacy_rows(out: &mut Vec<String>, legacy: &[PciInterrupt]) {
     out.push(format!("  {:<44} {:<14} {:<20} {}", "device", "in use", "hardware offers", "Windows setting"));
     for d in legacy {
         out.push(format!(
@@ -592,7 +637,15 @@ mod tests {
     // --- legacy interrupts ----------------------------------------------------------------------
 
     fn dev(name: &str, support: Support, opt_in: MsiOptIn) -> PciInterrupt {
-        PciInterrupt { instance_id: format!("PCI\\{name}"), name: name.into(), mode: IrqMode::LineBased, support, opt_in, allocations: 1 }
+        PciInterrupt {
+            instance_id: format!("PCI\\{name}"),
+            name: name.into(),
+            mode: IrqMode::LineBased,
+            support,
+            opt_in,
+            message_limit: None,
+            allocations: 1,
+        }
     }
 
     #[test]
@@ -668,6 +721,69 @@ mod tests {
         assert!(audio.evidence.iter().any(|e| e.contains("old-style shared interrupt")), "{:?}", audio.evidence);
         assert!(audio.evidence.iter().any(|e| e.contains("not a registry edit")), "{:?}", audio.evidence);
         assert!(!get(&found, "driver nvlddmkm.sys").evidence.iter().any(|e| e.contains("shared interrupt")));
+    }
+
+    /// Several drivers at once: one whose MSI handler contradicts a line-based device, one that
+    /// agrees, one serving devices on both modes (never judged), and one with no ISRs at all. The
+    /// table shows MessageNumberLimit only where the registry holds one.
+    #[test]
+    fn device_interrupts_shows_what_the_trace_saw_against_the_configuration() {
+        let agg = |line, msi| DriverAgg { isr_n: line + msi, isr_line_n: line, isr_msi_n: msi, ..DriverAgg::default() };
+        let drivers = vec![
+            ("oddaudio.sys".to_string(), agg(0, 40)),
+            ("HDAudBus.sys".to_string(), agg(12, 0)),
+            ("mixed.sys".to_string(), agg(3, 3)),
+            ("dpconly.sys".to_string(), agg(0, 0)),
+        ];
+        let at = |id: &str, name: &str, mode, limit| PciInterrupt {
+            instance_id: id.into(),
+            name: name.into(),
+            mode,
+            support: Support::HasMessage,
+            opt_in: MsiOptIn::NotRecorded,
+            message_limit: limit,
+            allocations: 1,
+        };
+        let devices = vec![
+            at(r"PCI\A\1", "Odd Audio Controller", IrqMode::LineBased, None),
+            at(r"PCI\B\1", "High Definition Audio Bus", IrqMode::LineBased, None),
+            at(r"PCI\C\1", "Some GPU", IrqMode::Message, Some(1)),
+            at(r"PCI\D\1", "Some NIC", IrqMode::LineBased, None),
+            at(r"PCI\E\1", "Standard NVM Express Controller", IrqMode::Message, Some(2048)),
+            at(r"PCI\E\2", "Standard NVM Express Controller", IrqMode::Message, Some(2048)),
+        ];
+        let mut map = DeviceMap::default();
+        map.insert_instances_for_test("oddaudio.sys", &[r"PCI\A\1"]);
+        map.insert_instances_for_test("hdaudbus.sys", &[r"PCI\B\1"]);
+        map.insert_instances_for_test("mixed.sys", &[r"PCI\C\1", r"PCI\D\1"]);
+        map.insert_instances_for_test("dpconly.sys", &[r"PCI\D\1"]);
+
+        let said = trace_vs_configuration(&drivers, &map, &devices);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("  oddaudio.sys: ") && said[0].contains("(Odd Audio Controller) is on a line-based"), "{said:?}");
+
+        let legacy: Vec<PciInterrupt> = devices.iter().filter(|d| d.legacy_despite_hardware()).cloned().collect();
+        let mut out = Vec::new();
+        irq_table(&mut out, &devices, &legacy, &said);
+        let text = out.join("\n");
+        assert!(text.contains("(MessageNumberLimit)"), "{text}");
+        let limits: Vec<&String> = out.iter().filter(|l| l.trim_end().ends_with(" 1") && l.contains("Some GPU")).collect();
+        assert_eq!(limits.len(), 1, "the GPU's limit is shown: {text}");
+        assert!(!out.iter().any(|l| l.contains("Some NIC") && l.trim_end().ends_with(" 0")), "an absent value is not printed as 0: {text}");
+        assert!(text.contains("What the trace saw against that configuration:") && text.contains("oddaudio.sys"), "{text}");
+        let nvme: Vec<&String> = out.iter().filter(|l| l.contains("Standard NVM Express Controller")).collect();
+        assert_eq!(nvme.len(), 1, "identical controllers with the same value are one row: {text}");
+        assert!(nvme[0].contains("Controller (2)") && nvme[0].trim_end().ends_with(" 2048"), "{text}");
+        // Table rows fit by construction; the disagreement is prose and `engine::compose_report` wraps it.
+        assert!(out.iter().filter(|l| !l.contains("configuration says")).all(|l| l.chars().count() <= 118), "{text}");
+
+        // No limit set anywhere, no disagreement: neither heading appears.
+        let plain: Vec<PciInterrupt> = devices.iter().map(|d| PciInterrupt { message_limit: None, ..d.clone() }).collect();
+        let mut out = Vec::new();
+        irq_table(&mut out, &plain, &[], &[]);
+        let text = out.join("\n");
+        assert!(!text.contains("MessageNumberLimit") && !text.contains("What the trace saw"), "{text}");
+        assert!(text.contains("No device is on a shared line"), "{text}");
     }
 
     #[test]
