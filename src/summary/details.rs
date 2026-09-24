@@ -165,7 +165,7 @@ pub(super) fn tables(cx: &mut Ctx) {
     let uncovered = cx.az.switch_uncovered.load(std::sync::atomic::Ordering::Relaxed);
     if uncovered > 0 && cx.scheduler_usable() {
         let of = cx.az.switch_gathers.load(std::sync::atomic::Ordering::Relaxed);
-        d!("For {uncovered} of the {of} moments looked at, the thread-switch history did not reach back far enough (it holds a few              seconds, less on a PC switching threads very fast, and nothing from before the run began), so those say nothing about              whether a stalled thread was woken or which programs were kept waiting.");
+        d!("For {uncovered} of the {of} moments looked at, the thread-switch history did not reach back far enough (it holds a few seconds, less on a PC switching threads very fast, and nothing from before the run began), so those say nothing about whether a stalled thread was woken or which programs were kept waiting.");
     }
     if cx.az.notable_folded > 0 {
         d!(

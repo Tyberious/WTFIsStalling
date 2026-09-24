@@ -389,7 +389,7 @@ impl Summary {
                     "gpu frames",
                     "The picture stopped updating when you felt the hitch",
                     vec![
-                        "At 2 of the 3 moment(s) you flagged, the graphics kernel put no new picture on screen for up to 240 ms. The                          program whose frames stopped was dwm.exe  -  part of Windows: the desktop compositor that draws every window.",
+                        "At 2 of the 3 moment(s) you flagged, the graphics kernel put no new picture on screen for up to 240 ms. The program whose frames stopped was dwm.exe  -  part of Windows: the desktop compositor that draws every window.",
                     ],
                     gpu::FRAMES_ADVICE,
                     vec![Metric::ms("longest moment with no new picture", 240.0)],

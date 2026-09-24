@@ -503,7 +503,7 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         let victims = s.slow - slow;
         let discounted = if victims > 0 {
             format!(
-                " {victims} more were slowed down by a whole-PC freeze: they began after the PC had already stopped, so they are                  not counted against this drive."
+                " {victims} more were slowed down by a whole-PC freeze: they began after the PC had already stopped, so they are not counted against this drive."
             )
         } else {
             String::new()

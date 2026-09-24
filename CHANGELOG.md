@@ -27,6 +27,7 @@ What changed in each release, in short. The full notes, with details and downloa
 
 ### Fixed
 - At a flagged moment, the list of waiting programs showed the whole run's waits instead of that moment's.
+- A few report sentences had a long run of spaces in the middle.
 
 ## 0.8.0 (2026-09-24)
 

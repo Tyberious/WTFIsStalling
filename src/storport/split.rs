@@ -237,7 +237,7 @@ pub fn finding_sentence(t: &SplitTotals, busy: bool) -> Option<String> {
         // "inside the drive". That is the drive working through its own queue, and blaming the
         // drive, cable or firmware for it sends people to the wrong fix.
         s.push_str(if busy {
-            " Mostly inside the drive, working through the requests it had been handed: the traffic named above is the cause,              not the drive."
+            " Mostly inside the drive, working through the requests it had been handed: the traffic named above is the cause, not the drive."
         } else {
             " Mostly inside the drive, with little else asked of it: the drive itself, its cable or its firmware was slow to answer."
         });
