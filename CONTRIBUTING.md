@@ -77,6 +77,12 @@ Useful for generating stalls on purpose: a CPU stress test (starvation), copying
 disk (I/O), opening many browser tabs on a RAM-starved VM (hard faults), and on real hardware simply
 running with RGB/monitoring utilities open (DPC latency).
 
+## Releases (maintainers)
+
+Version numbers, when a release is made, betas, what 1.0 requires and the release steps are in
+[RELEASING.md](RELEASING.md). Between releases `main` carries a `-dev` version; do not bump it in a
+pull request.
+
 ## Code signing (maintainers)
 
 Releases are signed through [SignPath Foundation](https://signpath.org/apply), which signs open-source

@@ -554,7 +554,9 @@ policy the project commits to.)*
 ## Changes
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md); the full notes are on the
-[releases page](https://github.com/Tyberious/WTFIsStalling/releases).
+[releases page](https://github.com/Tyberious/WTFIsStalling/releases). Versions after 0.9 are 0.10,
+0.11 and so on until 1.0 is earned; builds marked *pre-release* are betas for testing. How versions
+are numbered and what 1.0 requires is in [RELEASING.md](RELEASING.md).
 
 ## Contributing
 

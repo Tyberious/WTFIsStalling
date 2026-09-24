@@ -1,6 +1,9 @@
 name: Release
 
 # Push a tag like v0.1.0 to build the executables and attach them to a GitHub release.
+# A tag with a suffix, like v0.10.0-beta.1, is published as a pre-release: it is never marked as
+# the latest release, so the README badge and "latest" download links keep pointing at the last
+# final version. See RELEASING.md.
 #
 # Trust chain:
 #  * Build provenance (always): GitHub attests that these exact files were built by this workflow
@@ -27,6 +30,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+
+      # The executables report the version in Cargo.toml, so the tag must match it exactly: a tag
+      # pushed while main still says 0.10.0-dev would otherwise ship exes calling themselves "dev".
+      - name: Tag matches the version in Cargo.toml
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = $env:TAG
+          if ($tag -ne "v$version") { throw "Tag $tag does not match Cargo.toml version $version. Set the version, commit, then tag." }
+          if ($version -match '-dev') { throw "Refusing to release a development version ($version)." }
+          "Releasing $version"
+
       - run: cargo test
       - run: cargo build --release
 
@@ -88,6 +105,10 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # v0.10.0-beta.1 and the like: a pre-release, never "latest" (inputs per the action's
+          # action.yml: prerelease, make_latest).
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
             dist/WTFIsStalling.exe
             dist/wtfis-cli.exe
