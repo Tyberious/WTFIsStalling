@@ -51,6 +51,8 @@ pub(super) struct Ctx<'a> {
     pub switch_events: Option<u64>,
     pub debug_counts: Vec<((u32, u8), u64)>,
     pub debug_rejected: Vec<(i64, i64)>,
+    /// --debug only: DiskIo requests by (op, IrpFlags).
+    pub debug_irp_flags: Vec<((u8, u32), u64)>,
     pub named_files: usize,
     /// Every path already in drive-letter form and past the privacy rule.
     pub file_waits: Vec<FileRow>,
@@ -113,6 +115,8 @@ impl<'a> Ctx<'a> {
         let switch_events = az.shared.switches.then(|| inner.switch_events + inner.ready_events);
         let debug_counts: Vec<_> = inner.debug_counts.iter().map(|(k, v)| (*k, *v)).collect();
         let debug_rejected = inner.debug_rejected.clone();
+        let mut debug_irp_flags: Vec<_> = inner.debug_irp_flags.iter().map(|(k, v)| (*k, *v)).collect();
+        debug_irp_flags.sort();
         // Files the trace named. Anything it never named is dropped here rather than carried
         // around as an unnamed row: "(file name not available)" repeated is noise, not evidence.
         let named_files = inner.file_names.len();
@@ -158,6 +162,7 @@ impl<'a> Ctx<'a> {
             switch_events,
             debug_counts,
             debug_rejected,
+            debug_irp_flags,
             named_files,
             file_waits,
             fault_files,

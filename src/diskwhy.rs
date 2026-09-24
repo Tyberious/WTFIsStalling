@@ -54,11 +54,18 @@ impl DriveClass {
     /// the link, and an NVMe drive moves gigabytes a second. The old single flash threshold
     /// called an NVMe drive "busy" at 33 MB/s (field report, issue #15), about 1% of what it can
     /// do, which hid that the drive was slow with next to nothing asked of it.
-    fn busy_at(self) -> (f64, f64) {
+    ///
+    /// The third number is how many other requests must have completed during the slow one before
+    /// a rate is believed at all. For flash, 32: rates over a few requests mean little. For a hard
+    /// drive, 4: every request costs a seek of several milliseconds, so it completes only a handful
+    /// in 100 ms however hard it is being worked. Measured live on a USB hard drive with two
+    /// programs reading at random: ~10 others per slow request, which the flash rule called "had
+    /// little else to do" and blamed on the drive.
+    fn busy_at(self) -> (f64, f64, u32) {
         match self {
-            DriveClass::Spinning => (10.0, 50.0),
-            DriveClass::Flash => (30.0, 300.0),
-            DriveClass::Nvme => (200.0, 3000.0),
+            DriveClass::Spinning => (10.0, 50.0, 4),
+            DriveClass::Flash => (30.0, 300.0, 32),
+            DriveClass::Nvme => (200.0, 3000.0, 32),
         }
     }
 }
@@ -95,10 +102,10 @@ pub fn explain(slow: &IoRec, ios: &[IoRec], class: DriveClass, history_start: i6
     let mb_per_s = bytes as f64 / 1e6 / secs;
     let per_s = others as f64 / secs;
     // A hard drive is saturated by a fraction of what an SSD shrugs off.
-    let (busy_mb, busy_per_s) = class.busy_at();
+    let (busy_mb, busy_per_s, min_others) = class.busy_at();
     let fast = mb_per_s >= busy_mb || per_s >= busy_per_s;
     // Rates over a few milliseconds mean little: one neighboring request is not a busy disk.
-    let busy = fast && (bytes >= 4_000_000 || others >= 32);
+    let busy = fast && (bytes >= 4_000_000 || others >= min_others);
 
     let quiet_since = last_before.unwrap_or(history_start).max(history_start);
     let idle_before_ms = (in_flight_at_start == 0 && start > quiet_since).then(|| ticks_to_ms(start - quiet_since));
@@ -164,7 +171,7 @@ mod tests {
 
     fn io(disk: u32, start_ms: f64, dur_ms: f64, size: u32, pid: u32, op: u8) -> IoRec {
         let dur = ms_to_ticks(dur_ms);
-        IoRec { end: ms_to_ticks(10_000.0 + start_ms) + dur, dur, disk, tid: pid * 10, pid, size, op, file: 0 }
+        IoRec { end: ms_to_ticks(10_000.0 + start_ms) + dur, dur, disk, tid: pid * 10, pid, size, op, file: 0, offset: 0, irp_flags: 0 }
     }
 
     /// Monitoring began just before the requests the tests issue, unless a test says otherwise.
@@ -232,6 +239,18 @@ mod tests {
         ios.extend((0..33).map(|i| io(6, 1000.0 + i as f64 * 30.0, 5.0, 1_000_000, 42, b'W'))); // 33 MB/s
         assert_eq!(explain(&slow, &ios, DriveClass::Flash, T0).cause, Cause::Busy);
         assert_eq!(explain(&slow, &ios, DriveClass::Nvme, recent()).cause, Cause::IdleSlow);
+    }
+
+    /// Measured live on a USB hard drive: two programs reading at random, ~10 requests completed
+    /// during each 100 ms slow one. That is a hard drive working flat out, not one with "little
+    /// else to do"; on flash the same numbers still mean nothing.
+    #[test]
+    fn a_hard_drive_seeking_between_requests_is_busy_with_few_of_them() {
+        let slow = io(4, 1000.0, 100.0, 262_144, 7, b'R');
+        let mut ios = vec![slow];
+        ios.extend((0..9).map(|i| io(4, 1000.0 + i as f64 * 10.0, 9.0, 262_144, 40 + i % 2, b'R'))); // 90/s, 2.4 MB
+        assert_eq!(explain(&slow, &ios, DriveClass::Spinning, recent()).cause, Cause::Busy);
+        assert_eq!(explain(&slow, &ios, DriveClass::Flash, recent()).cause, Cause::IdleSlow);
     }
 
     #[test]

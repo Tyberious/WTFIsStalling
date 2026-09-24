@@ -225,17 +225,22 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
         // https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup3
         (GUID_DISKIO, 10 | 11 | 14) => {
             let disk = rd_u32(d, 0)?;
-            let (size, dur, tid, op, file) = if opcode == 14 {
-                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F', 0)
+            let irp_flags = rd_u32(d, 4).unwrap_or(0);
+            let (size, dur, tid, op, file, offset) = if opcode == 14 {
+                (0, rd_u64(d, 8)? as i64, rd_u32(d, 24)?, b'F', 0, 0)
             } else {
                 let file = rd_u64(d, 24).unwrap_or(0);
-                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' }, file)
+                let offset = rd_u64(d, 16).unwrap_or(0) as i64;
+                (rd_u32(d, 8)?, rd_u64(d, 40)? as i64, rd_u32(d, 48)?, if opcode == 10 { b'R' } else { b'W' }, file, offset)
             };
             if !(0..MAX_SANE).contains(&dur) {
                 return None;
             }
+            if shared.debug {
+                *inner.debug_irp_flags.entry((op, irp_flags)).or_default() += 1;
+            }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
-            let r = IoRec { end: ts, dur, disk, tid, pid, size, op, file };
+            let r = IoRec { end: ts, dur, file, offset, disk, tid, pid, size, irp_flags, op };
             inner.ios.push_back(r);
             let st = inner.disks.entry(disk).or_default();
             st.count += 1;
@@ -481,6 +486,29 @@ mod tests {
         // Repeating the same name (which the kernel does) must not throw the tally away.
         handle(&sh, &mut inner, GUID_FILEIO, 0, 300, 0, &name_payload(FILE_KEY, "\\Device\\HarddiskVolume3\\pagefile.sys"));
         assert_eq!(inner.file_wait[&FILE_KEY].count, 1);
+    }
+
+    /// IrpFlags @4 and ByteOffset @16 are kept, and --debug counts the flag values seen.
+    #[test]
+    fn irp_flags_and_byte_offset_are_read_at_the_documented_offsets() {
+        let mut sh = shared();
+        sh.debug = true;
+        let mut inner = sh.inner.lock().unwrap();
+        let mut d = io_payload(2, 4096, FILE_KEY, 300_000, 9);
+        d[4..8].copy_from_slice(&0x0000_0043u32.to_le_bytes());
+        d[16..24].copy_from_slice(&0x0000_00E8_D4A5_1000u64.to_le_bytes()); // 1 TB in
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 5_000, 0, &d);
+        handle(&sh, &mut inner, GUID_DISKIO, 10, 6_000, 0, &d);
+        let io = *inner.ios.back().unwrap();
+        assert_eq!((io.irp_flags, io.offset), (0x43, 1_000_000_000_000));
+        assert_eq!(inner.debug_irp_flags[&(b'R', 0x43)], 2);
+        // A flush carries flags but no offset.
+        let mut flush = vec![0u8; 28];
+        flush[4..8].copy_from_slice(&0x0000_0004u32.to_le_bytes());
+        flush[8..16].copy_from_slice(&400_000u64.to_le_bytes());
+        handle(&sh, &mut inner, GUID_DISKIO, 14, 9_000, 0, &flush);
+        let f = *inner.ios.back().unwrap();
+        assert_eq!((f.op, f.irp_flags, f.offset), (b'F', 4, 0));
     }
 
     /// Windows recycles FILE_OBJECT addresses. When a key comes back as a different file, the

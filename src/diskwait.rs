@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     fn io(disk: u32, start: i64, dur: i64, op: u8) -> IoRec {
-        IoRec { end: start + dur, dur, disk, tid: 1, pid: 4, size: 4096, op, file: 0 }
+        IoRec { end: start + dur, dur, disk, tid: 1, pid: 4, size: 4096, op, file: 0, offset: 0, irp_flags: 0 }
     }
 
     fn fault(pid: u32, start: i64, dur: i64) -> FaultRec {

@@ -42,18 +42,25 @@ pub struct FaultRec {
     pub file: u64,
 }
 
+/// One completed disk request. 56 bytes (see the size test): the ring is pruned by time
+/// (`Shared::keep`, 20 s), not by count, so its memory is the drives' request rate x 20 s x 56.
 #[derive(Clone, Copy)]
 pub struct IoRec {
     pub end: i64,
     pub dur: i64,
+    /// FileObject of the file, or 0 (flush events carry none). See `Inner::file_names`.
+    pub file: u64,
+    /// `ByteOffset`: "Byte offset from the beginning of the physical disk". 0 for a flush, which
+    /// carries none. https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1
+    pub offset: i64,
     pub disk: u32,
     pub tid: u32,
     pub pid: u32,
     pub size: u32,
+    /// `IrpFlags` of the request; see `diskstuck` for the bits that are read.
+    pub irp_flags: u32,
     /// b'R', b'W' or b'F'
     pub op: u8,
-    /// FileObject of the file, or 0 (flush events carry none). See `Inner::file_names`.
-    pub file: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -327,6 +334,8 @@ pub struct Inner {
     /// events whose computed duration was rejected as (event time, InitialTime).
     pub debug_counts: HashMap<(u32, u8), u64>,
     pub debug_rejected: Vec<(i64, i64)>,
+    /// --debug only: DiskIo requests by (op, IrpFlags), so the flag values can be checked live.
+    pub debug_irp_flags: HashMap<(u8, u32), u64>,
 }
 
 pub struct Shared {
@@ -430,6 +439,30 @@ impl Inner {
         (switches, readies)
     }
 
+    /// What `diskstuck` needs to say who was stuck behind a slow request `[start, end]`, or `None`
+    /// when the rings cannot honestly answer: they do not reach back to `start`, or the trace has
+    /// not yet reached `after` past `end`. Returns the wake-ups from just before `end` to `after`
+    /// past it, and only the switches that took one of THOSE threads off a processor since
+    /// `start`.
+    ///
+    /// This runs under the lock the ETW callback needs for every event, and a long request on a
+    /// busy PC spans hundreds of thousands of switch records, so it copies only what matches
+    /// instead of the whole window.
+    pub fn stuck_records(&self, start: i64, end: i64, before: i64, after: i64) -> Option<(Vec<SwitchRec>, Vec<ReadyRec>)> {
+        if !self.switches_cover(start) || self.latest_ts < end + after {
+            return None;
+        }
+        let (from, to) = (end - before, end + after);
+        let a = self.readies.partition_point(|r| r.ts < from);
+        let b = self.readies.partition_point(|r| r.ts <= to);
+        let readies: Vec<ReadyRec> = self.readies.range(a..b.max(a)).copied().collect();
+        let tids: std::collections::HashSet<u32> = readies.iter().map(|r| r.tid).collect();
+        let a = self.switches.partition_point(|r| r.ts < start);
+        let b = self.switches.partition_point(|r| r.ts <= to);
+        let switches = self.switches.range(a..b.max(a)).filter(|s| tids.contains(&s.old_tid)).copied().collect();
+        Some((switches, readies))
+    }
+
     pub fn prune(&mut self, keep: i64) {
         let cutoff = self.latest_ts - keep;
         let switch_cutoff = self.latest_ts - crate::util::ms_to_ticks(SWITCH_KEEP_MS);
@@ -488,6 +521,29 @@ mod tests {
         assert_eq!(std::mem::size_of::<SwitchRec>(), 24);
         assert_eq!(std::mem::size_of::<ReadyRec>(), 24);
         const { assert!((SWITCH_CAP_MAX + READY_CAP_MAX) * 24 <= 96 << 20, "the two rings must stay under 96 MB") };
+        // Was 48 before IrpFlags and ByteOffset were kept (issue #20); the comment on IoRec
+        // states the bound in these terms.
+        assert_eq!(std::mem::size_of::<IoRec>(), 56);
+    }
+
+    /// Nothing may be read about who was stuck behind a request unless the rings reach back to
+    /// its start AND the trace has caught up past its end.
+    #[test]
+    fn stuck_records_are_only_handed_out_for_windows_the_rings_cover() {
+        let mut inner = Inner::default();
+        for i in 0..100i64 {
+            inner.push_switch(SwitchRec { old_tid: (i % 5) as u32 + 10, ..sw(i * 10, 0) });
+            inner.push_ready(ReadyRec { ts: i * 10 + 5, tid: (i % 5) as u32 + 10, by_tid: 0, cpu: 0, flag: 0 });
+        }
+        inner.latest_ts = 995;
+        assert!(inner.stuck_records(-5, 500, 1, 20).is_none(), "starts before the oldest record");
+        assert!(inner.stuck_records(100, 980, 1, 20).is_none(), "the trace has not reached past the end yet");
+        let (s, r) = inner.stuck_records(100, 500, 1, 20).expect("covered");
+        assert_eq!(r.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![505, 515]);
+        assert!(s.iter().all(|s| s.ts >= 100 && s.ts <= 520 && (s.old_tid == 10 || s.old_tid == 11)), "only those threads' switches");
+        assert!(!s.is_empty());
+        inner.ring_lost_until = Some(200);
+        assert!(inner.stuck_records(100, 500, 1, 20).is_none(), "records from inside the window were thrown away");
     }
 
     #[test]

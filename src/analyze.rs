@@ -6,6 +6,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::disks::DiskMap;
+use crate::diskstuck::{self, DiskBehind};
 use crate::diskwait::{self, Role};
 use crate::diskwhy::{self, Cause, DiskWhy};
 use crate::files::{self, DosMap};
@@ -164,6 +165,19 @@ pub(crate) struct SlowSeen {
     pub(crate) victim: bool,
 }
 
+/// The System process: Windows' own kernel threads.
+const SYSTEM_PID: u32 = 4;
+
+/// What `explain_io` has to say about one slow request.
+struct IoWhy {
+    /// Why the disk was slow, for the end of the slow-disk line.
+    why: String,
+    /// "    Request: ..." - what the request was.
+    request: Option<String>,
+    /// "    Stuck behind it: ..." - who waited for it.
+    stuck: Option<String>,
+}
+
 /// Moments the user flagged with "I felt it" (QPC), waiting for the analyzer to pick them up.
 static MARKS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
@@ -197,6 +211,12 @@ pub struct Analyzer {
     pub(crate) disk_why: HashMap<u32, DiskWhy>,
     /// Every slow request seen per disk, and whether a freeze explains it (see `diskwait`).
     pub(crate) disk_slow: HashMap<u32, Vec<SlowSeen>>,
+    /// What each disk's slow requests were and who was stuck behind them (see `diskstuck`).
+    pub(crate) disk_behind: HashMap<u32, DiskBehind>,
+    /// Slow-request events waiting for the trace to reach past them, so the threads woken as
+    /// they completed are in the rings before anyone looks. Everything after the first such
+    /// event waits with it, so the event log stays in order.
+    held_notables: Vec<Notable>,
     /// Each drive's own health counters when monitoring began; the summary compares against them.
     pub(crate) health_at_start: HashMap<u32, DriveHealth>,
     started: i64,
@@ -308,6 +328,8 @@ impl Analyzer {
             topo: topology().clone(),
             disk_why: HashMap::new(),
             disk_slow: HashMap::new(),
+            disk_behind: HashMap::new(),
+            held_notables: Vec::new(),
             health_at_start,
             started: qpc(),
             profile,
@@ -361,6 +383,8 @@ impl Analyzer {
             topo: Topology::default(),
             disk_why: HashMap::new(),
             disk_slow: HashMap::new(),
+            disk_behind: HashMap::new(),
+            held_notables: Vec::new(),
             health_at_start: HashMap::new(),
             started: qpc(),
             profile,
@@ -1466,11 +1490,28 @@ impl Analyzer {
 
     /// One-liners for individually bad events, even when no probe stalled.
     fn report_notables(&mut self, last_call: bool) {
-        let notables = std::mem::take(&mut self.shared.inner.lock().unwrap().notable);
+        let mut notables = std::mem::take(&mut self.held_notables);
+        let latest = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            notables.append(&mut inner.notable);
+            inner.latest_ts
+        };
+        // A slow request is examined only once the trace has reached far enough past its end for
+        // the wake-ups it caused to be in the rings; see `diskstuck::LOOK_AFTER_MS`. Held for at
+        // most a few seconds, like a stall, and never at the end of the run.
+        if !last_call && self.shared.switches {
+            let (need, give_up, now) = (ms_to_ticks(diskstuck::LOOK_AFTER_MS + 50.0), ms_to_ticks(4000.0), qpc());
+            if let Some(at) =
+                notables.iter().position(|n| matches!(n, Notable::SlowIo(i) if latest < i.end + need && now - i.end < give_up))
+            {
+                self.held_notables = notables.split_off(at);
+            }
+        }
         for n in notables {
             self.notable_total += 1;
             // Every slow request is explained, including the ones the log below leaves out.
-            let why = if let Notable::SlowIo(i) = &n { self.explain_io(i) } else { String::new() };
+            let io_why = if let Notable::SlowIo(i) = &n { Some(self.explain_io(i)) } else { None };
+            let why = io_why.as_ref().map(|w| w.why.clone()).unwrap_or_default();
             if let Notable::LongExec(e) = &n {
                 let times = self.long_exec_times.entry(self.modules.name(e.routine)).or_default();
                 if times.len() < 5000 {
@@ -1533,16 +1574,23 @@ impl Analyzer {
                     f.bytes / 1024,
                     file.map(|f| format!("  from {f}")).unwrap_or_default()
                 ),
-                Notable::SlowIo(i) => say!(
-                    "[{}] slow disk {:<5} {:>9}  {}{}  {} KB  issued by {}  ({why})",
-                    clock().fmt(i.end - i.dur),
-                    op_name(i.op),
-                    fmt_dur(i.dur),
-                    self.disks.get(i.disk).short(),
-                    file.map(|f| format!("  {f}")).unwrap_or_default(),
-                    i.size / 1024,
-                    self.procs.label(i.pid, i.tid)
-                ),
+                Notable::SlowIo(i) => {
+                    say!(
+                        "[{}] slow disk {:<5} {:>9}  {}{}  {} KB  issued by {}  ({why})",
+                        clock().fmt(i.end - i.dur),
+                        op_name(i.op),
+                        fmt_dur(i.dur),
+                        self.disks.get(i.disk).short(),
+                        file.map(|f| format!("  {f}")).unwrap_or_default(),
+                        i.size / 1024,
+                        self.procs.label(i.pid, i.tid)
+                    );
+                    // At most two more lines, and only for requests that get a line of their own:
+                    // folded and suppressed ones are counted in the finding instead.
+                    for line in io_why.iter().flat_map(|w| [&w.request, &w.stuck]).flatten() {
+                        say!("{line}");
+                    }
+                }
             }
         }
         let every = ms_to_ticks(Quieter::rollup_period_ms());
@@ -1564,17 +1612,129 @@ impl Analyzer {
         }
     }
 
-    /// Works out what the disk was doing while `slow` was outstanding, adds it to the disk's
-    /// totals and returns a few words for the log line.
-    fn explain_io(&mut self, slow: &IoRec) -> String {
-        let ios: Vec<IoRec> = self.shared.inner.lock().unwrap().ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
+    /// Works out what the disk was doing while `slow` was outstanding, what the request was and
+    /// who was stuck behind it, adds all of it to the disk's totals, and returns the words for
+    /// the log line and the (at most two) lines under it.
+    fn explain_io(&mut self, slow: &IoRec) -> IoWhy {
+        let start = slow.end - slow.dur;
+        let (ios, near, recs) = {
+            let inner = self.shared.inner.lock().unwrap();
+            let ios: Vec<IoRec> = inner.ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
+            // Every disk: a thread woken as this one completed may have been waiting on another.
+            let hi = slow.end + ms_to_ticks(diskstuck::READY_AFTER_MS);
+            let near: Vec<IoRec> = inner.ios.iter().filter(|i| i.end >= start && i.end <= hi).copied().collect();
+            let recs = self.shared.switches.then(|| {
+                let (before, after) = (ms_to_ticks(diskstuck::READY_BEFORE_MS), ms_to_ticks(diskstuck::LOOK_AFTER_MS));
+                inner.stuck_records(start, slow.end, before, after)
+            });
+            (ios, near, recs)
+        };
+        let why = self.explain_cause(slow, &ios);
+        let disk = self.disks.get(slow.disk).clone();
+
+        // What the request was. The path is only ever looked at after the privacy rule.
+        let path = self.file_label(slow.file);
+        let kind = diskstuck::classify(slow.op, slow.irp_flags, path.as_deref());
+
+        // Several programs fighting over a hard drive's head at the time.
+        let mut thrashers: Vec<String> = Vec::new();
+        if disk.spinning == Some(true) {
+            // Keyed by process, not by name: two copies of the same program fight over the head
+            // just as hard as two different ones (seen live with two readers of one kind).
+            let mut names: HashMap<(u32, u32), String> = HashMap::new();
+            let mut reqs: Vec<(i64, i64, (String, u32))> = Vec::new();
+            // Thrashing is what the drive has been doing lately, not a property of one request: a
+            // hard drive completes only ~5 requests during a 60 ms one, too few to see a pattern
+            // (measured live). So the last half second up to this completion is looked at, or the
+            // request's own lifetime when that is longer. Rule of thumb, not a specification.
+            let from = slow.end - slow.dur.max(ms_to_ticks(diskstuck::THRASH_LOOK_MS));
+            for i in ios.iter().filter(|i| i.op != b'F' && i.end > from && i.end <= slow.end) {
+                let key = if i.pid == PID_UNKNOWN { (i.pid, i.tid) } else { (i.pid, 0) };
+                let name = names.entry(key).or_insert_with(|| process_name(&self.procs.label(i.pid, i.tid))).clone();
+                reqs.push((i.end, i.offset, (name, key.0 ^ key.1)));
+            }
+            if let Some(t) = diskstuck::thrash(&reqs, true) {
+                thrashers = diskstuck::copies(t.into_iter().map(|((name, _), _)| name));
+            }
+        }
+        let request = diskstuck::request_text(kind, slow.op, path.as_deref()).map(|t| diskstuck::request_line(&t, &thrashers));
+
+        // Who was stuck behind it. Nothing at all is said when the rings could not tell.
+        let mut stuck_line = None;
+        let mut victims: Vec<diskstuck::Victim> = Vec::new();
+        let mut chains: Vec<(String, i64, String)> = Vec::new();
+        if let Some(Some((sw, rd))) = &recs {
+            let stuck = diskstuck::stuck_behind(slow, &near, sw, rd);
+            let found = diskstuck::lock_chains(slow, &stuck, sw, rd);
+            let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+            let named: Vec<(String, i64)> = stuck
+                .iter()
+                // Windows' own kernel threads (the file cache's workers, mostly) are the machinery
+                // doing the waiting on everyone's behalf, not a program anyone is waiting for:
+                // measured live, they were all that "stuck behind it" named for a cached read.
+                .filter_map(|s| (self.pid_of(s.tid) != SYSTEM_PID).then(|| self.thread_program(s.tid).map(|n| (n, s.waited))).flatten())
+                .filter(|(n, _)| !own.as_ref().is_some_and(|own| n.to_lowercase().starts_with(own)))
+                .collect();
+            victims = diskstuck::by_program(&named);
+            chains = found
+                .iter()
+                .filter_map(|c| {
+                    if self.pid_of(c.waiter) == SYSTEM_PID {
+                        return None;
+                    }
+                    Some((self.thread_program(c.waiter)?, c.waited, self.thread_program(c.holder)?))
+                })
+                .filter(|(w, _, _)| !own.as_ref().is_some_and(|own| w.to_lowercase().starts_with(own)))
+                .collect();
+            stuck_line = diskstuck::stuck_line(&victims, &chains, &disk.short());
+        }
+
+        let behind = self.disk_behind.entry(slow.disk).or_default();
+        *behind.kinds.entry(kind).or_default() += 1;
+        if !thrashers.is_empty() {
+            behind.thrash += 1;
+            for name in &thrashers {
+                *behind.thrash_programs.entry(name.clone()).or_default() += 1;
+            }
+        }
+        match &recs {
+            Some(Some(_)) => behind.checked += 1,
+            Some(None) => behind.uncovered += 1,
+            None => {} // not traced at all: nothing to count
+        }
+        for v in &victims {
+            let e = behind.stuck.entry(v.name.clone()).or_default();
+            e.0 += 1;
+            e.1 += v.longest;
+        }
+        for (w, t, h) in &chains {
+            let e = behind.chains.entry((w.clone(), h.clone())).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(*t);
+        }
+        IoWhy { why, request, stuck: stuck_line }
+    }
+
+    /// The program a thread belongs to, or `None` for the idle thread and threads that can no
+    /// longer be named.
+    fn thread_program(&mut self, tid: u32) -> Option<String> {
+        let pid = self.pid_of(tid);
+        if pid == 0 {
+            return None;
+        }
+        let label = self.procs.label(pid, tid);
+        (!label.starts_with("unknown") && !label.starts_with("pid ")).then(|| process_name(&label))
+    }
+
+    /// Why the disk was slow, from the traffic around the request; adds it to the disk's totals.
+    fn explain_cause(&mut self, slow: &IoRec, ios: &[IoRec]) -> String {
         let disk = self.disks.get(slow.disk);
         let class = match (disk.spinning, disk.bus) {
             (Some(true), _) => diskwhy::DriveClass::Spinning,
             (_, "NVMe") => diskwhy::DriveClass::Nvme,
             _ => diskwhy::DriveClass::Flash,
         };
-        let ctx = diskwhy::explain(slow, &ios, class, self.started);
+        let ctx = diskwhy::explain(slow, ios, class, self.started);
         // Remembered so a freeze can later say "this one was a victim of the freeze, not a
         // problem of its own". Capped: a sick drive can produce thousands over a long run.
         let seen = self.disk_slow.entry(slow.disk).or_default();
@@ -2009,7 +2169,18 @@ mod tests {
         let mut ev = evidence(vec![], idle_samples(), HashMap::new());
         assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "scheduling delay with idle CPUs");
 
-        ev.ios = vec![IoRec { end: ms(1883.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0 }];
+        ev.ios = vec![IoRec {
+            end: ms(1883.0),
+            dur: ms(878.0),
+            disk: 5,
+            tid: 1,
+            pid: 4,
+            size: 4096,
+            op: b'W',
+            file: 0,
+            offset: 0,
+            irp_flags: 0,
+        }];
         assert_eq!(az.verdict_sched(&ev, ms(1000.0), ms(1887.0), &no_probes()), "disk 5");
     }
 
@@ -2021,6 +2192,61 @@ mod tests {
 
     fn sched_probe(start: i64, dur: i64) -> Stall {
         Stall { kind: StallKind::Scheduler, cpu: None, start, end: start + dur, minor: false }
+    }
+
+    /// Who was stuck behind a slow request is said only when the switch rings cover it; otherwise
+    /// nothing is said about it at all (not "nobody waited"), and the request is counted as unchecked.
+    #[test]
+    fn a_slow_request_names_who_waited_only_when_the_rings_cover_it() {
+        let slow =
+            IoRec { end: ms(1800.0), dur: ms(800.0), disk: 99, tid: 7, pid: 100, size: 4096, op: b'R', file: 0, offset: 0, irp_flags: 0x2 };
+        let waiter = |ts: f64| SwitchRec {
+            ts: ms(ts),
+            new_tid: 0,
+            old_tid: 51,
+            cpu: 0,
+            new_prio: 0,
+            old_prio: 8,
+            old_wait_reason: 9,
+            old_wait_mode: 0,
+            old_state: switches::STATE_WAITING,
+        };
+        let build = |first_switch_ms: f64, traced: bool| {
+            let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[(100, "explorer.exe")]), false);
+            Arc::get_mut(&mut az.shared).unwrap().switches = traced;
+            {
+                let mut inner = az.shared.inner.lock().unwrap();
+                inner.push_switch(SwitchRec { old_tid: 90, ..waiter(first_switch_ms) });
+                inner.push_switch(waiter(1100.0));
+                inner.push_ready(ReadyRec { ts: ms(1800.1), tid: 51, by_tid: 0, cpu: 0, flag: READY_FROM_DPC });
+                inner.tid_pid.insert(51, 100);
+                inner.tid_pid.insert(7, 100);
+                inner.ios.push_back(slow);
+                inner.latest_ts = ms(5000.0);
+            }
+            az
+        };
+
+        let mut az = build(0.0, true);
+        let w = az.explain_io(&slow);
+        assert_eq!(w.stuck.as_deref(), Some("    Stuck behind it: explorer.exe (1 thread, up to 700 ms)"));
+        assert!(w.request.as_deref().is_some_and(|r| r.contains("through the file cache")), "{:?}", w.request);
+        let b = &az.disk_behind[&99];
+        assert_eq!((b.checked, b.uncovered, b.stuck["explorer.exe"].0), (1, 0, 1));
+
+        // The rings start after the request did: nothing is said, and it is counted as unchecked.
+        let mut az = build(1050.0, true);
+        let w = az.explain_io(&slow);
+        assert!(w.stuck.is_none());
+        let b = &az.disk_behind[&99];
+        assert_eq!((b.checked, b.uncovered), (0, 1));
+        assert!(b.stuck.is_empty());
+
+        // Not traced at all (light mode, --no-switches): nothing said, nothing counted either way.
+        let mut az = build(0.0, false);
+        assert!(az.explain_io(&slow).stuck.is_none());
+        assert_eq!((az.disk_behind[&99].checked, az.disk_behind[&99].uncovered), (0, 0));
+        assert_eq!(az.disk_behind[&99].kinds[&diskstuck::Kind::PagedFile], 1, "what the request was is still known");
     }
 
     fn eight_cpu_analyzer() -> Analyzer {
@@ -2158,7 +2384,8 @@ mod tests {
         let mut az = Analyzer::for_test(ModuleMap::for_test(&[]), ProcNames::for_test(&[]), true);
         az.topo = crate::topology::Topology::build(&[8], &[]);
         let (start, end) = (ms(1000.0), ms(1886.0));
-        let victim = IoRec { end: ms(1887.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0 };
+        let victim =
+            IoRec { end: ms(1887.0), dur: ms(878.0), disk: 5, tid: 1, pid: 4, size: 4096, op: b'W', file: 0, offset: 0, irp_flags: 0 };
         az.disk_slow.insert(5, vec![SlowSeen { end: victim.end, dur: victim.dur, victim: false }]);
         let stalls: Vec<Stall> = (0..8).map(|c| Stall { kind: StallKind::Kernel, cpu: Some(c), start, end, minor: false }).collect();
         let mut ev = evidence(vec![], vec![], HashMap::new());

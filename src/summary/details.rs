@@ -263,6 +263,17 @@ pub(super) fn tables(cx: &mut Ctx) {
             d!("  rejected DPC/ISR: event ts {ts}, InitialTime {initial}, now {}", qpc());
         }
     }
+    // The IrpFlags values actually seen, to check the bits `diskstuck` reads (0x2 paging, 0x40
+    // synchronous paging, 0x1 no-cache) against a live run: a paging read should show 0x2 set.
+    let irp_flags = std::mem::take(&mut cx.debug_irp_flags);
+    if !irp_flags.is_empty() {
+        d!("");
+        d!("debug: disk requests by (read/write/flush, IrpFlags):");
+        for ((op, flags), n) in irp_flags {
+            let paging = if flags & 0x2 != 0 && op != b'F' { "  paging" } else { "" };
+            d!("  {} 0x{flags:08x}: {n}{paging}", op as char);
+        }
+    }
     // The graphics provider is a manifest provider, so its events are counted by (id, version)
     // rather than by opcode. The second list is the one an elevated live run has to check: an
     // (id, version) whose payload layout this build could not work out is skipped, never guessed.

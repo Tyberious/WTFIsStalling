@@ -7,6 +7,7 @@ use std::mem::{size_of, zeroed};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::disks::{fmt_size, DiskInfo};
+use crate::diskstuck::{DiskBehind, Kind};
 use crate::diskwhy::{Cause, DiskWhy};
 use crate::evlog;
 use crate::files;
@@ -171,7 +172,7 @@ fn dominant_file(per_file: &[(String, u64, i64)]) -> Option<(String, f64)> {
 }
 
 /// One sentence per reason the disk's slow requests were slow, most common first.
-fn why_sentences(why: &DiskWhy) -> Vec<String> {
+fn why_sentences(why: &DiskWhy, spinning: bool) -> Vec<String> {
     let mut causes = [Cause::Busy, Cause::WokeUp, Cause::IdleSlow, Cause::Flush].map(|c| (c, why.count(c)));
     causes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     let of = |n: u32| if n == why.total() { "every time".to_string() } else { format!("{n} of {} times", why.total()) };
@@ -189,7 +190,14 @@ fn why_sentences(why: &DiskWhy) -> Vec<String> {
                     })
                     .collect();
                 let who = if movers.is_empty() { String::new() } else { format!(" The traffic came from {}.", movers.join(" and ")) };
-                format!("Why: the disk was busy moving a lot of data ({}).{who}", of(n))
+                // On a hard drive "busy" is usually many requests rather than much data: each
+                // one moves the head.
+                let what = if spinning {
+                    "busy: other requests kept it seeking back and forth, which for a hard drive costs as much as moving a lot of data"
+                } else {
+                    "busy moving a lot of data"
+                };
+                format!("Why: the disk was {what} ({}).{who}", of(n))
             }
             Cause::WokeUp => format!(
                 "Why: the drive had gone to sleep ({}). The slow request was the first after up to {:.0} s of silence.",
@@ -482,13 +490,178 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         cx.found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, worst * slow as i64);
         cx.found.measure(&key, Metric::count("slow requests", slow as f64));
         cx.found.measure(&key, Metric::ms("worst wait", ticks_to_ms(worst)));
-        for sentence in why.map(why_sentences).unwrap_or_default() {
+        for sentence in why.map(|w| why_sentences(w, disk.spinning == Some(true))).unwrap_or_default() {
             cx.found.note(&key, sentence);
         }
         if let Some(sentence) = files_sentence(&on_disk) {
             cx.found.note(&key, sentence);
         }
+        if let Some(behind) = cx.az.disk_behind.get(n).cloned() {
+            for sentence in behind_sentences(&behind, cx.scheduler_usable()) {
+                cx.found.note(&key, sentence);
+            }
+            for advice in behind_advice(&behind, disk.spinning == Some(true)) {
+                cx.found.advise(&key, &advice);
+            }
+        }
     }
+}
+
+/// Parts of Windows that can turn up doing disk work, beyond `known_worker`'s table: none of them
+/// is something a person can close or run "one at a time".
+const WINDOWS_PARTS: &[&str] = &[
+    "explorer.exe",
+    "lsass.exe",
+    "services.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "smss.exe",
+    "sihost.exe",
+    "runtimebroker.exe",
+    "searchhost.exe",
+    "fontdrvhost.exe",
+    "ctfmon.exe",
+    "taskhostw.exe",
+    "spoolsv.exe",
+    "memory compression",
+];
+
+fn windows_part(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    name.starts_with("System") || known_worker(name).is_some_and(|w| w.windows) || WINDOWS_PARTS.contains(&lower.as_str())
+}
+
+/// A process as the disk finding names it: parts of Windows marked as such, so that nothing
+/// reads as "this program is the problem, close it".
+fn shown(name: &str) -> String {
+    if name.starts_with("System") {
+        "Windows itself (System)".to_string()
+    } else if windows_part(name) {
+        format!("{name} (part of Windows)")
+    } else {
+        name.to_string()
+    }
+}
+
+fn and_list(items: &[String]) -> String {
+    match items.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => items.join(""),
+    }
+}
+
+/// Evidence about what a disk's slow requests were and who was stuck behind them (issue #20).
+/// `sched` is whether anything may be read from the thread-switch trace at all
+/// (`Ctx::scheduler_usable`); without it only what the requests themselves carry is said.
+fn behind_sentences(b: &DiskBehind, sched: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let paging = b.count(Kind::is_paging);
+    let mut parts: Vec<String> = Vec::new();
+    if paging > 0 {
+        let mut detail: Vec<String> = Vec::new();
+        let from_pagefile = b.count(|k| k == Kind::PagingFile);
+        let code = b.count(|k| k == Kind::ProgramCode);
+        if from_pagefile > 0 {
+            detail.push(format!("{from_pagefile} to or from the paging file"));
+        }
+        if code > 0 {
+            detail.push(format!("{code} loading program code"));
+        }
+        let detail = if detail.is_empty() { String::new() } else { format!(": {}", detail.join(", ")) };
+        parts.push(format!("{paging} paging (Windows moving program code or memory between RAM and the drive{detail})"));
+    }
+    for (kind, what) in [
+        (Kind::PagedFile, "through the file cache (Windows fetching a file for a program, or writing its changes out)"),
+        (Kind::Bookkeeping, "file-system bookkeeping ($Mft and the like)"),
+        (Kind::FileData, "a file's contents"),
+    ] {
+        let n = b.count(|k| k == kind);
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    let flushes = b.count(|k| k == Kind::Flush);
+    if flushes > 0 {
+        parts.push(format!("{flushes} flush{}", if flushes == 1 { "" } else { "es" }));
+    }
+    if !parts.is_empty() {
+        out.push(format!("What the slow requests were: {}.", parts.join(", ")));
+    }
+    if sched {
+        let top = b.top_stuck(3);
+        if !top.is_empty() {
+            let list: Vec<String> =
+                top.iter().map(|(name, times, total)| format!("{}: behind {times}, {} in total", shown(name), fmt_dur(*total))).collect();
+            out.push(format!("Stuck behind them (waiting until they completed): {}.", list.join("; ")));
+        } else if b.checked > 0 {
+            out.push(format!("No program was seen stopped waiting for any of the {} that could be checked.", b.checked));
+        }
+        for (waiter, holder, times, longest) in b.top_chains(2) {
+            out.push(format!(
+                "{} waited up to {} on a lock held by {}, which was itself waiting on this drive ({} time{}).",
+                shown(&waiter),
+                fmt_dur(longest),
+                shown(&holder),
+                times,
+                plural(times as u64)
+            ));
+        }
+        if b.uncovered > 0 {
+            out.push(format!(
+                "{} of them could not be checked for who was stuck behind them: the thread-switch history no longer reached back that far.",
+                b.uncovered
+            ));
+        }
+    }
+    if b.thrash > 0 {
+        let names: Vec<String> = b.top_thrashers(3).iter().map(|(n, _)| shown(n)).collect();
+        out.push(format!(
+            "During {} of them the drive's head kept jumping between far-apart places for {} at the same time, so each got a fraction \
+             of the drive.",
+            b.thrash,
+            and_list(&names)
+        ));
+    }
+    out
+}
+
+/// What to try, from what the slow requests were. Only where it is actionable, and never
+/// "run it one at a time" for a part of Windows.
+fn behind_advice(b: &DiskBehind, spinning: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if spinning && b.count(|k| k == Kind::ProgramCode) > 0 {
+        out.push(
+            "Some slow requests were Windows loading program code from this hard drive: a program installed on it waits for the drive \
+             whenever it needs a part of itself that is not in memory yet. Moving the programs you use most to an SSD fixes that."
+                .to_string(),
+        );
+    }
+    if b.thrash > 0 {
+        let top = b.top_thrashers(3);
+        let (win, own): (Vec<String>, Vec<String>) = top.into_iter().map(|(n, _)| n).partition(|n| windows_part(n));
+        match (own.len(), win.first()) {
+            (0, _) => {}
+            (1, Some(w)) => {
+                // "powershell.exe (2 copies)" names the fight; the advice names the program.
+                let program = own[0].split(" (").next().unwrap_or(&own[0]);
+                // `shown` may already say "Windows itself (...)": do not say Windows twice.
+                let with = shown(w);
+                let with = if with.starts_with("Windows") { with } else { format!("Windows' own work ({with})") };
+                out.push(format!(
+                    "{} was using this hard drive at the same time as {with}, far apart on the disk. Pause {program} while you use \
+                     the PC, or move what it works on to another drive.",
+                    own[0]
+                ))
+            }
+            (1, None) => {}
+            _ => out.push(format!(
+                "{} were using this hard drive at the same time, far apart on the disk, so its head kept jumping between them. Run \
+                 them one at a time, or move one of them to another drive.",
+                and_list(&own)
+            )),
+        }
+    }
+    out
 }
 
 /// What Windows itself logged about storage: resets, retries, bad blocks.
@@ -574,7 +747,7 @@ mod tests {
         why.causes.insert(Cause::IdleSlow, 1);
         why.movers.insert("steam.exe".into(), 3_000_000_000);
         why.movers.insert("chrome.exe".into(), 100_000_000);
-        let s = why_sentences(&why);
+        let s = why_sentences(&why, false);
         assert!(
             s[0].contains("busy") && s[0].contains("9 of 10 times") && s[0].contains("steam.exe (3 GB, 97% of the traffic: Steam"),
             "{s:?}"
@@ -597,7 +770,7 @@ mod tests {
     fn a_sleeping_drive_gets_power_settings_and_logged_errors_override_everything() {
         let mut why = DiskWhy { longest_sleep_ms: 42_000.0, ..Default::default() };
         why.causes.insert(Cause::WokeUp, 2);
-        assert!(why_sentences(&why)[0].contains("every time") && why_sentences(&why)[0].contains("42 s"));
+        assert!(why_sentences(&why, false)[0].contains("every time") && why_sentences(&why, false)[0].contains("42 s"));
         assert!(disk_advice(&usb_hdd(), Some(&why), false, FileHint::default()).contains("Turn off hard disk after"));
         let logged = disk_advice(&usb_hdd(), Some(&why), true, FileHint::default());
         assert!(logged.contains("back up what matters now") && !logged.contains("Turn off hard disk"), "{logged}");
@@ -697,6 +870,87 @@ mod tests {
         // Nothing was seen, or not all of it: fall back to the raw totals rather than guess.
         assert_eq!(discount_victims(None, 6, ms_to_ticks(2173.0)), (6, ms_to_ticks(2173.0)));
         assert_eq!(discount_victims(Some(&mixed), 6, ms_to_ticks(2173.0)), (6, ms_to_ticks(2173.0)));
+    }
+
+    fn behind() -> DiskBehind {
+        let mut b = DiskBehind::default();
+        b.kinds.insert(Kind::PagingFile, 5);
+        b.kinds.insert(Kind::ProgramCode, 3);
+        b.kinds.insert(Kind::PagedFile, 4);
+        b.kinds.insert(Kind::Bookkeeping, 2);
+        b.kinds.insert(Kind::FileData, 6);
+        b.checked = 18;
+        b.uncovered = 2;
+        b.stuck.insert("explorer.exe".into(), (14, ms_to_ticks(9200.0)));
+        b.stuck.insert("Discord.exe".into(), (2, ms_to_ticks(300.0)));
+        b.chains.insert(("explorer.exe".into(), "System (kernel threads)".into()), (3, ms_to_ticks(2100.0)));
+        b
+    }
+
+    #[test]
+    fn the_disk_finding_says_what_was_slow_and_who_waited_for_it() {
+        let s = behind_sentences(&behind(), true);
+        assert!(
+            s[0].starts_with("What the slow requests were: 8 paging")
+                && s[0].contains("4 through the file cache")
+                && s[0].contains("5 to or from the paging file"),
+            "{s:?}"
+        );
+        assert!(s[0].contains("3 loading program code") && s[0].contains("2 file-system bookkeeping") && s[0].contains("6 a file's"));
+        assert!(s[1].starts_with("Stuck behind them") && s[1].contains("explorer.exe (part of Windows): behind 14, "), "{s:?}");
+        assert!(s[1].find("explorer").unwrap() < s[1].find("Discord").unwrap(), "most waiting first: {s:?}");
+        assert!(
+            s.iter().any(|l| l.contains("on a lock held by Windows itself (System), which was itself waiting on this drive (3 times)")),
+            "{s:?}"
+        );
+        assert!(s.iter().any(|l| l.starts_with("2 of them could not be checked")), "{s:?}");
+        // Lost events: nothing read from the thread-switch trace is said, only what the requests carry.
+        let s = behind_sentences(&behind(), false);
+        assert_eq!(s.len(), 1, "{s:?}");
+        // Checked, and nobody waited: that is said plainly; not checked at all says nothing.
+        let quiet = DiskBehind { checked: 4, ..DiskBehind::default() };
+        assert!(behind_sentences(&quiet, true)[0].contains("No program was seen"));
+        assert!(behind_sentences(&DiskBehind { uncovered: 4, ..DiskBehind::default() }, true).iter().all(|l| !l.contains("No program")));
+    }
+
+    /// The audience rule: a part of Windows is never something to close, pause, uninstall or run
+    /// "one at a time", whatever the drive was doing.
+    #[test]
+    fn the_disk_finding_never_tells_anyone_to_stop_a_part_of_windows() {
+        let windows = ["System (kernel threads)", "svchost.exe", "dwm.exe", "MsMpEng.exe", "SearchIndexer.exe", "explorer.exe"];
+        for a in windows {
+            for b in windows.iter().filter(|b| **b != a) {
+                let mut d = behind();
+                d.thrash = 3;
+                d.thrash_programs.insert(a.to_string(), 3);
+                d.thrash_programs.insert(b.to_string(), 2);
+                d.stuck.insert(a.to_string(), (1, 10));
+                d.chains.insert((b.to_string(), a.to_string()), (1, 10));
+                let text = [behind_sentences(&d, true), behind_advice(&d, true)].concat().join(" ").to_lowercase();
+                for bad in ["close", "end task", "uninstall", "pause", "one at a time"] {
+                    assert!(!text.contains(bad), "{a} / {b}: says {bad:?}: {text}");
+                }
+            }
+        }
+        // Two ordinary programs do get the practical advice...
+        let mut d = DiskBehind { thrash: 2, ..DiskBehind::default() };
+        d.thrash_programs.insert("steam.exe".into(), 2);
+        d.thrash_programs.insert("qbittorrent.exe".into(), 2);
+        let advice = behind_advice(&d, true).join(" ");
+        assert!(
+            advice.contains("qbittorrent.exe and steam.exe were using this hard drive") && advice.contains("one at a time"),
+            "{advice}"
+        );
+        // ...and one program against Windows' own work is told about only that program.
+        let mut d = DiskBehind { thrash: 2, ..DiskBehind::default() };
+        d.thrash_programs.insert("steam.exe".into(), 2);
+        d.thrash_programs.insert("MsMpEng.exe".into(), 2);
+        let advice = behind_advice(&d, true).join(" ");
+        assert!(advice.starts_with("steam.exe was using") && advice.contains("MsMpEng.exe (part of Windows)"), "{advice}");
+        assert!(!advice.contains("Pause MsMpEng"), "{advice}");
+        // Program code paging from a hard drive is worth moving; from an SSD it is not.
+        assert!(behind_advice(&behind(), true).iter().any(|a| a.contains("to an SSD")));
+        assert!(behind_advice(&behind(), false).is_empty());
     }
 
     #[test]

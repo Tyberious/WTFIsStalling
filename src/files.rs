@@ -195,8 +195,26 @@ pub fn public_path(path: &str) -> String {
         let program_data = dirs.iter().any(|c| c.eq_ignore_ascii_case("AppData"));
         return shorten(prefix, &["Users", "..."], &personal_name(file, program_data));
     }
-    let public =
-        dirs.is_empty() || system_file(file) || PUBLIC_ROOTS.iter().any(|r| r.eq_ignore_ascii_case(dirs[0])) || dirs[0].starts_with('$');
+    // Folders whose names start with '$' belong to Windows ($Extend, $Recycle.Bin, $WinREAgent),
+    // but only the '$' part of the path is Windows' own: the Recycle Bin keeps one folder per
+    // account named by its security ID (S-1-5-21-...), which identifies the account, and a deleted
+    // folder keeps its original name and contents inside it. So the '$' components are shown and
+    // everything after them is treated like a personal folder.
+    let dollar = dirs.iter().take_while(|c| c.starts_with('$')).count();
+    if dollar > 0 {
+        return if dollar == dirs.len() {
+            shorten(prefix, dirs, file)
+        } else {
+            let mut shown: Vec<&str> = dirs[..dollar].to_vec();
+            shown.push("...");
+            // "$R4F2KQ1.pdf" is a name Windows made up; anything else is the person's.
+            let name = if file.starts_with('$') { file.to_string() } else { personal_name(file, false) };
+            shorten(prefix, &shown, &name)
+        };
+    }
+    // A system file NAME ($Mft, pagefile.sys) is only public where Windows keeps it, at the root:
+    // "D:\Clients\Smith\$notes.txt" must not print its folders because the name starts with '$'.
+    let public = dirs.is_empty() || PUBLIC_ROOTS.iter().any(|r| r.eq_ignore_ascii_case(dirs[0]));
     if public {
         shorten(prefix, dirs, file)
     } else {
@@ -323,6 +341,23 @@ pub fn rank(entries: &[(String, u32, u64, i64, i64)], top: usize) -> Vec<(String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_recycle_bin_and_dollar_names_do_not_leak_the_account_or_folders() {
+        let sid = r"\Device\HarddiskVolume3\$Recycle.Bin\S-1-5-21-1004336348-1177238915-682003330-1001\$RX2Q9ZA.pdf";
+        let shown = public_path(sid);
+        assert!(!shown.contains("S-1-5"), "the account's security ID: {shown}");
+        assert_eq!(shown, r"\Device\HarddiskVolume3\$Recycle.Bin\...\$RX2Q9ZA.pdf");
+        // A deleted folder keeps its own name and contents inside the bin.
+        let inner = public_path(r"D:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R8K1\Divorce papers\draft.docx");
+        assert!(!inner.contains("Divorce") && !inner.contains("draft"), "{inner}");
+        // Windows' own '$' folders stay readable.
+        assert_eq!(public_path(r"C:\$Extend\$UsnJrnl"), r"C:\$Extend\$UsnJrnl");
+        // A name starting with '$' in someone's own folder does not make the folders public.
+        let own = public_path(r"D:\Clients\Smith\$notes.txt");
+        assert!(!own.contains("Clients") && !own.contains("Smith"), "{own}");
+        assert_eq!(public_path(r"C:\$Mft"), r"C:\$Mft");
+    }
 
     #[test]
     fn the_holes_a_review_found_stay_closed() {

@@ -78,6 +78,13 @@ pub fn wait_reason_name(reason: i8) -> Option<&'static str> {
     })
 }
 
+/// The lock-like kinds of wait: exactly the reasons `wait_reason_name` calls "waiting for a lock
+/// another thread holds" (WrKeyedEvent 21, WrKernel 26, WrResource 27, WrPushLock 28, WrMutex 29,
+/// WrFastMutex 34, WrGuardedMutex 35; values from the CSwitch page). Which lock is never known.
+pub fn lock_wait(reason: i8) -> bool {
+    matches!(reason, 21 | 26..=29 | 34 | 35)
+}
+
 /// Is this a thread that chose to stop, rather than one held up by something?
 ///
 /// A program with a timer loop sleeps thousands of times a run, and a thread-pool worker sits on
@@ -836,5 +843,9 @@ mod tests {
         assert_eq!(wait_reason_name(-1), None, "a garbage payload names no wait");
         assert_eq!(wait_reason_name(99), None);
         assert_eq!(wait_reason_name(30), None, "WrQuantumEnd is not a wait anyone can feel");
+        // "A lock" in a disk finding means exactly what the plain words call a lock.
+        for reason in -1i8..=40 {
+            assert_eq!(lock_wait(reason), wait_reason_name(reason) == Some("waiting for a lock another thread holds"), "{reason}");
+        }
     }
 }
