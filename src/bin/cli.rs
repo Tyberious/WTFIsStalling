@@ -7,6 +7,7 @@ use clap::Parser;
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use wtfis::baseline::CompareMode;
 use wtfis::engine::{self, Config, LogTarget};
+use wtfis::stacks::StackSet;
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +53,20 @@ struct Args {
     /// disk request, so it stays on in --light mode
     #[arg(long)]
     no_storage_trace: bool,
-    /// Measure more gently: probe every 2 ms and leave thread-switch and GPU tracing off, so the tool costs
+    /// Which kernel events get a module-level call stack: any of cswitch, ready, diskinit, fault
+    /// (comma-separated), or all / none. Default: diskinit,fault. For measuring the cost
+    #[arg(long, hide = true, value_name = "LIST", conflicts_with = "no_stacks")]
+    stacks: Option<String>,
+    /// Collect no call stacks at all
+    #[arg(long, hide = true)]
+    no_stacks: bool,
+    /// Also record WHERE every waiting thread was blocked (which drivers were on its call stack),
+    /// not only which drivers slow disk requests went through. Costs more: on a busy 32-thread PC,
+    /// ~120,000 extra stack events a second and about twice this tool's own processor use. Not in
+    /// --light mode
+    #[arg(long, conflicts_with_all = ["stacks", "no_stacks"])]
+    deep: bool,
+    /// Measure more gently: probe every 2 ms and leave thread-switch, GPU and call-stack tracing off, so the tool costs
     /// the PC about half as much. Stalls shorter than ~2 ms can then be missed. On by itself on a
     /// PC with 4 logical CPUs or fewer, or one running on battery
     #[arg(long)]
@@ -108,6 +122,22 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
 fn main() {
     engine::run_probe_child_if_requested();
     let args = Args::parse();
+    // Checked before anything else, so a mistyped list fails here and not after an elevation prompt.
+    let stacks = match (args.no_stacks, args.stacks.as_deref()) {
+        (true, _) => StackSet::NONE,
+        // Measured 2026-09-24 (32 threads, disk load): disk starts + hard faults ~1,000 stacks a
+        // second and no measurable cost; switch stacks ~122,000 a second, monitor 5% -> 9% of a
+        // core. So switch stacks are opt-in. Wake-up stacks are not used by the report at all.
+        (false, None) if args.deep => StackSet::parse("default,cswitch").expect("a fixed list"),
+        (false, Some(list)) => match StackSet::parse(list) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("--stacks: {e}");
+                std::process::exit(1);
+            }
+        },
+        (false, None) => StackSet::DEFAULT,
+    };
 
     if !engine::is_elevated() {
         if !args.no_elevate && engine::relaunch_elevated(&["--pause-on-exit"]) {
@@ -161,6 +191,7 @@ fn main() {
         switches: !args.no_switches,
         gpu_trace: !args.no_gpu_trace,
         storage_trace: !args.no_storage_trace,
+        stacks,
         // Neither flag: decide from the machine itself, exactly as the GUI does.
         light: match (args.light, args.no_light) {
             (true, _) => Some(true),

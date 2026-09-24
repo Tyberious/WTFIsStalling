@@ -53,6 +53,8 @@ pub(super) struct Ctx<'a> {
     pub debug_rejected: Vec<(i64, i64)>,
     /// --debug only: DiskIo requests by (op, IrpFlags).
     pub debug_irp_flags: Vec<((u8, u32), u64)>,
+    /// What the call stacks cost and what became of them (see `stacks`).
+    pub stacks: crate::stacks::StackReport,
     pub named_files: usize,
     /// Every path already in drive-letter form and past the privacy rule.
     pub file_waits: Vec<FileRow>,
@@ -85,6 +87,8 @@ pub(super) struct Ctx<'a> {
     /// DETAILS tables built by the `platform` section (hardware-access drivers, network filters,
     /// devices on legacy interrupts), printed by `details::tables`.
     pub platform_lines: Vec<String>,
+    /// The "where the waiting happened" block, built by `storage::slow_disks` from call stacks.
+    pub stack_lines: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -117,6 +121,7 @@ impl<'a> Ctx<'a> {
         let debug_rejected = inner.debug_rejected.clone();
         let mut debug_irp_flags: Vec<_> = inner.debug_irp_flags.iter().map(|(k, v)| (*k, *v)).collect();
         debug_irp_flags.sort();
+        let stacks = inner.stacks.report();
         // Files the trace named. Anything it never named is dropped here rather than carried
         // around as an unnamed row: "(file name not available)" repeated is noise, not evidence.
         let named_files = inner.file_names.len();
@@ -163,6 +168,7 @@ impl<'a> Ctx<'a> {
             debug_counts,
             debug_rejected,
             debug_irp_flags,
+            stacks,
             named_files,
             file_waits,
             fault_files,
@@ -184,6 +190,7 @@ impl<'a> Ctx<'a> {
             device_map: DeviceMap::default(),
             today: (0, 0, 0),
             platform_lines: Vec::new(),
+            stack_lines: Vec::new(),
         }
     }
 }

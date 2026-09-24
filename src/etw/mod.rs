@@ -25,13 +25,14 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_FLAG_CSWITCH,
-    EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DISPATCHER, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT,
-    EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
-    EVENT_TRACE_PROPERTIES,
+    CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, TraceSetInformation, TraceStackTracingInfo, CLASSIC_EVENT_ID,
+    CONTROLTRACE_HANDLE, EVENT_TRACE_FLAG_CSWITCH, EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_DISK_IO_INIT,
+    EVENT_TRACE_FLAG_DISPATCHER, EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS,
+    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+use crate::stacks::{Kind, StackSet};
 use crate::state::Shared;
 use crate::util::wide;
 
@@ -56,7 +57,22 @@ pub struct Session {
     pub profile: bool,
     /// Whether context switches and thread wake-ups are actually being traced.
     pub switches: bool,
+    /// Which events Windows agreed to attach call stacks to (see `stacks`), and the Win32 error
+    /// when it refused them all.
+    pub stacks: StackSet,
+    pub stack_error: Option<u32>,
+    /// The DiskIo start events (EVENT_TRACE_FLAG_DISK_IO_INIT) are on.
+    disk_init: bool,
     stopped: std::sync::atomic::AtomicBool,
+}
+
+/// One set of EnableFlags to try, and what it turns on.
+#[derive(Clone, Copy)]
+struct Attempt {
+    flags: u32,
+    profile: bool,
+    switches: bool,
+    init: bool,
 }
 
 /// A kernel logger session outlives the process that started it. Whatever goes wrong after the
@@ -143,7 +159,43 @@ fn try_start(flags: u32) -> Result<CONTROLTRACE_HANDLE, u32> {
 }
 
 impl Session {
-    pub fn start(want_profile: bool, want_switches: bool) -> Result<Session, String> {
+    /// `want_stacks`: which events to ask call stacks for. Stacks on context switches and wake-ups
+    /// are dropped when switches are not traced; DiskIo start events need one more flag
+    /// (EVENT_TRACE_FLAG_DISK_IO_INIT, 0x400: "Enables the following DiskIo event type:
+    /// DiskIo_TypeGroup2", https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties),
+    /// tried first and dropped with them if Windows refuses it.
+    pub fn start(want_profile: bool, want_switches: bool, want_stacks: StackSet) -> Result<Session, String> {
+        let mut session = Session::start_flags(want_profile, want_switches, want_stacks.has(Kind::DiskInit))?;
+        let mut stacks = want_stacks;
+        if !session.switches {
+            stacks = stacks.without(Kind::CSwitch).without(Kind::Ready);
+        }
+        if !session.disk_init {
+            stacks = stacks.without(Kind::DiskInit);
+        }
+        if !stacks.is_empty() {
+            let ids = stacks.classic_ids();
+            // "Call this function after calling StartTrace." The list belongs to this session and
+            // ends with it; see `stacks` for why nothing here outlives the run.
+            // https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-tracesetinformation
+            let rc = unsafe {
+                TraceSetInformation(
+                    session.handle,
+                    TraceStackTracingInfo,
+                    ids.as_ptr() as *const c_void,
+                    (ids.len() * size_of::<CLASSIC_EVENT_ID>()) as u32,
+                )
+            };
+            if rc != 0 {
+                session.stack_error = Some(rc);
+                stacks = StackSet::NONE;
+            }
+        }
+        session.stacks = stacks;
+        Ok(session)
+    }
+
+    fn start_flags(want_profile: bool, want_switches: bool, want_init: bool) -> Result<Session, String> {
         let core = EVENT_TRACE_FLAG_PROCESS
             | EVENT_TRACE_FLAG_THREAD
             | EVENT_TRACE_FLAG_DISK_IO
@@ -171,28 +223,39 @@ impl Session {
         // https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties
         // https://learn.microsoft.com/en-us/windows/win32/etw/cswitch
         let sched = EVENT_TRACE_FLAG_CSWITCH | EVENT_TRACE_FLAG_DISPATCHER;
-        let mut attempts: Vec<(u32, bool, bool)> = attempts.into_iter().map(|(f, p)| (f, p, false)).collect();
+        let mut attempts: Vec<Attempt> =
+            attempts.into_iter().map(|(flags, profile)| Attempt { flags, profile, switches: false, init: false }).collect();
         if want_switches {
             // Tried first with the scheduler flags on; the same list without them is the fallback,
             // so a Windows that refuses them still yields everything else.
-            let mut with: Vec<(u32, bool, bool)> = attempts.iter().map(|(f, p, _)| (f | sched, *p, true)).collect();
+            let mut with: Vec<Attempt> = attempts.iter().map(|a| Attempt { flags: a.flags | sched, switches: true, ..*a }).collect();
+            with.append(&mut attempts);
+            attempts = with;
+        }
+        if want_init {
+            // Same again for the disk-request start events the issuing call stacks ride on.
+            let mut with: Vec<Attempt> =
+                attempts.iter().map(|a| Attempt { flags: a.flags | EVENT_TRACE_FLAG_DISK_IO_INIT, init: true, ..*a }).collect();
             with.append(&mut attempts);
             attempts = with;
         }
         let mut last = 0;
-        for (flags, with_profile, with_switches) in attempts {
-            let mut r = try_start(flags);
+        for a in attempts {
+            let mut r = try_start(a.flags);
             if matches!(r, Err(ERROR_ALREADY_EXISTS)) {
                 // Left over from a previous run that was killed; take it over.
                 stop_by_name();
-                r = try_start(flags);
+                r = try_start(a.flags);
             }
             match r {
                 Ok(handle) => {
                     return Ok(Session {
                         handle,
-                        profile: with_profile,
-                        switches: with_switches,
+                        profile: a.profile,
+                        switches: a.switches,
+                        disk_init: a.init,
+                        stacks: StackSet::NONE,
+                        stack_error: None,
                         stopped: std::sync::atomic::AtomicBool::new(false),
                     })
                 }

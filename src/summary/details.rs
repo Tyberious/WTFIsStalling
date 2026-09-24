@@ -113,8 +113,14 @@ pub(super) fn tables(cx: &mut Ctx) {
     d!("THIS TOOL'S OWN COST  (what the measuring itself used)");
     let gpu_events = cx.run.gpu_trace.totals.available.then_some(cx.run.gpu_trace.totals.events);
     let storage = &cx.run.storage_trace;
-    for line in overhead.detail_lines(events, events_lost, cx.switch_events, gpu_events, storage.available.then_some(storage.events)) {
+    let stack_events = (!cx.stacks.set.is_empty()).then_some(cx.stacks.counts.total());
+    for line in
+        overhead.detail_lines(events, events_lost, cx.switch_events, gpu_events, storage.available.then_some(storage.events), stack_events)
+    {
         d!("{line}");
+    }
+    if let Some(rc) = cx.stacks.enable_error {
+        d!("  Windows refused to attach call stacks (Win32 error {rc}), so which drivers were in the path of a wait is not known.");
     }
     if let Some(why) = &storage.note {
         d!("  The storage trace did not run: {why}. How slow disk time split between the drive and Windows is not measured.");
@@ -226,6 +232,12 @@ pub(super) fn tables(cx: &mut Ctx) {
             }
         }
     }
+    let stack_lines = std::mem::take(&mut cx.stack_lines);
+    if !stack_lines.is_empty() {
+        d!("");
+        d!("WHERE THE WAITING HAPPENED  (drivers on the call stack, caller first; driver names only, never function names)");
+        details.extend(stack_lines);
+    }
     details.extend(std::mem::take(&mut cx.platform_lines));
     if !gpu_lines.is_empty() {
         d!("");
@@ -284,6 +296,57 @@ pub(super) fn tables(cx: &mut Ctx) {
         for ((op, flags), n) in irp_flags {
             let paging = if flags & 0x2 != 0 && op != b'F' { "  paging" } else { "" };
             d!("  {} 0x{flags:08x}: {n}{paging}", op as char);
+        }
+    }
+    // Call stacks: what each kind cost, and the facts an elevated run has to confirm - which thread
+    // each stack claims (the event header's or the one its payload names), whether it turned up on
+    // the processor that logged its event, whether disk starts and completions pair up by Irp, and
+    // which end of a stack Stack1 is (the raw samples, Stack1 first).
+    if cx.az.shared.debug && (!cx.stacks.set.is_empty() || cx.stacks.enable_error.is_some()) {
+        let st = std::mem::take(&mut cx.stacks);
+        let c = &st.counts;
+        d!("");
+        d!("debug: call stacks asked for: {} (TraceSetInformation error: {:?})", st.set.names(), st.enable_error);
+        let rows = crate::stacks::Kind::ALL
+            .iter()
+            .map(|k| (k.name(), c.kinds[*k as usize])) // Measured live: on Windows 11 25H2 the user-mode half of a stack arrives as its own StackWalk
+            // event with no kernel frame, and those make up nearly all of this row.
+            .chain([("unmatched (mostly user-mode halves)", c.unmatched)]);
+        for (name, k) in rows {
+            let per = |x: u64| if k.stacks > 0 { x as f64 / k.stacks as f64 } else { 0.0 };
+            d!(
+                "  {name:<9} {} stacks, {} KB, {:.1} frames each ({:.1} kernel, max {}), {} with no kernel frame; thread = header {} / payload {}; kept {}",
+                k.stacks,
+                k.bytes / 1024,
+                per(k.frames),
+                per(k.kernel_frames),
+                k.max_frames,
+                k.empty,
+                k.by_header_tid,
+                k.by_payload_tid,
+                k.kept
+            );
+        }
+        d!(
+            "  total {} stacks, {} KB; found on another processor {}; lost their slot {}; ragged {}",
+            c.total(),
+            c.total_bytes() / 1024,
+            c.other_cpu,
+            c.overwritten,
+            c.ragged
+        );
+        d!(
+            "  disk requests: completed with a start seen {}, without {}; slow with a stack {}, start but no stack {}, no start {}; starts not tracked {}",
+            c.io_with_init,
+            c.io_without_init,
+            c.slow_found,
+            c.slow_no_stack,
+            c.slow_no_init,
+            c.init_dropped
+        );
+        for (kind, frames, user) in &st.samples {
+            let names: Vec<String> = frames.iter().map(|a| cx.az.modules.owner(*a).unwrap_or_else(|| "?".into())).collect();
+            d!("  sample {} (Stack1 first): {} [+{user} user-mode frames]", kind.name(), names.join(", "));
         }
     }
     // The graphics provider is a manifest provider, so its events are counted by (id, version)

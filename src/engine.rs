@@ -55,6 +55,10 @@ pub struct Config {
     /// (inside the drive or waiting in Windows), retries and resets. ON in light mode too: it is
     /// one small event per disk request, a tiny fraction of the kernel trace (see `storport`).
     pub storage_trace: bool,
+    /// Which kernel events carry a module-level call stack (see `stacks`). Off in light mode
+    /// whatever this says. Hidden CLI flags `--stacks` / `--no-stacks` set it, for measuring what
+    /// each kind costs before the default is final.
+    pub stacks: crate::stacks::StackSet,
     /// Measure with the lighter settings (2 ms probes, slower CPU sampling). `None` lets the
     /// tool decide before the run from the CPU count and whether the PC is on battery, which is
     /// what the GUI always uses; `Some` overrides that either way.
@@ -79,6 +83,7 @@ impl Default for Config {
             switches: true,
             gpu_trace: true,
             storage_trace: true,
+            stacks: crate::stacks::StackSet::DEFAULT,
             light: None,
             log: LogTarget::Auto,
             compare: CompareMode::Auto,
@@ -322,7 +327,10 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     // Context switches cost far more than everything else in this session put together, and light
     // mode exists to cost the PC less; asking for them there would undo the point of it.
     let want_switches = cfg.switches && light_reason.is_none();
-    let session = etw::Session::start(cfg.profile, want_switches)?;
+    // Call stacks cost one stack walk per event they are attached to; light mode leaves them off
+    // for the same reason it leaves the switches off.
+    let want_stacks = if light_reason.is_some() { crate::stacks::StackSet::NONE } else { cfg.stacks };
+    let session = etw::Session::start(cfg.profile, want_switches, want_stacks)?;
     if !session.profile && cfg.profile {
         say!("warning: CPU sampling could not be enabled; process attribution and firmware/SMI detection are off.");
     }
@@ -337,6 +345,12 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
         say!("Light mode: on, because {why}. The probes check every {probe_ms:.0} ms instead of 1 ms, so measuring costs this PC");
         say!("            less. Stalls shorter than about {probe_ms:.0} ms can be missed.");
     }
+    if let Some(rc) = session.stack_error {
+        say!("warning: Windows refused call stacks (Win32 error {rc}); the report cannot say which drivers were in the path.");
+    } else if !session.stacks.is_empty() {
+        say!("Stacks  : recording which drivers {} went through", session.stacks.plain());
+        say!("          (driver names only, never function names).");
+    }
     if session.switches {
         say!("Switches: tracing every thread switch, which is what tells 'nothing woke it' apart from 'it was woken and not run'.");
         say!("          It is the most expensive thing this tool records: tens of thousands of events a second on a busy PC. The");
@@ -349,7 +363,9 @@ fn run_inner(cfg: &Config, stop: &AtomicBool, log_path: Option<&str>) -> Result<
     let shared = Arc::new(state::Shared {
         inner: Mutex::new({
             let (switch_cap, ready_cap) = state::switch_caps(ncpu as usize);
-            state::Inner { switch_cap, ready_cap, ..Default::default() }
+            let mut stacks = crate::stacks::StackState::new(session.stacks, ncpu as usize);
+            stacks.enable_error = session.stack_error;
+            state::Inner { switch_cap, ready_cap, stacks, ..Default::default() }
         }),
         exec_warn: ms_to_ticks(cfg.dpc_warn_us / 1000.0),
         fault_warn: ms_to_ticks(cfg.fault_warn_ms),

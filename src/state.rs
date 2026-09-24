@@ -341,6 +341,9 @@ pub struct Inner {
     pub debug_rejected: Vec<(i64, i64)>,
     /// --debug only: DiskIo requests by (op, IrpFlags), so the flag values can be checked live.
     pub debug_irp_flags: HashMap<(u8, u32), u64>,
+
+    /// Module-level call stacks, when the session asks for them (see `stacks`).
+    pub stacks: crate::stacks::StackState,
 }
 
 pub struct Shared {
@@ -489,6 +492,7 @@ impl Inner {
         while self.samples.front().is_some_and(|r| r.ts < cutoff) {
             self.samples.pop_front();
         }
+        self.stacks.prune(self.latest_ts, keep, crate::util::ms_to_ticks(SWITCH_KEEP_MS));
         self.last_prune = self.latest_ts;
     }
 }

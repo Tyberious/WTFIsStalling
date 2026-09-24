@@ -7,13 +7,14 @@ use std::mem::{size_of, zeroed};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::disks::{fmt_size, DiskInfo};
-use crate::diskstuck::{DiskBehind, Kind};
+use crate::diskstuck::{top_counts, DiskBehind, Kind, STACK_KEYS_CAP};
 use crate::diskwhy::{Cause, DiskWhy};
 use crate::evlog;
 use crate::files;
 use crate::health::{self, DriveHealth};
 use crate::procs::known_worker;
 use crate::procs::process_name;
+use crate::stacks;
 use crate::state::LatStat;
 use crate::storport::split::{self as storsplit, SplitTotals};
 use crate::storport::{AddrTotals, ResetRec, StorageReport};
@@ -456,6 +457,8 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
     let io_warn = cx.run.io_warn;
     let run_s = cx.run.elapsed_s.max(1.0);
     let disks = cx.disk_stats.clone();
+    // Read from the registry once, and only if some disk has call stacks to talk about.
+    let mut filters: Option<HashMap<String, String>> = None;
     for (n, s) in &disks {
         if s.slow == 0 {
             continue;
@@ -505,6 +508,20 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
             }
             for advice in behind_advice(&behind, disk.spinning == Some(true)) {
                 cx.found.advise(&key, &advice);
+            }
+            // What the call stacks said: which drivers the slow requests went through, and where
+            // the threads stuck behind them were blocked.
+            if behind.stack_found + behind.stack_missing + behind.wait_stacks > 0 {
+                let filters = filters.get_or_insert_with(stacks::filesystem_filters);
+                let names = StackNames::of(&behind, filters, &mut cx.az.modules);
+                for sentence in stack_sentences(&behind, filters, &names) {
+                    cx.found.note(&key, sentence);
+                }
+                for advice in stack_advice(&behind, filters, &names) {
+                    cx.found.advise(&key, &advice);
+                }
+                let lines = stack_lines(&disk.short(), &behind);
+                cx.stack_lines.extend(lines);
             }
         }
         // Where the slow time went, inside the drive or in Windows, from the storage port driver.
@@ -789,6 +806,134 @@ fn behind_advice(b: &DiskBehind, spinning: bool) -> Vec<String> {
                 and_list(&own)
             )),
         }
+    }
+    out
+}
+
+/// Names and owners of the file-system filters a disk's call stacks mention, looked up once, so
+/// the wording below is a pure function of data (and testable without a live module list).
+#[derive(Default)]
+struct StackNames {
+    /// driver -> "WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning)"
+    label: HashMap<String, String>,
+    /// driver -> whether its own version resource says Microsoft wrote it
+    microsoft: HashMap<String, Option<bool>>,
+}
+
+impl StackNames {
+    fn of(b: &DiskBehind, filters: &HashMap<String, String>, modules: &mut crate::modules::ModuleMap) -> StackNames {
+        let mut out = StackNames::default();
+        for m in b.in_path.keys().chain(b.waited_in.keys()) {
+            if !stacks::is_filter(filters, m) || out.label.contains_key(m) {
+                continue;
+            }
+            let described = modules.describe_short(m);
+            let described = (described != "unidentified driver").then_some(described);
+            let group = filters.get(&m.to_ascii_lowercase()).map(String::as_str);
+            out.label.insert(m.clone(), stacks::filter_label(m, group, described.as_deref()));
+            out.microsoft.insert(m.clone(), modules.is_microsoft(m));
+        }
+        out
+    }
+
+    fn name(&self, m: &str) -> String {
+        self.label.get(m).cloned().unwrap_or_else(|| m.to_string())
+    }
+}
+
+fn percent(n: u32, of: u32) -> String {
+    format!("{:.0}%", 100.0 * n as f64 / of.max(1) as f64)
+}
+
+/// A filter counts as "most of the time" in the path of a disk's slow requests from this many
+/// stacks on, and at least half of them. Rule of thumb: one or two stacks are an anecdote.
+const MOSTLY_MIN: u32 = 3;
+
+/// The filters in the path of a disk's slow requests, most often first: (driver, how many stacks).
+fn filters_in_path(b: &DiskBehind, filters: &HashMap<String, String>) -> Vec<(String, u32)> {
+    top_counts(&b.in_path, STACK_KEYS_CAP).into_iter().filter(|(m, _)| stacks::is_filter(filters, m)).collect()
+}
+
+/// What the call stacks said about one disk's slow requests (see `stacks`). Facts only: a filter
+/// being in the path of a request is never called its cause, because every file access on Windows
+/// passes through several of them.
+fn stack_sentences(b: &DiskBehind, filters: &HashMap<String, String>, names: &StackNames) -> Vec<String> {
+    let mut out = Vec::new();
+    if b.stack_found > 0 {
+        let asked = b.stack_found + b.stack_missing;
+        let of = if b.stack_missing > 0 { format!(" ({} of the {asked} checked had one)", b.stack_found) } else { String::new() };
+        let found = filters_in_path(b, filters);
+        if found.is_empty() {
+            out.push(format!("The call stacks of the slow requests{of} show no file-system filter's own code in their path."));
+        } else {
+            let list: Vec<String> =
+                found.iter().take(4).map(|(m, n)| format!("{} in {}", names.name(m), percent(*n, b.stack_found))).collect();
+            out.push(format!(
+                "The call stacks of the slow requests{of} show these file-system filters in their path: {}. In the path is not the \
+                 same as the cause: every file access on Windows passes through several filters.",
+                and_list(&list)
+            ));
+        }
+    } else if b.stack_missing > 0 {
+        out.push(format!(
+            "Call stacks were asked for, but none arrived for the {} slow request{} checked (Windows cannot walk every kernel stack), \
+             so which drivers were in their path is not known.",
+            b.stack_missing,
+            plural(b.stack_missing as u64)
+        ));
+    }
+    if b.wait_stacks > 0 {
+        let list: Vec<String> =
+            top_counts(&b.waited_in, 3).iter().map(|(m, n)| format!("inside {} in {n} of {}", names.name(m), b.wait_stacks)).collect();
+        out.push(format!("Where the programs stuck behind them were blocked, from their call stacks: {}.", list.join(", ")));
+    }
+    out
+}
+
+/// What to try from the call stacks, only when one filter was in the path of most slow requests or
+/// most waits. Never "turn it off" or "uninstall" for anything, and for Microsoft Defender only
+/// what Microsoft documents: an exclusion for a folder the person trusts, with Microsoft's warning.
+fn stack_advice(b: &DiskBehind, filters: &HashMap<String, String>, names: &StackNames) -> Vec<String> {
+    let mostly = |n: u32, of: u32| n >= MOSTLY_MIN && 2 * n >= of;
+    let mut out = Vec::new();
+    for (m, n) in filters_in_path(b, filters) {
+        let blocked = b.waited_in.get(&m).copied().unwrap_or(0);
+        if !mostly(n, b.stack_found) && !mostly(blocked, b.wait_stacks) {
+            continue;
+        }
+        if stacks::known_filter(&m) == Some("Microsoft Defender Antivirus") {
+            // Menu path and warning: https://support.microsoft.com/en-us/windows/add-an-exclusion-to-windows-security-811816c0-4dfd-af4a-47e4-c301afe13b26
+            // ("Adding an exclusion to Windows Security means that Microsoft Defender Antivirus will
+            // no longer check those types of files for threats, which could leave your device and
+            // data vulnerable.")
+            out.push(format!(
+                "{} was in the path of most of this drive's slow requests. That alone does not make it the cause, and it is part of \
+                 Windows' protection. If it keeps showing up, Microsoft documents excluding a folder you trust from its scanning \
+                 (Windows Security > Virus & threat protection settings > Manage settings > Exclusions); Microsoft warns that files \
+                 there are then no longer checked for threats, so only exclude something like a game library, never Downloads.",
+                names.name(&m)
+            ));
+        } else if names.microsoft.get(&m).copied().flatten() == Some(false) {
+            let av = filters.get(&m.to_ascii_lowercase()).is_some_and(|g| g.eq_ignore_ascii_case("FSFilter Anti-Virus"));
+            let one = if av { " Only one antivirus product should be scanning files at a time." } else { "" };
+            out.push(format!(
+                "{} was in the path of most of this drive's slow requests. That alone does not make it the cause. If it keeps \
+                 showing up, look in that product's settings for exclusions or a performance or gaming mode.{one}",
+                names.name(&m)
+            ));
+        }
+    }
+    out
+}
+
+/// The DETAILS block for one disk: the commonest issuing paths and where the stuck threads waited.
+fn stack_lines(drive: &str, b: &DiskBehind) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, n) in top_counts(&b.issue_paths, 3) {
+        out.push(format!("  {drive}: slow requests issued through {path}  ({n} of {})", b.stack_found));
+    }
+    for ((program, path), n) in top_counts(&b.wait_paths, 4) {
+        out.push(format!("  {drive}: {program} was blocked in {path}  ({n} time{})", plural(n as u64)));
     }
     out
 }
@@ -1080,6 +1225,85 @@ mod tests {
         // Program code paging from a hard drive is worth moving; from an SSD it is not.
         assert!(behind_advice(&behind(), true).iter().any(|a| a.contains("to an SSD")));
         assert!(behind_advice(&behind(), false).is_empty());
+    }
+
+    fn filter_map() -> HashMap<String, String> {
+        [
+            ("wdfilter.sys", "FSFilter Anti-Virus"),
+            ("cldflt.sys", "FSFilter HSM"),
+            ("fltmgr.sys", "FSFilter Infrastructure"),
+            ("avx.sys", "FSFilter Anti-Virus"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+    }
+
+    fn stacked() -> DiskBehind {
+        let mut b = DiskBehind { stack_found: 10, stack_missing: 2, wait_stacks: 4, ..DiskBehind::default() };
+        for (m, n) in [("FLTMGR.SYS", 10), ("Ntfs.sys", 10), ("WdFilter.sys", 8), ("cldflt.sys", 1)] {
+            b.in_path.insert(m.into(), n);
+        }
+        b.waited_in.insert("WdFilter.sys".into(), 3);
+        b.waited_in.insert("the Windows kernel".into(), 1);
+        b.issue_paths.insert("FLTMGR.SYS -> Ntfs.sys".into(), 7);
+        b.wait_paths.insert(("explorer.exe".into(), "FLTMGR.SYS -> WdFilter.sys".into()), 3);
+        b
+    }
+
+    fn names_for_test() -> StackNames {
+        let mut n = StackNames::default();
+        n.label.insert("WdFilter.sys".into(), stacks::filter_label("WdFilter.sys", Some("FSFilter Anti-Virus"), None));
+        n.microsoft.insert("WdFilter.sys".into(), Some(true));
+        n.label.insert("avx.sys".into(), "avx.sys (Example AV, antivirus scanning)".into());
+        n.microsoft.insert("avx.sys".into(), Some(false));
+        n
+    }
+
+    #[test]
+    fn call_stacks_name_the_filters_in_the_path_without_calling_them_the_cause() {
+        let s = stack_sentences(&stacked(), &filter_map(), &names_for_test());
+        assert!(s[0].contains("(10 of the 12 checked had one)"), "{s:?}");
+        assert!(
+            s[0].contains("WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning) in 80%") && s[0].contains("cldflt.sys in 10%"),
+            "{s:?}"
+        );
+        assert!(!s[0].contains("FLTMGR") && !s[0].contains("Ntfs"), "the Filter Manager and the file system are not filters: {s:?}");
+        assert!(s[0].contains("not the same as the cause"), "{s:?}");
+        assert!(s[1].contains("inside WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning) in 3 of 4"), "{s:?}");
+        assert!(s[1].contains("inside the Windows kernel in 1 of 4"), "{s:?}");
+        // No filter at all, and no stack at all, are both said plainly.
+        let mut none = stacked();
+        none.in_path.retain(|m, _| m == "Ntfs.sys");
+        none.wait_stacks = 0;
+        assert_eq!(stack_sentences(&none, &filter_map(), &names_for_test()).len(), 1);
+        assert!(stack_sentences(&none, &filter_map(), &names_for_test())[0].contains("show no file-system filter"));
+        let missing = DiskBehind { stack_missing: 3, ..DiskBehind::default() };
+        assert!(stack_sentences(&missing, &filter_map(), &names_for_test())[0].contains("none arrived for the 3 slow requests"));
+        let lines = stack_lines("disk 1 (D:)", &stacked());
+        assert_eq!(lines[0], "  disk 1 (D:): slow requests issued through FLTMGR.SYS -> Ntfs.sys  (7 of 10)");
+        assert_eq!(lines[1], "  disk 1 (D:): explorer.exe was blocked in FLTMGR.SYS -> WdFilter.sys  (3 times)");
+    }
+
+    /// The audience rule, for call stacks: Defender is part of Windows, so the most the report
+    /// may do is point at Microsoft's documented exclusions - never off, never uninstall.
+    #[test]
+    fn defender_in_the_path_is_never_something_to_turn_off() {
+        let advice = stack_advice(&stacked(), &filter_map(), &names_for_test()).join(" ");
+        assert!(advice.contains("Exclusions") && advice.contains("no longer checked for threats"), "{advice}");
+        for bad in ["turn off", "disable", "uninstall", "close", "remove", "stop", "real-time protection"] {
+            assert!(!advice.to_lowercase().contains(bad), "says {bad:?}: {advice}");
+        }
+        // Only when it was in the path most of the time: once in ten says nothing.
+        let mut rare = stacked();
+        rare.in_path.insert("WdFilter.sys".into(), 1);
+        rare.waited_in.clear();
+        assert!(stack_advice(&rare, &filter_map(), &names_for_test()).is_empty());
+        // Another vendor's antivirus filter gets that product's settings, and the one-antivirus rule.
+        let mut other = DiskBehind { stack_found: 6, ..DiskBehind::default() };
+        other.in_path.insert("avx.sys".into(), 5);
+        let a = stack_advice(&other, &filter_map(), &names_for_test()).join(" ");
+        assert!(a.starts_with("avx.sys (Example AV") && a.contains("that product's settings") && a.contains("Only one antivirus"), "{a}");
     }
 
     #[test]

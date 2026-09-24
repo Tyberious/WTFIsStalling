@@ -7,7 +7,9 @@
 //!
 //! What this never claims: WHICH lock, or which kernel function anyone was in. A wait reason is a
 //! kind of wait and a readying thread is the thread that signaled; "held by" below means exactly
-//! "the thread that woke it", and is only said when the trace names such a thread at all.
+//! "the thread that woke it", and is only said when the trace names such a thread at all. Which
+//! DRIVER a thread was blocked in, and which drivers a request went through, come from module-level
+//! call stacks when those are on (`stacks`, issue #20 step 3): driver names, never functions.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -174,6 +176,8 @@ pub struct LockChain {
     pub waiter: u32,
     pub holder: u32,
     pub waited: i64,
+    /// When the holder woke the waiter; the wait began `waited` before.
+    pub woke_at: i64,
 }
 
 /// The newest switch that took `tid` off a processor at or before `at`, if that was into a wait.
@@ -250,7 +254,7 @@ pub fn lock_chains(slow: &IoRec, stuck: &[Stuck], sw: &[SwitchRec], rd: &[ReadyR
         if r.ts - off.ts < ms_to_ticks(STUCK_MIN_MS) {
             continue;
         }
-        out.push(LockChain { waiter: r.tid, holder: by, waited: r.ts - off.ts });
+        out.push(LockChain { waiter: r.tid, holder: by, waited: r.ts - off.ts, woke_at: r.ts });
     }
     out.sort_by_key(|c| (std::cmp::Reverse(c.waited), c.waiter));
     out
@@ -332,45 +336,72 @@ fn clip(name: &str) -> String {
     format!("{head}...")
 }
 
-/// One program stuck behind a request: its name, how many of its threads, the longest wait.
+/// One program stuck behind a request: its name, how many of its threads, the longest wait, and
+/// where (which driver) that longest-waiting thread was blocked, when a call stack says so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Victim {
     pub name: String,
     pub threads: usize,
     pub longest: i64,
+    pub waited_in: Option<String>,
 }
 
+/// One stuck thread: its program, how long it waited, and where, if a call stack says.
+pub type StuckThread = (String, i64, Option<String>);
+
 /// Threads grouped into programs, longest wait first.
-pub fn by_program(stuck: &[(String, i64)]) -> Vec<Victim> {
+pub fn by_program(stuck: &[StuckThread]) -> Vec<Victim> {
     let mut v: Vec<Victim> = Vec::new();
-    for (name, waited) in stuck {
+    for (name, waited, inside) in stuck {
         match v.iter_mut().find(|p| &p.name == name) {
             Some(p) => {
                 p.threads += 1;
-                p.longest = p.longest.max(*waited);
+                if *waited > p.longest {
+                    p.longest = *waited;
+                    p.waited_in = inside.clone();
+                }
             }
-            None => v.push(Victim { name: name.clone(), threads: 1, longest: *waited }),
+            None => v.push(Victim { name: name.clone(), threads: 1, longest: *waited, waited_in: inside.clone() }),
         }
     }
     v.sort_by(|a, b| b.longest.cmp(&a.longest).then_with(|| a.name.cmp(&b.name)));
     v
 }
 
-/// "    Stuck behind it: explorer.exe (3 threads, up to 2100 ms), Discord.exe (1); explorer.exe
-/// waited 1200 ms on a lock held by System, which was waiting on disk 1 (D:)"
+/// A lock chain for the event log: (waiter, how long it waited, holder, where the waiter was
+/// blocked when a call stack says so).
+pub type ChainText = (String, i64, String, Option<String>);
+
+/// "    Stuck behind it: explorer.exe (3 threads, up to 2100 ms, in WdFilter.sys), Discord.exe (1);
+/// explorer.exe waited 1200 ms on a lock held by System, which was waiting on disk 1 (D:)"
 ///
-/// Never wider than `LINE_WIDTH`: programs are dropped (the lock chain is the rarer and more
-/// telling fact, so it goes last), then the chain, until it fits. `chains` is (waiter, waited,
-/// holder); only the longest is shown here, the finding totals them all.
-pub fn stuck_line(victims: &[Victim], chains: &[(String, i64, String)], drive: &str) -> Option<String> {
+/// Never wider than `LINE_WIDTH`: where the waiting happened goes first (it is the newest and
+/// least essential part), then programs are dropped (the lock chain is the rarer and more telling
+/// fact, so it goes last), then the chain, until it fits. Only the longest chain is shown here,
+/// the finding totals them all.
+pub fn stuck_line(victims: &[Victim], chains: &[ChainText], drive: &str) -> Option<String> {
     if victims.is_empty() && chains.is_empty() {
         return None;
     }
+    // With the chain before without it, and within each, with where they waited before without.
+    let (with_in, without_in) = (stuck_candidates(victims, chains, drive, true), stuck_candidates(victims, chains, drive, false));
+    let candidates: Vec<String> = [with_in.0, without_in.0, with_in.1, without_in.1].concat();
+    let lines: Vec<String> = candidates.into_iter().map(|c| format!("    Stuck behind it: {c}")).collect();
+    // The last resort is only reachable with absurd names: cut rather than overflow.
+    lines.iter().find(|l| l.chars().count() <= LINE_WIDTH).cloned().or_else(|| lines.first().map(|l| l.chars().take(LINE_WIDTH).collect()))
+}
+
+/// (candidates that keep the lock chain, candidates without it), best first.
+fn stuck_candidates(victims: &[Victim], chains: &[ChainText], drive: &str, with_in: bool) -> (Vec<String>, Vec<String>) {
+    let inside = |w: &Option<String>| match w {
+        Some(m) if with_in => format!(" in {}", clip(m)),
+        _ => String::new(),
+    };
     // "disk 1 (D:)", and "disk 1" when that is what it takes to fit (the line above names the drive).
     let bare = drive.split(" (").next().unwrap_or(drive);
     let chain_to = |drive: &str| {
-        chains.first().map(|(w, t, h)| {
-            format!("{} waited {} on a lock held by {}, which was waiting on {}", clip(w), fmt_dur(*t), clip(h), clip(drive))
+        chains.first().map(|(w, t, h, at)| {
+            format!("{} waited {}{} on a lock held by {}, which was waiting on {}", clip(w), fmt_dur(*t), inside(at), clip(h), clip(drive))
         })
     };
     // The worst program in full, the next ones as "name (threads)".
@@ -379,7 +410,9 @@ pub fn stuck_line(victims: &[Victim], chains: &[(String, i64, String)], drive: &
         for (i, p) in victims.iter().take(n).enumerate() {
             parts.push(if i == 0 {
                 let t = if p.threads == 1 { "1 thread".to_string() } else { format!("{} threads", p.threads) };
-                format!("{} ({t}, up to {})", clip(&p.name), fmt_dur(p.longest))
+                let at = inside(&p.waited_in);
+                let at = if at.is_empty() { at } else { format!(",{at}") };
+                format!("{} ({t}, up to {}{at})", clip(&p.name), fmt_dur(p.longest))
             } else {
                 format!("{} ({})", clip(&p.name), p.threads)
             });
@@ -396,10 +429,7 @@ pub fn stuck_line(victims: &[Victim], chains: &[(String, i64, String)], drive: &
         candidates.extend(ns.iter().map(|&n| format!("{}; {c}", programs(n))));
         candidates.push(if victims.is_empty() { c.clone() } else { format!("{counted}; {c}") });
     }
-    candidates.extend(ns.iter().map(|&n| programs(n)));
-    let lines: Vec<String> = candidates.into_iter().map(|c| format!("    Stuck behind it: {c}")).collect();
-    // The last resort is only reachable with absurd names: cut rather than overflow.
-    lines.iter().find(|l| l.chars().count() <= LINE_WIDTH).cloned().or_else(|| lines.first().map(|l| l.chars().take(LINE_WIDTH).collect()))
+    (candidates, ns.iter().map(|&n| programs(n)).collect())
 }
 
 /// "the drive kept jumping between A and B", when there was a fight over the head at all.
@@ -421,6 +451,37 @@ pub fn request_line(text: &str, thrash_with: &[String]) -> String {
         }
     }
     base.chars().take(LINE_WIDTH).collect()
+}
+
+fn request_line_scored(kind: Kind, op: u8, path: Option<&str>, thrash_with: &[String], timing: Option<&str>, via: &[String]) -> String {
+    let short = request_short(kind, op).to_string();
+    let long = request_text(kind, op, path).unwrap_or_else(|| short.clone());
+    let descs = [(long, 0u32), (short, 1)];
+    let fights: Vec<(Option<String>, u32)> = match fight(thrash_with) {
+        Some(f) => {
+            let brief = f.replacen("the drive kept jumping", "head jumping", 1);
+            vec![(Some(f), 0), (Some(brief), 1), (None, 4)]
+        }
+        None => vec![(None, 0)],
+    };
+    let mut vias: Vec<(Option<&str>, u32)> = via.iter().enumerate().map(|(i, v)| (Some(v.as_str()), 2 * i as u32)).collect();
+    // Dearer than dropping the thrashing (4) plus the shorter via (2), so the fight goes first.
+    vias.push((None, 7));
+    let mut scored: Vec<(u32, String)> = Vec::new();
+    for (d, ds) in &descs {
+        for (f, fs) in &fights {
+            for (v, vs) in &vias {
+                let parts: Vec<&str> = [Some(d.as_str()), f.as_deref(), *v, timing].into_iter().flatten().collect();
+                scored.push((ds + fs + vs, format!("    Request: {}", parts.join("; "))));
+            }
+        }
+    }
+    if let Some(t) = timing {
+        scored.push((100, format!("    Request: {t}")));
+    }
+    scored.sort_by_key(|(score, _)| *score);
+    let fits = scored.iter().find(|(_, l)| l.chars().count() <= LINE_WIDTH).map(|(_, l)| l.clone());
+    fits.unwrap_or_else(|| scored.last().map(|(_, l)| l.chars().take(LINE_WIDTH).collect()).unwrap_or_default())
 }
 
 /// A few words for what the request was, for when the full sentence does not leave room.
@@ -445,6 +506,25 @@ pub fn request_short(kind: Kind, op: u8) -> &'static str {
 /// one before the thrashing or the timing is dropped, and the timing, the one new measured fact,
 /// goes last.
 pub fn request_line_timed(kind: Kind, op: u8, path: Option<&str>, thrash_with: &[String], timing: Option<&str>) -> Option<String> {
+    request_line_via(kind, op, path, thrash_with, timing, &[])
+}
+
+/// `request_line_timed` plus which drivers the request was issued through (`via`, most detailed
+/// variant first, from `stacks::via_variants`). With no `via` it is exactly the old line. With one,
+/// every combination is scored by what it gives up and the cheapest that fits wins: the short
+/// description first, then the shorter via and the brief thrashing, then the thrashing, then the
+/// via; the storage port driver's timing is still the last thing to go.
+pub fn request_line_via(
+    kind: Kind,
+    op: u8,
+    path: Option<&str>,
+    thrash_with: &[String],
+    timing: Option<&str>,
+    via: &[String],
+) -> Option<String> {
+    if !via.is_empty() {
+        return Some(request_line_scored(kind, op, path, thrash_with, timing, via));
+    }
     let long = request_text(kind, op, path);
     let Some(timing) = timing else { return long.map(|t| request_line(&t, thrash_with)) };
     let short = request_short(kind, op);
@@ -478,6 +558,38 @@ pub struct DiskBehind {
     /// Slow requests during which the drive was thrashing, and program -> how often it was involved.
     pub thrash: u32,
     pub thrash_programs: HashMap<String, u32>,
+    /// Slow requests whose issuing call stack was looked for: found, and asked for but missing
+    /// (Windows could not walk it, or the start of the request was never seen). See `stacks`.
+    pub stack_found: u32,
+    pub stack_missing: u32,
+    /// Driver -> in how many of the found issuing stacks it appeared at all.
+    pub in_path: HashMap<String, u32>,
+    /// Issuing path as text -> how often, for DETAILS.
+    pub issue_paths: HashMap<String, u32>,
+    /// Stuck threads whose wait had a call stack, and where they were blocked -> how often.
+    pub wait_stacks: u32,
+    pub waited_in: HashMap<String, u32>,
+    /// (program, wait path) -> how often, for DETAILS.
+    pub wait_paths: HashMap<(String, String), u32>,
+}
+
+/// Distinct keys one of the stack tallies above may hold; new ones past this are not counted, so a
+/// long run cannot grow them without bound. Far more than the report ever shows.
+pub const STACK_KEYS_CAP: usize = 64;
+
+/// Counts `key` in `m`, unless `m` is full and the key is new.
+pub fn bump<K: Eq + Hash>(m: &mut HashMap<K, u32>, key: K) {
+    if m.len() < STACK_KEYS_CAP || m.contains_key(&key) {
+        *m.entry(key).or_default() += 1;
+    }
+}
+
+/// The most frequent keys of a tally, most first (ties by key, so the order is stable).
+pub fn top_counts<K: Clone + Ord>(m: &HashMap<K, u32>, n: usize) -> Vec<(K, u32)> {
+    let mut v: Vec<(K, u32)> = m.iter().map(|(k, c)| (k.clone(), *c)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
 }
 
 impl DiskBehind {
@@ -621,7 +733,7 @@ mod tests {
         // 80 (WrResource) woken by 51 shortly after 51 got going: a chain.
         let rd = vec![rdy(1802.0, 80, 51, 0)];
         let c = lock_chains(&slow, &stuck, &sw, &rd);
-        assert_eq!(c, vec![LockChain { waiter: 80, holder: 51, waited: ms(1802.0) - ms(1200.0) }]);
+        assert_eq!(c, vec![LockChain { waiter: 80, holder: 51, waited: ms(1802.0) - ms(1200.0), woke_at: ms(1802.0) }]);
         // The same wake-up done from a DPC names nobody.
         assert!(lock_chains(&slow, &stuck, &sw, &[rdy(1802.0, 80, 51, READY_FROM_DPC)]).is_empty());
         // Woken by someone who was not stuck: nothing.
@@ -667,16 +779,16 @@ mod tests {
 
     #[test]
     fn stuck_lines_never_exceed_the_report_width() {
-        let v = |name: &str, threads, ms_: f64| Victim { name: name.into(), threads, longest: ms(ms_) };
+        let v = |name: &str, threads, ms_: f64| Victim { name: name.into(), threads, longest: ms(ms_), waited_in: None };
         let victims = vec![v("explorer.exe", 3, 2100.0), v("Discord.exe", 1, 900.0), v("steam.exe", 2, 40.0)];
-        let chains = vec![("explorer.exe".to_string(), ms(1200.0), "System".to_string())];
+        let chains = vec![("explorer.exe".to_string(), ms(1200.0), "System".to_string(), None)];
         let line = stuck_line(&victims, &chains, "disk 1 (D:)").unwrap();
         assert!(line.chars().count() <= LINE_WIDTH, "{line}");
         assert!(line.contains("lock held by System, which was waiting on disk 1"), "{line}");
         println!("{line}");
         let long = "a".repeat(300);
         let many: Vec<Victim> = (0..20).map(|i| v(&format!("{long}{i}.exe"), i + 1, 5.0)).collect();
-        let chains = [(long.clone(), ms(1.0), long.clone())];
+        let chains = [(long.clone(), ms(1.0), long.clone(), Some(long.clone()))];
         for (vs, cs) in [(&many[..], &chains[..]), (&many[..], &[][..]), (&[][..], &chains[..]), (&victims[..], &[][..])] {
             let line = stuck_line(vs, cs, &long).unwrap();
             assert!(line.chars().count() <= LINE_WIDTH, "{} chars: {line}", line.chars().count());
@@ -724,10 +836,94 @@ mod tests {
         println!("{}", request_line_timed(Kind::PagedFile, b'R', None, &fighters[1], Some(timing)).unwrap());
     }
 
+    /// Which drivers a request went through rides on the "Request:" line too: it gives way before
+    /// the thrashing does, the storage port driver's timing is still the last thing to go, and no
+    /// combination is ever wider than the report.
+    #[test]
+    fn the_request_line_with_drivers_fits_and_gives_way_in_order() {
+        let via: Vec<String> = crate::stacks::via_variants(
+            &["FLTMGR.SYS", "Ntfs.sys", "WdFilter.sys", "volsnap.sys", "disk.sys", "CLASSPNP.SYS", "storport.sys"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
+        let timing = "1955 ms inside the drive, 45.00 ms waiting in Windows; retried 12 times";
+        let kinds = [Kind::PagingFile, Kind::ProgramCode, Kind::PagedFile, Kind::Bookkeeping, Kind::FileData, Kind::Flush];
+        let fighters = [vec![], vec!["steam.exe".to_string(), "qbittorrent.exe".to_string()], vec!["x".repeat(300), "y".repeat(300)]];
+        let long_via = vec![format!("via {}", "z".repeat(400))];
+        for kind in kinds {
+            for op in *b"RWF" {
+                for thrash in &fighters {
+                    for v in [&via, &long_via] {
+                        for t in [Some(timing), None] {
+                            let line = request_line_via(kind, op, Some(r"C:\$Mft"), thrash, t, v).expect("a line");
+                            assert!(line.chars().count() <= LINE_WIDTH, "{} chars: {line}", line.chars().count());
+                            if let Some(t) = t {
+                                assert!(line.ends_with(t), "the timing stays: {line}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Room for everything: the full path is shown.
+        let few = crate::stacks::via_variants(&["FLTMGR.SYS".to_string(), "Ntfs.sys".to_string(), "disk.sys".to_string()]);
+        let line = request_line_via(Kind::FileData, b'R', None, &[], None, &few).unwrap();
+        assert_eq!(line, "    Request: ordinary read of a file's contents; via FLTMGR.SYS -> Ntfs.sys -> disk.sys");
+        // Too long in full: the storage stack below the file system is left out first.
+        let line = request_line_via(Kind::FileData, b'R', None, &[], None, &via).unwrap();
+        assert_eq!(line, "    Request: ordinary read of a file's contents; via FLTMGR.SYS -> Ntfs.sys -> WdFilter.sys");
+        // The thrashing gives way before the drivers do (the finding still totals it)...
+        let line = request_line_via(Kind::FileData, b'R', None, &fighters[1], None, &via).unwrap();
+        assert_eq!(line, "    Request: ordinary read of a file's contents; via FLTMGR.SYS -> Ntfs.sys -> WdFilter.sys");
+        // ...and the drivers before the timing does.
+        let timing = "200 ms inside the drive, 5.00 ms waiting in Windows";
+        let line = request_line_via(Kind::FileData, b'R', None, &fighters[1], Some(timing), &via).unwrap();
+        assert_eq!(line, format!("    Request: ordinary read of a file's contents; {timing}"));
+        // No via: exactly the old line.
+        assert_eq!(request_line_via(Kind::FileData, b'R', None, &[], None, &[]), request_line_timed(Kind::FileData, b'R', None, &[], None));
+        println!("{line}");
+    }
+
+    #[test]
+    fn where_a_victim_waited_rides_on_the_stuck_line_and_goes_first() {
+        let v = |name: &str, threads, ms_: f64, at: Option<&str>| Victim {
+            name: name.into(),
+            threads,
+            longest: ms(ms_),
+            waited_in: at.map(String::from),
+        };
+        let victims = vec![v("explorer.exe", 3, 2100.0, Some("WdFilter.sys")), v("Discord.exe", 1, 900.0, None)];
+        let line = stuck_line(&victims, &[], "disk 1 (D:)").unwrap();
+        assert_eq!(line, "    Stuck behind it: explorer.exe (3 threads, up to 2100 ms, in WdFilter.sys), Discord.exe (1)");
+        // With a lock chain there is no room for both: the "in" parts go before the chain does.
+        let chains = vec![("explorer.exe".to_string(), ms(1200.0), "System".to_string(), Some("Ntfs.sys".to_string()))];
+        let line = stuck_line(&victims, &chains, "disk 1 (D:)").unwrap();
+        assert!(line.contains("lock held by System") && !line.contains(" in WdFilter"), "{line}");
+        assert!(line.chars().count() <= LINE_WIDTH);
+        println!("{line}");
+        // A short chain keeps where the waiter was blocked.
+        let short = vec![("a.exe".to_string(), ms(12.0), "b.exe".to_string(), Some("Ntfs.sys".to_string()))];
+        let line = stuck_line(&[], &short, "disk 1").unwrap();
+        assert_eq!(line, "    Stuck behind it: a.exe waited 12.00 ms in Ntfs.sys on a lock held by b.exe, which was waiting on disk 1");
+    }
+
+    #[test]
+    fn stack_tallies_are_bounded() {
+        let mut m: HashMap<String, u32> = HashMap::new();
+        for i in 0..(STACK_KEYS_CAP + 10) {
+            bump(&mut m, format!("k{i}"));
+        }
+        bump(&mut m, "k0".to_string());
+        assert_eq!(m.len(), STACK_KEYS_CAP);
+        assert_eq!(m["k0"], 2, "known keys still count");
+        assert_eq!(top_counts(&m, 1), vec![("k0".to_string(), 2)]);
+    }
+
     #[test]
     fn threads_add_up_per_program() {
-        let p = by_program(&[("a.exe".into(), 5), ("b.exe".into(), 50), ("a.exe".into(), 70)]);
-        assert_eq!(p[0], Victim { name: "a.exe".into(), threads: 2, longest: 70 });
+        let p = by_program(&[("a.exe".into(), 5, None), ("b.exe".into(), 50, None), ("a.exe".into(), 70, Some("Ntfs.sys".into()))]);
+        assert_eq!(p[0], Victim { name: "a.exe".into(), threads: 2, longest: 70, waited_in: Some("Ntfs.sys".into()) });
         assert_eq!(p[1].name, "b.exe");
     }
 }

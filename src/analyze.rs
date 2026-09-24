@@ -18,6 +18,7 @@ use crate::probe::{ProbeTids, Stall, StallKind};
 use crate::procs::{process_name, ProcNames};
 use crate::quiet::Quieter;
 use crate::say;
+use crate::stacks::{self, IoStack, Kind as StackKind};
 use crate::state::*;
 use crate::storport::split::{self as storsplit, Outcome, SplitTotals};
 use crate::storport::{ScsiAddr, StorTrace};
@@ -1669,7 +1670,7 @@ impl Analyzer {
     /// the log line and the (at most two) lines under it.
     fn explain_io(&mut self, slow: &IoRec) -> IoWhy {
         let start = slow.end - slow.dur;
-        let (ios, near, recs) = {
+        let (ios, near, recs, (issue, (switch_ins, fault_stacks))) = {
             let inner = self.shared.inner.lock().unwrap();
             let ios: Vec<IoRec> = inner.ios.iter().filter(|i| i.disk == slow.disk).copied().collect();
             // Every disk: a thread woken as this one completed may have been waiting on another.
@@ -1679,7 +1680,21 @@ impl Analyzer {
                 let (before, after) = (ms_to_ticks(diskstuck::READY_BEFORE_MS), ms_to_ticks(diskstuck::LOOK_AFTER_MS));
                 inner.stuck_records(start, slow.end, before, after)
             });
-            (ios, near, recs)
+            // Call stacks (see `stacks`): the request's own issuing stack, and the wait stacks of the
+            // threads woken around its completion, any of which may turn out to be stuck behind it.
+            let st = &inner.stacks;
+            let issue = st.set.has(StackKind::DiskInit).then(|| st.slow_io_stack(slow.end, slow.irp));
+            let waits = match &recs {
+                Some(Some((_, rd))) if st.set.has(StackKind::CSwitch) || st.set.has(StackKind::Fault) => {
+                    let mut tids: Vec<u32> = rd.iter().map(|r| r.tid).collect();
+                    tids.sort_unstable();
+                    tids.dedup();
+                    let to = slow.end + ms_to_ticks(diskstuck::LOOK_AFTER_MS + stacks::FAULT_LATE_MS);
+                    st.wait_stacks(&tids, start, to)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            (ios, near, recs, (issue, waits))
         };
         let why = self.explain_cause(slow, &ios);
         let disk = self.disks.get(slow.disk).clone();
@@ -1715,35 +1730,61 @@ impl Analyzer {
             Some(Outcome::Split(s)) => Some(storsplit::event_words(&s)),
             _ => None,
         };
-        let request = diskstuck::request_line_timed(kind, slow.op, path.as_deref(), &thrashers, timing.as_deref());
+        // Which drivers the request went through on its way down, from its issuing call stack.
+        let issue_path: Option<Vec<String>> = match &issue {
+            Some(Some(IoStack::Found(st))) => Some(self.stack_path(st)),
+            _ => None,
+        };
+        let via = issue_path.as_deref().map(stacks::via_variants).unwrap_or_default();
+        let request = diskstuck::request_line_via(kind, slow.op, path.as_deref(), &thrashers, timing.as_deref(), &via);
 
         // Who was stuck behind it. Nothing at all is said when the rings could not tell.
         let mut stuck_line = None;
         let mut victims: Vec<diskstuck::Victim> = Vec::new();
-        let mut chains: Vec<(String, i64, String)> = Vec::new();
+        let mut chains: Vec<diskstuck::ChainText> = Vec::new();
+        let mut wait_paths: Vec<(String, String)> = Vec::new();
         if let Some(Some((sw, rd))) = &recs {
             let stuck = diskstuck::stuck_behind(slow, &near, sw, rd);
             let found = diskstuck::lock_chains(slow, &stuck, sw, rd);
             let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
-            let named: Vec<(String, i64)> = stuck
-                .iter()
+            let is_own = |n: &str| own.as_ref().is_some_and(|own| n.to_lowercase().starts_with(own));
+            let mut named: Vec<diskstuck::StuckThread> = Vec::new();
+            for s in &stuck {
                 // Windows' own kernel threads (the file cache's workers, mostly) are the machinery
                 // doing the waiting on everyone's behalf, not a program anyone is waiting for:
                 // measured live, they were all that "stuck behind it" named for a cached read.
-                .filter_map(|s| (self.pid_of(s.tid) != SYSTEM_PID).then(|| self.thread_program(s.tid).map(|n| (n, s.waited))).flatten())
-                .filter(|(n, _)| !own.as_ref().is_some_and(|own| n.to_lowercase().starts_with(own)))
-                .collect();
-            victims = diskstuck::by_program(&named);
-            chains = found
-                .iter()
-                .filter_map(|c| {
-                    if self.pid_of(c.waiter) == SYSTEM_PID {
-                        return None;
+                if self.pid_of(s.tid) == SYSTEM_PID {
+                    continue;
+                }
+                let Some(name) = self.thread_program(s.tid).filter(|n| !is_own(n)) else { continue };
+                // Where it was blocked, when a call stack for exactly this wait exists.
+                let off = s.woke_at - s.waited;
+                let at = match stacks::wait_stack(s.tid, off, s.woke_at, &switch_ins, &fault_stacks) {
+                    Some((st, _)) => {
+                        let path = self.stack_path(st);
+                        wait_paths.push((name.clone(), stacks::path_text(None, &path)));
+                        Some(stacks::waited_in(&path))
                     }
-                    Some((self.thread_program(c.waiter)?, c.waited, self.thread_program(c.holder)?))
-                })
-                .filter(|(w, _, _)| !own.as_ref().is_some_and(|own| w.to_lowercase().starts_with(own)))
-                .collect();
+                    None => None,
+                };
+                named.push((name, s.waited, at));
+            }
+            victims = diskstuck::by_program(&named);
+            for c in &found {
+                if self.pid_of(c.waiter) == SYSTEM_PID {
+                    continue;
+                }
+                let (Some(w), Some(h)) = (self.thread_program(c.waiter), self.thread_program(c.holder)) else { continue };
+                if is_own(&w) {
+                    continue;
+                }
+                // A lock wait is never a page fault: only the switch-in stack can say where it was.
+                let at = stacks::wait_stack(c.waiter, c.woke_at - c.waited, c.woke_at, &switch_ins, &[]).map(|(st, _)| {
+                    let path = self.stack_path(st);
+                    stacks::waited_in(&path)
+                });
+                chains.push((w, c.waited, h, at));
+            }
             stuck_line = diskstuck::stuck_line(&victims, &chains, &disk.short());
         }
 
@@ -1765,12 +1806,43 @@ impl Analyzer {
             e.0 += 1;
             e.1 += v.longest;
         }
-        for (w, t, h) in &chains {
+        for (w, t, h, _) in &chains {
             let e = behind.chains.entry((w.clone(), h.clone())).or_default();
             e.0 += 1;
             e.1 = e.1.max(*t);
         }
+        // Call stacks: which drivers the request went through, and where its victims waited.
+        match (&issue, &issue_path) {
+            (_, Some(path)) => {
+                behind.stack_found += 1;
+                let mut seen: Vec<&String> = Vec::new();
+                for m in path {
+                    if !seen.contains(&m) {
+                        seen.push(m);
+                        diskstuck::bump(&mut behind.in_path, m.clone());
+                    }
+                }
+                diskstuck::bump(&mut behind.issue_paths, stacks::path_text(None, path));
+            }
+            (Some(_), None) => behind.stack_missing += 1,
+            (None, None) => {} // not asked for
+        }
+        for v in &victims {
+            if let Some(at) = &v.waited_in {
+                behind.wait_stacks += 1;
+                diskstuck::bump(&mut behind.waited_in, at.clone());
+            }
+        }
+        for key in wait_paths {
+            diskstuck::bump(&mut behind.wait_paths, key);
+        }
         IoWhy { why, request, stuck: stuck_line }
+    }
+
+    /// The drivers on a call stack, caller first (see `stacks::module_path`).
+    fn stack_path(&mut self, st: &stacks::Stack) -> Vec<String> {
+        let modules = &mut self.modules;
+        stacks::module_path(&st.frames, &mut |a| modules.owner(a))
     }
 
     /// The program a thread belongs to, or `None` for the idle thread and threads that can no

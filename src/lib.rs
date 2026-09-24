@@ -31,6 +31,7 @@ pub mod probe;
 pub mod procs;
 pub mod quiet;
 pub mod reg;
+pub mod stacks;
 pub mod state;
 pub mod storport;
 pub mod summary;

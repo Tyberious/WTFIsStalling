@@ -4,7 +4,7 @@
 //!
 //! A panic must never unwind out of `on_event`, which Windows calls: it is wrapped.
 
-use windows_sys::Win32::System::Diagnostics::Etw::{EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD};
+use windows_sys::Win32::System::Diagnostics::Etw::{EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD};
 
 use crate::state::*;
 
@@ -92,7 +92,12 @@ pub(super) unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // A poisoned lock only means some other thread panicked; the event data is still sound.
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let at = At { guid: hdr.ProviderId.data1, opcode: hdr.EventDescriptor.Opcode, ts: hdr.TimeStamp, cpu, tid: hdr.ThreadId };
+        // Pointer size of the payload: EVENT_HEADER_FLAG_32_BIT_HEADER "Indicates that the provider
+        // was running on a 32-bit computer or in a WOW64 session", _64_BIT_HEADER the 64-bit case.
+        // Neither set is read as this (64-bit) build's own size.
+        // https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header
+        let ptr64 = hdr.Flags as u32 & EVENT_HEADER_FLAG_32_BIT_HEADER == 0;
+        let at = At { guid: hdr.ProviderId.data1, opcode: hdr.EventDescriptor.Opcode, ts: hdr.TimeStamp, cpu, tid: hdr.ThreadId, ptr64 };
         handle_event(shared, &mut inner, at, data);
     }));
 }
@@ -108,6 +113,9 @@ struct At {
     cpu: u16,
     /// The thread the event was logged in the context of (`EVENT_HEADER::ThreadId`).
     tid: u32,
+    /// The payload's pointers are 8 bytes (only the stack parser reads pointers by this; every
+    /// other layout here is the documented 64-bit one).
+    ptr64: bool,
 }
 
 /// Layouts below are the 64-bit MOF layouts of the classic NT kernel logger events.
@@ -201,6 +209,7 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
                 return None;
             }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
+            inner.stacks.on_fault(ts, cpu, at.tid, start, tid);
             let r = FaultRec { start, end: ts, tid, pid, bytes, file };
             inner.faults.push_back(r);
             let st = inner.faults_by_pid.entry(pid).or_default();
@@ -241,6 +250,8 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
                 *inner.debug_irp_flags.entry((op, irp_flags)).or_default() += 1;
             }
             let pid = inner.tid_pid.get(&tid).copied().unwrap_or(PID_UNKNOWN);
+            // The issuing stack, if the start of this request left one, is kept only when it was slow.
+            inner.stacks.on_disk_done(ts, irp, dur >= shared.io_warn);
             let r = IoRec { end: ts, dur, file, irp, offset, disk, tid, pid, size, irp_flags, op };
             inner.ios.push_back(r);
             let st = inner.disks.entry(disk).or_default();
@@ -311,7 +322,7 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
         (GUID_THREAD, 36) => {
             // Everything up to OldThreadWaitIdealProcessor must be there; a record missing any of
             // it cannot be placed in the timeline at all.
-            inner.push_switch(SwitchRec {
+            let rec = SwitchRec {
                 ts,
                 new_tid: rd_u32(d, 0)?,
                 old_tid: rd_u32(d, 4)?,
@@ -321,14 +332,31 @@ fn handle_event(shared: &Shared, inner: &mut Inner, at: At, d: &[u8]) -> Option<
                 old_wait_reason: rd_i8(d, 12)?,
                 old_wait_mode: rd_i8(d, 13)?,
                 old_state: rd_i8(d, 14)?,
-            });
+            };
+            inner.stacks.on_switch(ts, cpu, at.tid, &rec);
+            inner.push_switch(rec);
         }
         // ReadyThread (Thread_V2, event type 50): TThreadId u32 @0, AdjustReason i8 @4,
         // AdjustIncrement i8 @5, Flag i8 @6, Reserved i8 @7. (8 bytes)
         // AdjustReason/AdjustIncrement are a priority boost, not a wait, so they are not kept.
         // https://learn.microsoft.com/en-us/windows/win32/etw/readythread
         (GUID_THREAD, 50) => {
-            inner.push_ready(ReadyRec { ts, tid: rd_u32(d, 0)?, by_tid: at.tid, cpu, flag: rd_i8(d, 6)? });
+            let rec = ReadyRec { ts, tid: rd_u32(d, 0)?, by_tid: at.tid, cpu, flag: rd_i8(d, 6)? };
+            inner.stacks.on_ready(ts, cpu, at.tid, rec.tid);
+            inner.push_ready(rec);
+        }
+        // DiskIo ReadInit / WriteInit / FlushInit (DiskIo_TypeGroup2, 64-bit): Irp ptr @0,
+        // IssuingThreadId u32 @8. Only arrive when the session asked for them
+        // (EVENT_TRACE_FLAG_DISK_IO_INIT), which it does only for their call stacks.
+        // https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup2
+        (GUID_DISKIO, 12 | 13 | 15) => {
+            let irp = rd_u64(d, 0)?;
+            inner.stacks.on_disk_init(ts, cpu, at.tid, irp, rd_u32(d, 8).unwrap_or(0));
+        }
+        // StackWalk_Event: see `stacks` for the layout and how a stack finds its event.
+        (crate::stacks::GUID_STACKWALK, crate::stacks::OPCODE_STACK) if !inner.stacks.set.is_empty() => {
+            let raw = crate::stacks::parse(d, at.ptr64)?;
+            inner.stacks.on_stack(cpu, raw, d.len());
         }
         _ => {}
     }
@@ -369,7 +397,7 @@ mod tests {
 
     /// The old positional form, so the tests below read as "this event, on this CPU, at this time".
     fn handle(sh: &Shared, inner: &mut Inner, guid: u32, opcode: u8, ts: i64, cpu: u16, d: &[u8]) -> Option<()> {
-        handle_event(sh, inner, At { guid, opcode, ts, cpu, tid: 0 }, d)
+        handle_event(sh, inner, At { guid, opcode, ts, cpu, tid: 0, ptr64: true }, d)
     }
 
     fn exec_payload(initial_time: u64, routine: u64) -> Vec<u8> {
@@ -693,13 +721,53 @@ mod tests {
     fn a_ready_event_carries_the_thread_readied_and_the_context_it_happened_in() {
         let sh = shared();
         let mut inner = sh.inner.lock().unwrap();
-        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 900, cpu: 2, tid: 88 }, &ready_payload(4242, 0));
+        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 900, cpu: 2, tid: 88, ptr64: true }, &ready_payload(4242, 0));
         assert_eq!(*inner.readies.back().unwrap(), ReadyRec { ts: 900, tid: 4242, by_tid: 88, cpu: 2, flag: 0 });
         assert_eq!(inner.readies.back().unwrap().waker(), Some(88));
         // Readied from a DPC: the thread on the processor did not do it, and is not named.
-        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 950, cpu: 2, tid: 88 }, &ready_payload(4242, 1));
+        handle_event(&sh, &mut inner, At { guid: GUID_THREAD, opcode: 50, ts: 950, cpu: 2, tid: 88, ptr64: true }, &ready_payload(4242, 1));
         assert_eq!(inner.readies.back().unwrap().waker(), None);
         assert_eq!(inner.ready_events, 2);
+    }
+
+    /// ReadInit (Irp @0, IssuingThreadId @8), then its StackWalk event, then the completion carrying
+    /// the same Irp @32: the slow request comes out with its issuing stack. With stacks off the
+    /// same events keep nothing.
+    #[test]
+    fn a_disk_start_its_stack_and_its_completion_are_tied_together_by_irp() {
+        use crate::stacks::{IoStack, StackSet, StackState, GUID_STACKWALK, OPCODE_STACK};
+        const IRP: u64 = 0xFFFF_B00B_0000_1230;
+        const K: u64 = 0xFFFF_F800_0000_0000;
+        let sh = shared();
+        let mut inner = sh.inner.lock().unwrap();
+        inner.stacks = StackState::new(StackSet::DEFAULT, 4);
+        let mut init = IRP.to_le_bytes().to_vec();
+        init.extend(9u32.to_le_bytes());
+        let at = |guid, opcode, ts, tid| At { guid, opcode, ts, cpu: 1, tid, ptr64: true };
+        handle_event(&sh, &mut inner, at(GUID_DISKIO, 12, 1_000, 9), &init);
+        let mut stack = 1_000u64.to_le_bytes().to_vec();
+        stack.extend(4242u32.to_le_bytes());
+        stack.extend(9u32.to_le_bytes());
+        for f in [K + 0x40, K + 0x80, 0x7FF6_1234_0000] {
+            stack.extend(f.to_le_bytes());
+        }
+        handle_event(&sh, &mut inner, at(GUID_STACKWALK, OPCODE_STACK, 1_001, 9), &stack);
+        let mut done = io_payload(1, 4096, 0, 300_000, 9);
+        done[32..40].copy_from_slice(&IRP.to_le_bytes());
+        handle_event(&sh, &mut inner, at(GUID_DISKIO, 10, 400_000, 0), &done);
+        match inner.stacks.slow_io_stack(400_000, IRP) {
+            Some(IoStack::Found(s)) => assert_eq!((&s.frames[..], s.user, s.pid), (&[K + 0x40, K + 0x80][..], true, 4242)),
+            other => panic!("no issuing stack: {other:?}"),
+        }
+        let c = &inner.stacks.counts;
+        assert_eq!((c.total(), c.io_with_init, c.slow_found), (1, 1, 1));
+
+        // Stacks off: the same events leave nothing behind.
+        inner.stacks = StackState::default();
+        handle_event(&sh, &mut inner, at(GUID_DISKIO, 12, 2_000, 9), &init);
+        handle_event(&sh, &mut inner, at(GUID_STACKWALK, OPCODE_STACK, 2_001, 9), &stack);
+        handle_event(&sh, &mut inner, at(GUID_DISKIO, 10, 500_000, 0), &done);
+        assert!(inner.stacks.slow_io.is_empty() && inner.stacks.counts.total() == 0);
     }
 
     #[test]

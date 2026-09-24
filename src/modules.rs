@@ -129,6 +129,20 @@ impl ModuleMap {
         (addr < m.base + m.size).then_some(m)
     }
 
+    /// The loaded module an address falls in, without reloading the list (`name` reloads).
+    pub fn module_at(&self, addr: u64) -> Option<&str> {
+        self.find(addr).map(|m| m.name.as_str())
+    }
+
+    /// Like `name`, but `None` for an address no loaded module owns, for call stacks, where an
+    /// unplaceable frame is left out rather than printed as a raw address.
+    pub fn owner(&mut self, addr: u64) -> Option<String> {
+        if self.find(addr).is_none() && self.last_refresh.elapsed().as_secs() >= 5 {
+            self.refresh();
+        }
+        self.module_at(addr).map(str::to_string)
+    }
+
     /// Driver file name for a kernel address. Reloads the module list (rate limited)
     /// when the address is unknown, since drivers can load after we started.
     pub fn name(&mut self, addr: u64) -> String {
@@ -311,9 +325,18 @@ const KB: &[(&[&str], Knowledge)] = &[
         what: "CPU power management driver (C-states / P-states / core parking)",
         advice: "Test with the High/Ultimate Performance power plan, update BIOS + chipset driver, and as an experiment disable deep C-states in the BIOS.",
     }),
-    (&["wdfilter", "mpfilter", "mbam", "aswsp", "aswmon", "klif", "klhk", "epfw", "eamon", "bdselfpr", "atc.sys", "symefa", "srtsp", "mfehidk", "sophos", "csagent", "sentinel", "fltmgr"], Knowledge {
+    (&["wdfilter", "mpfilter", "mbam", "aswsp", "aswmon", "klif", "klhk", "epfw", "eamon", "bdselfpr", "atc.sys", "symefa", "srtsp", "mfehidk", "sophos", "csagent", "sentinel"], Knowledge {
         what: "Antivirus / file-system filter driver",
         advice: "Add exclusions for games/projects, test with real-time protection temporarily off, and never run two antivirus products at once.",
+    }),
+    // The Filter Manager is not a filter: it hosts them. "FltMgr is installed with Windows, but it
+    // becomes active only when a minifilter driver is loaded ... A minifilter driver attaches to
+    // the file system stack indirectly, by registering with FltMgr". It used to sit in the antivirus
+    // row above, which described a Windows component as antivirus software.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/filter-manager-concepts
+    (&["fltmgr"], Knowledge {
+        what: "Windows' file-system filter manager (runs the file filters of antivirus, backup, cloud-sync and encryption software)",
+        advice: "Usually a symptom, not the cause: the filter drivers it runs do the work. Look at which antivirus, backup, cloud-sync or encryption software is installed, and at the other drivers in the same incidents.",
     }),
     (&["bthport", "bthusb", "bthenum", "ibtusb", "rtkbt", "btha2dp", "bthhfenum"], Knowledge {
         what: "Bluetooth driver",

@@ -87,6 +87,7 @@ days old) by itself.
 | **Devices on an old-style shared interrupt** | Per present PCI device: the interrupt mode actually in use (from the allocated resources) against what the hardware advertises (from the device's PCI properties). A device on a shared line whose own hardware offers the message-signaled kind is reported at low severity, with what Windows records about it — and the advice is deliberately careful: a current driver from the device maker and a BIOS update, never a recipe for editing the registry |
 | **Paging** (not enough RAM, or a process being swapped in) | Hard page faults per process with how long each was frozen, and which file the memory was read back from when one file dominates |
 | A **slow or dying disk** | Per-disk request latency, slow requests and who issued them; the disk is named by drive letter, model, connection, size, firmware and how full it is, and the report says **why** it was slow: busy (and which program was moving the data), asleep and waking up, forced flushes, or idle-but-slow (the drive, cable or firmware). The files that waited longest are named (`pagefile.sys`, `$Mft`, a game's `.pak`...) in plain words, and change the advice where they change the answer: a paging file means the PC ran out of memory, game data on a hard drive means moving the game. Each slow request also says **what it was** (paging, file-system bookkeeping or a file's contents), **which programs were stuck behind it** and any program waiting on a lock held by one of them, and on a hard drive whether two programs were making its head jump back and forth. For drives run by Windows' storage port driver (NVMe, SATA, UAS USB) it also says **where the time went**: how much was spent inside the drive (the drive, its cable or firmware) and how much waiting in Windows before reaching it (too much asked of the drive at once), with any retries; a drive that driver does not see (older USB "BOT" drives) is reported as not measured, never as zero |
+| **Antivirus, backup, cloud-sync or encryption software in the path of slow disk waits** | Each disk request and each slow hard page fault carries a *module-level* call stack: the drivers that were on it, never function names (those need Microsoft's symbol files, i.e. network access, which this tool does not have). So a slow request says which drivers it went through ("via FLTMGR.SYS -> Ntfs.sys -> WdFilter.sys"), with `--deep` a program stuck behind it also says which driver it was blocked in, and the disk finding totals the file-system filters in the path ("WdFilter.sys (Microsoft Defender Antivirus, antivirus scanning) in 80%"). Filters are recognized from the load order group Windows registers them in, and named from Microsoft's documentation or the file's own version resource. Being in the path is never called the cause — every file access on Windows passes through several filters — and Microsoft Defender is never something to turn off: when it is in the path of most slow requests, the report points to Microsoft's documented folder exclusions, with Microsoft's warning |
 | **A drive being reset or retried while you watch** | The storage port driver's own events, live: requests it had to send again and resets of a drive or its controller, with the time and the disk. A reset during the run is rated high, the same as Windows' event 129, and one Windows also logged is reported once |
 | **A drive that is failing, overheating or on a bad cable** | Each drive's own health data, read when monitoring starts and ends: NVMe critical warnings, media errors, wear, temperature and thermal throttling; SATA SMART bad sectors and CRC (cable) errors. Counters that moved *while monitoring* are flagged as the cause, lifetime totals only as background |
 | **Drive errors Windows logged** | System event log, last 7 days: controller resets (129), retried I/O (153), bad blocks (7), paging errors (51), surprise disconnects (157) |
@@ -195,7 +196,8 @@ Two independent sources, correlated on one clock (QPC):
 * **Kernel ETW trace.** A private real-time system-logger session records every DPC and ISR (with the
   driver routine address and duration), hard page faults, disk I/O latency, file names, thread creation
   (for thread → process mapping), 1 kHz CPU profile samples and — the expensive one — every context
-  switch and every thread wake-up. Routine addresses are resolved to the loaded
+  switch and every thread wake-up. The start of every disk request and every hard page fault also
+  carries a call stack (see below). Routine addresses are resolved to the loaded
   driver; a built-in knowledge base plus each file's version resource explains what that driver is. Each
   routine's activity is also recorded as one bit per quarter-second of the run — a few hundred kilobytes
   in total, and one hash lookup per event — so that a driver waking on a steady timer can be seen even
@@ -341,6 +343,19 @@ hard drives only, the positions of the requests the drive finished meanwhile sho
 working far-apart places at once, interleaved, so the head kept jumping between them. When the switch
 history does not reach back to a request, nothing is said about who waited for it.
 
+**Which drivers were in the path.** The same kernel session asks Windows to attach a call stack to the
+start of every disk request and to every hard page fault (`TraceSetInformation` with
+`TraceStackTracingInfo`, a setting of this session only, gone when it stops; nothing system-wide is
+changed, which is also why some kernel stacks cannot be walked and are reported as missing). Each
+stack is reduced to the drivers on it, in call order, with the Windows kernel itself and repeats
+left out; user-mode frames become just the program's name, so no DLL path or anything from your
+folders reaches the report. A request's issuing stack is kept only if the request turns out slow,
+and a fault's only if it waited 10 ms or more, so memory stays small. A slow request's "Request:"
+line gains "via ..." (Windows' own storage drivers below the file system are the first thing left
+out when the line is full), a program stuck behind it gains "in <driver>", and DETAILS gets a short
+"where the waiting happened" block. The cost block reports how many stacks arrived and at what
+rate; light mode leaves them off.
+
 **Drive health and the Windows event log.** Each drive's temperature and health data (NVMe health log,
 SATA SMART) is read when monitoring starts and again when it stops, so that counters which moved
 during the run (thermal throttling, cable CRC errors) stand apart from lifetime totals. The System
@@ -404,7 +419,8 @@ wtfis-cli --no-compare       # don't compare with an earlier run
 | `--no-switches` | off | Don't trace thread switches, the most expensive thing this tool records; already off in `--light` mode |
 | `--no-gpu-trace` | off | Don't trace the graphics kernel (frame timing and video memory pressure); already off in `--light` mode |
 | `--no-storage-trace` | off | Don't trace the storage port driver (time inside the drive vs waiting in Windows, retries, resets); stays on in `--light` mode, being one small event per disk request |
-| `--light` | auto | Measure more gently: probe every 2 ms instead of 1 ms, and leave thread-switch and graphics tracing off; on by itself on a PC with 4 logical CPUs or fewer, or one running on battery |
+| `--deep` | off | Also record where every waiting thread was blocked (which drivers were on its call stack). Measured on a busy 32-thread PC: about 120,000 extra stack events a second and roughly twice the tool's own processor use, so it is opt-in; not in `--light` mode |
+| `--light` | auto | Measure more gently: probe every 2 ms instead of 1 ms, and leave thread-switch tracing, graphics tracing and call stacks off; on by itself on a PC with 4 logical CPUs or fewer, or one running on battery |
 | `--no-light` | off | Keep full measuring even on a small or unplugged PC (the opposite of `--light`) |
 | `--log <path>` | `WTFIsStalling-<date>.txt` in the current directory | Report file path |
 | `--no-log` | off | Don't write a report file |
