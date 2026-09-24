@@ -352,7 +352,11 @@ fn show_outcome(hwnd: HWND, ui: &Ui) {
             *REPORT.lock().unwrap() = out.report;
             if let Some(path) = out.log_path {
                 unsafe { EnableWindow(ui.show as HWND, 1) };
-                set_text(ui.status, &format!("Saved to {path}"));
+                // The file name only: people post screenshots of this window, and the full path
+                // starts with C:\Users\<their name>. "Show report file" opens the folder.
+                let name =
+                    std::path::Path::new(&path).file_name().map_or_else(|| "the report file".into(), |n| n.to_string_lossy().into_owned());
+                set_text(ui.status, &format!("Saved as {name}"));
                 *REPORT_PATH.lock().unwrap() = Some(path);
             }
         }
