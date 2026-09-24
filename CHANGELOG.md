@@ -3,6 +3,16 @@
 What changed in each release, in short. The full notes, with details and download verification, are on the
 [releases page](https://github.com/Tyberious/WTFIsStalling/releases). Dates are release dates.
 
+## Unreleased (0.10.0)
+
+### Changed
+- The list of hardware-access tools no longer draws on any GPL-licensed source: every fact once taken from
+  Eclypsium's Screwed-Drivers list was re-sourced from LOLDrivers, Microsoft or the vendor, and claims no such
+  source confirms were made less specific (for example "an ASRock utility" instead of a product name).
+
+### Fixed
+- The 64-bit build of an Intel utility driver (`semav6msr64.sys`) was never recognized.
+
 ## 0.9.0 (2026-09-24)
 
 ### Changed

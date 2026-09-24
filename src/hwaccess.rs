@@ -18,8 +18,13 @@
 //! * `vendor` - the vendor's own advisory or page, or a coordination body (CERT/CC VU#380058 for
 //!   SignalRGB), or the upstream project's own source tree / README.
 //! * `catalog` - LOLDrivers <https://github.com/magicsword-io/LOLDrivers> (Apache-2.0; see
-//!   THIRD-PARTY-NOTICES.md) and Eclypsium's Screwed-Drivers list. Both are community-curated:
-//!   good for file names and signers, often thin or absent on product attribution.
+//!   THIRD-PARTY-NOTICES.md), read from its per-driver YAML (Company / Product / Description /
+//!   signer fields). Community-curated: good for file names and signers, often thin or absent on
+//!   product attribution.
+//!
+//! Eclypsium's Screwed-Drivers list is NOT a source: it is GPL-3.0, which cannot be relicensed
+//! under this project's MIT license. Every fact once taken from it was re-sourced on 2026-09-24
+//! from LOLDrivers, Microsoft or the vendor, or dropped. Do not add it back.
 //!
 //! NOTHING IS HERE FROM MEMORY. Products whose driver file could not be tied to a citable source
 //! are deliberately absent, and must stay absent: NZXT CAM, Lian Li L-Connect, SteelSeries GG,
@@ -43,7 +48,7 @@ pub enum Source {
     Cve,
     /// The vendor's own advisory or page, a coordination body, or the project's source tree.
     Vendor,
-    /// LOLDrivers / Eclypsium. Community-curated.
+    /// LOLDrivers. Community-curated.
     Catalog,
 }
 
@@ -135,15 +140,10 @@ const TOOLS: &[HwTool] = &[
     // installs it is not verified.
     tool("asmmap.sys", "an ASUS utility (\"Asus Memory Mapping Driver\")", "ASUSTeK", PHYS_MEM, Source::Blocklist),
     tool("asmmap64.sys", "an ASUS utility (\"Asus Memory Mapping Driver\")", "ASUSTeK", PHYS_MEM, Source::Blocklist),
-    // Signed by ASUSTeK per Eclypsium; MS-BL FriendlyName="GLCKIO2.sys". The widely repeated
-    // "Gigabyte RGB Fusion" attribution has NO citable source, so it is not made here.
-    tool(
-        "glckio2.sys",
-        "an ASUSTeK-signed lighting / clock utility (which product is not verified)",
-        "ASUSTeK",
-        PORT_IO,
-        Source::Blocklist,
-    ),
+    // MS-BL FriendlyName="GLCKIO2.sys"; signer "ASUSTeK Computer Inc." per LOLDrivers
+    // (yaml/868c6920-f6cb-4088-8277-095a1358abe1.yaml). The widely repeated "Gigabyte RGB Fusion"
+    // attribution has NO citable source, so it is not made here, and neither is any product.
+    tool("glckio2.sys", "an ASUSTeK-signed hardware utility (which product is not verified)", "ASUSTeK", PORT_IO, Source::Blocklist),
     // --- ENE Technology (bundled by motherboard-vendor RGB stacks) -----------------------------
     // MS-BL blocks the whole signer: <CertOemID Value="ENE Technology Inc." />. Which retail RGB
     // app installs them (ASUS Aura is the usual claim) is NOT verified, so it is not named.
@@ -160,10 +160,12 @@ const TOOLS: &[HwTool] = &[
     // CVE-2019-16098: RTCore64.sys/RTCore32.sys in MSI Afterburner 4.6.2.15658 "allows any
     // authenticated user to read and write to arbitrary memory, I/O ports, and MSRs".
     stem("rtcore", "MSI Afterburner (4.6.2.15658 and older)", "Micro-Star / RivaTuner", MSR_IO_MEM, Source::Cve),
-    // MS-BL FileName="NTIOLib.sys"; Eclypsium NTIOLib_X64.sys / NBIOLib_X64.sys, Micro-Star.
-    // Both NTIOLib_X64.sys copies are loaded on the development PC (MSI Center + Mystic Light).
+    // MS-BL FileName="NTIOLib.sys". LOLDrivers: NTIOLib_X64.sys and NBIOLib_X64.sys, Company
+    // "MSI", signer MICRO-STAR INTERNATIONAL CO., LTD., descriptions including "NTIOLib For
+    // MSIRatio_CC" and "MSI ComCenService Driver" (yaml/54d67d79-..., yaml/6fc3034f-...). Both
+    // NTIOLib_X64.sys copies are loaded on the development PC (MSI Center + Mystic Light).
     stem("ntiolib", "MSI Center, Mystic Light, Dragon Center / Command Center", "Micro-Star", PHYS_MEM, Source::Blocklist),
-    stem("nbiolib", "MSI overclocking utilities", "Micro-Star", PHYS_MEM, Source::Catalog),
+    stem("nbiolib", "an MSI utility (built on MSI's NTIOLib driver)", "Micro-Star", PHYS_MEM, Source::Catalog),
     // CVE-2020-17382 + Core Security advisory: MSI Ambient Link, "MICSYS IO driver". Loaded here.
     stem("msio", "MSI Ambient Link / MSI AmbiLighter", "MICSYS Technology", PORT_IO, Source::Cve),
     // --- GIGABYTE ------------------------------------------------------------------------------
@@ -208,20 +210,36 @@ const TOOLS: &[HwTool] = &[
     // MS-BL FriendlyName="PartnerTech WinIO32A.sys" and siblings. Which consumer app ships them is
     // not verified. The stem also covers WINIODrv.sys.
     stem("winio", "a tool built on the WinIo library", "(rebranded by several vendors)", MSR_IO_MEM, Source::Blocklist),
-    // Eclypsium: signer "ASROCK Incorporation", "ASRock IO Driver"; exploit-db 45716.
-    stem("asrdrv", "ASRock A-Tuning / RGB LED / App Shop", "ASRock", PHYS_MEM, Source::Catalog),
-    tool("asromgdrv.sys", "an ASRock utility", "ASRock", PHYS_MEM, Source::Catalog),
-    tool("appshopdrv103.sys", "ASRock App Shop", "ASRock", PHYS_MEM, Source::Catalog),
-    // Eclypsium: "ATI Diagnostics Hardware Abstraction", ATI GPU flash update tool.
-    tool("atillk64.sys", "an ATI / AMD graphics flashing or diagnostics tool", "ATI Technologies", NOT_VERIFIED, Source::Catalog),
-    // MS-BL FriendlyName="Nvidia NVFlash FileAttribute"; Eclypsium rows for the rest.
-    tool("nvflash.sys", "NVIDIA flashing / overclocking tooling", "NVIDIA", NOT_VERIFIED, Source::Blocklist),
-    stem("nvflsh", "NVIDIA flashing / overclocking tooling", "NVIDIA", NOT_VERIFIED, Source::Catalog),
-    tool("nvoclock.sys", "NVIDIA overclocking tooling", "NVIDIA", NOT_VERIFIED, Source::Catalog),
-    // Eclypsium: "piddrv64.sys ... Intel Processor Identification Utility for Windows".
-    stem("piddrv", "Intel Processor Identification Utility", "Intel", NOT_VERIFIED, Source::Blocklist),
-    tool("semav6msr.sys", "Intel Computing Improvement Program", "Intel", "processor registers (MSR)", Source::Catalog),
-    // MS-BL FriendlyName="HwRwDrv FileAttribute"; signed "Open Source Developer, Jun Liu".
+    // LOLDrivers: AsrDrv*.sys / AsrOmgDrv.sys, Company "ASRock Incorporation", Product "ASRock IO
+    // Driver", signer ASROCK Incorporation (yaml/51c342f3-..., yaml/6a50e368-..., yaml/3f39af20-...);
+    // AppShopDrv103.sys, Company "ASRock Incorporation", Product "AppShopDrv103 Driver"
+    // (yaml/29d2c408-...). Which ASRock app installs each is not verified, so none is named.
+    stem("asrdrv", "an ASRock utility (\"ASRock IO Driver\")", "ASRock", PHYS_MEM, Source::Catalog),
+    tool("asromgdrv.sys", "an ASRock utility (\"ASRock IO Driver\")", "ASRock", PHYS_MEM, Source::Catalog),
+    tool("appshopdrv103.sys", "an ASRock utility (\"AppShopDrv103 Driver\")", "ASRock", PHYS_MEM, Source::Catalog),
+    // LOLDrivers: Company "ATI Technologies Inc.", Product "ATI Diagnostics", Description "ATI
+    // Diagnostics Hardware Abstraction Sys"; one sample describes itself as an overclocking tool
+    // (yaml/61514cbd-..., yaml/10b1fc3d-...).
+    tool("atillk64.sys", "an ATI / AMD graphics diagnostics or overclocking tool", "ATI Technologies", NOT_VERIFIED, Source::Catalog),
+    // MS-BL FriendlyName="Nvidia NVFlash FileAttribute". LOLDrivers: nvflsh64.sys signed by NVIDIA
+    // Corporation (yaml/d4664202-...); nvoclock.sys, Product "NVIDIA System Utility Driver"
+    // (yaml/837ad058-...).
+    tool("nvflash.sys", "NVIDIA's graphics card flashing tool (NVFlash)", "NVIDIA", NOT_VERIFIED, Source::Blocklist),
+    stem("nvflsh", "NVIDIA's graphics card flashing tool (NVFlash)", "NVIDIA", NOT_VERIFIED, Source::Catalog),
+    tool("nvoclock.sys", "an NVIDIA system utility (\"NVIDIA System Utility Driver\")", "NVIDIA", NOT_VERIFIED, Source::Catalog),
+    // Intel's own support article 000095828: the file "(in Resources > Extras folder)" of Intel
+    // graphics driver packages, flagged by Microsoft's attack-surface-reduction rule, and "removed
+    // as of graphics driver 31.0.101.4575". Intel spells it ppidrv64.sys in that article; the
+    // blocklist and every other report spell it piddrv64.sys, which is what the stem matches.
+    // https://www.intel.com/content/www/us/en/support/articles/000095828/graphics.html
+    stem("piddrv", "Intel graphics driver packages older than 31.0.101.4575", "Intel", NOT_VERIFIED, Source::Vendor),
+    // LOLDrivers: semav6msr.sys / semav6msr64.sys signed "Intel(R) Code Signing External"
+    // (catalog entry with no product). Which Intel tool installs it is not verified: community
+    // sites name three different ones, and no Intel source names any.
+    // A stem, so the 64-bit semav6msr64.sys matches too (it used to be an exact "semav6msr.sys").
+    stem("semav6msr", "an Intel utility (which one is not verified)", "Intel", "processor registers (MSR)", Source::Catalog),
+    // MS-BL FriendlyName="HwRwDrv FileAttribute"; signed "Open Source Developer, Jun Liu" per
+    // LOLDrivers, which also lists a Shuttle Inc.-signed build of the same driver.
     tool("hwrwdrv.sys", "a tool bundling the generic \"hardware read & write\" driver", "(various)", PHYS_MEM, Source::Catalog),
     // --- the sandboxed replacement --------------------------------------------------------------
     // File name from the project's own PawnIO.inf.in + CMakeLists. LibreHardwareMonitor >=v0.9.5,
@@ -304,6 +322,22 @@ mod tests {
         for renamed in ["FanControl.sys", "OpenHardwareMonitorLib.sys", "ThrottleBlood.sys", "gdrv2.sys"] {
             assert!(lookup(renamed).is_some(), "{renamed}");
         }
+    }
+
+    /// The rows re-sourced away from a GPL-3.0 list (2026-09-24) say only what LOLDrivers, Microsoft
+    /// or the vendor say, and the 64-bit Intel file is matched at all.
+    #[test]
+    fn re_sourced_rows_claim_no_more_than_their_sources() {
+        let intel = lookup("semav6msr64.sys").expect("the 64-bit file LOLDrivers lists");
+        assert!(intel.product.contains("not verified") && intel.vendor == "Intel", "{}", intel.product);
+        let pid = lookup("piddrv64.sys").expect("Intel's graphics packages shipped it");
+        assert_eq!(pid.source, Source::Vendor);
+        assert!(!pid.product.contains("Processor Identification"), "no first-party source says so: {}", pid.product);
+        let ati = lookup("atillk64.sys").unwrap();
+        assert!(!ati.product.contains("flash"), "no remaining source says flashing: {}", ati.product);
+        let asrock = lookup("AsrDrv106.sys").unwrap();
+        assert!(!asrock.product.contains("A-Tuning"), "which ASRock app is not sourced: {}", asrock.product);
+        assert!(lookup("glckio2.sys").unwrap().product.contains("not verified"));
     }
 
     /// Four needles with no source behind them, and one that matched the wrong thing.
