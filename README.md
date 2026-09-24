@@ -274,8 +274,8 @@ a run. `wtfis-cli --light` turns it on by hand and `--no-light` keeps full measu
 
 **Context switches are the expensive part.** They are the highest-volume class the kernel logger has —
 tens of thousands of events a second on a busy PC — so they go into their own short ring buffer (six
-seconds of history, sized to the number of logical CPUs: about 14 MB on a typical PC, growing on
-many-core machines and capped at 96 MB), they are **off in light mode**, and
+seconds of history, sized to the number of logical CPUs: about 15 MB with 8 of them, 25 MB with 16, 50 MB with 32,
+never more than 96 MB), they are **off in light mode**, and
 `wtfis-cli --no-switches` turns them off anywhere. The cost block reports how many of them arrived and at
 what rate, so the price is visible next to what it bought. If Windows could not deliver every event,
 nothing in the report rests on them at all: one missing wake-up record would turn "woken on time" into
