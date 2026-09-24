@@ -1,24 +1,78 @@
 name: Report from a stalling PC
-description: Share a WTFIsStalling report, especially one where the verdict was wrong, missing or unhelpful
-labels: [report]
+description: Share what WTFIsStalling found on your PC, especially when the verdict was wrong, missing or unhelpful
+title: "[Report] "
+labels: ["field report"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing a report. Reports from real PCs are how the tool learns which verdicts hold up.
+
+        **For the most useful report:** run WTFIsStalling while the problem is happening, and press
+        **Ctrl+Shift+F9** (or click **I felt it!**) each time you feel a hitch or freeze.
+
+        **Privacy:** a report lists your hardware, driver file names and the names of running programs.
+        It never contains your user name, and personal file names are hidden. Have a quick look before
+        you post it anyway: this issue is public.
   - type: textarea
     id: symptom
     attributes:
       label: What does the problem feel like?
-      description: e.g. "game freezes for a split second every 10-20 s", "audio crackles when the mouse moves"
+      description: What you see or hear, and how long it lasts.
+      placeholder: e.g. "the whole PC freezes for about a second, mouse and sound included", "audio crackles when the mouse moves"
+    validations:
+      required: true
+  - type: dropdown
+    id: how-often
+    attributes:
+      label: How often does it happen?
+      options:
+        - Several times a minute
+        - About once a minute
+        - A few times an hour
+        - Rarely, or only in certain situations
     validations:
       required: true
   - type: textarea
-    id: report
+    id: doing
     attributes:
-      label: Report
-      description: Click "Copy report" and paste here. It lists hardware, driver file names and running program names; trim anything you don't want public.
-      render: text
+      label: What were you doing when it happened?
+      description: The game or program, and anything else that was running that might matter (downloads, recording, RGB or fan software, a VPN).
+  - type: input
+    id: version
+    attributes:
+      label: WTFIsStalling version
+      description: It is on the first line of the report, e.g. "WTFIsStalling 0.9.0".
     validations:
       required: true
+  - type: upload
+    id: report-file
+    attributes:
+      label: The report file
+      description: The `WTFIsStalling-<date>.txt` file from that run. In the app, **Show report file** opens the folder it is in.
+    validations:
+      required: true
+      accept: ".txt"
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary (optional)
+      description: From version 0.10 on, **Copy summary** puts a short version on the clipboard; paste it here so the verdict is readable without opening the file.
+      render: text
+  - type: textarea
+    id: changed
+    attributes:
+      label: Did you change anything between runs?
+      description: If you ran it more than once, what you changed each time (e.g. "closed the RGB software", "unplugged the external drive") and what the comparison at the top of the next report said.
   - type: textarea
     id: truth
     attributes:
       label: Was the verdict right?
-      description: If you know the real cause or what fixed it, say so. That is how the tool gets smarter.
+      description: If you know the real cause, or what fixed it, please say so. That is how the tool gets smarter.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before posting
+      options:
+        - label: I looked through the report and I am fine with it being public.
+          required: true
