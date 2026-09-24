@@ -20,6 +20,10 @@ What changed in each release, in short. The full notes, with details and downloa
 
 ### Fixed
 - The 64-bit build of an Intel utility driver (`semav6msr64.sys`) was never recognized.
+
+## 0.9.1 (2026-09-24)
+
+### Fixed
 - Programs could be reported as "held up" for about 2 seconds at a flagged moment when their threads were only
   idle, waiting for their next message or event; on a PC running a browser or other Chromium-based apps this could
   become the top suspect. Such waits no longer count; waits on locks, disks and paging still do.
