@@ -223,13 +223,21 @@ fn note_network_filters(found: &mut Findings, filters: &[NetFilter]) {
         found.0.iter().map(|(k, _)| k.clone()).filter(|k| k.strip_prefix("driver ").is_some_and(netfilters::hosts_filters)).collect();
     for key in hosts {
         if others.is_empty() {
-            // Ruling something out is worth as much as naming it, and cheaper to act on.
+            // Only half a rule-out: the registry walk sees NDIS lightweight filters, not the
+            // Windows Filtering Platform rules that VPN kill switches and firewalls mostly add.
+            // WFP's kernel-mode filter engine filters at the network and transport layers of the
+            // TCP/IP stack (Microsoft, "Windows Filtering Platform Architecture Overview"); that it
+            // lives in netio.sys is from crash stacks (tcpip!WfpAleClassify -> NETIO!KfdClassify
+            // -> NETIO!ProcessCallout, OSR community forum), not from Microsoft's documentation.
+            // A 0.9.1 field report said "a VPN is not what is doing this work" with wireguard.sys
+            // loaded.
             found.note(
                 &key,
                 format!(
-                    "All {} network filter driver{} installed on this PC are Microsoft's own, so no other vendor's filter is \
-                     running inside this file: a VPN, a 'network optimizer' or a security product's network filter is not what is \
-                     doing this work.",
+                    "All {} network filter driver{} of the kind Windows lists (NDIS filters) are Microsoft's own, so no other \
+                     vendor's filter of that kind is running here. That does not rule out a VPN, a firewall or a security product: \
+                     most of them add rules through the Windows Filtering Platform instead, which Windows checks inside its own \
+                     networking files and which this tool cannot list.",
                     filters.len(),
                     plural(filters.len() as u64)
                 ),
@@ -609,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn all_microsoft_filters_rule_something_out_instead() {
+    fn all_microsoft_filters_rule_out_only_ndis_filters() {
         let mut found = Findings::default();
         found.add("driver ndis.sys", Severity::Medium, "t".into(), "e".into(), "a".into(), 0);
         note_network_filters(
@@ -617,8 +625,9 @@ mod tests {
             &[filter("ms_pacer", "pacer.sys", Some("Microsoft Corporation")), filter("ms_ndiscap", "ndiscap.sys", None)],
         );
         let said = get(&found, "driver ndis.sys").evidence.join(" ");
-        assert!(said.contains("All 2 network filter drivers installed on this PC are Microsoft's own"), "{said}");
-        assert!(said.contains("is not what is doing this work"), "{said}");
+        assert!(said.contains("All 2 network filter drivers of the kind Windows lists (NDIS filters) are Microsoft's own"), "{said}");
+        // The NDIS list cannot see Windows Filtering Platform rules, so a VPN is never ruled out.
+        assert!(said.contains("does not rule out a VPN") && !said.contains("is not what is doing this work"), "{said}");
     }
 
     /// When the vendor had to be guessed from a name, the sentence says so.
