@@ -93,11 +93,40 @@ fn files_sentence(rows: &[FileRow], programs: &HashMap<(String, u32), Vec<Progra
     Some(sentence)
 }
 
+/// What the Windows event log holds about one drive, as far as the advice is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Logged {
+    Nothing,
+    /// Only event 157, fewer than `REPEATED` times: the disk disappeared without warning (Windows
+    /// added the event to record a disk disappearing; NTDebugging blog, "Event ID 157 Disk has
+    /// been surprise removed"). A pulled cable or a power blip does that as often as a failing
+    /// drive, so one or two do not earn "back up now".
+    Disconnects,
+    /// Resets, retries, bad blocks, paging or controller errors, or repeated disconnects.
+    Errors,
+}
+
+/// How many entries of one kind make it a pattern; `event_log` raises old entries to Medium there.
+const REPEATED: usize = 3;
+
+fn logged_for(log: &[evlog::StorageEvent], n: u32) -> Logged {
+    let ids: Vec<u32> = log.iter().filter(|e| e.disk == Some(n)).map(|e| e.id).collect();
+    if ids.is_empty() {
+        Logged::Nothing
+    } else if ids.len() < REPEATED && ids.iter().all(|id| *id == 157) {
+        Logged::Disconnects
+    } else {
+        Logged::Errors
+    }
+}
+
 /// What to try for a slow disk, based on why it seemed slow, what kind of disk it is, and which
 /// files did the waiting.
-fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool, hint: FileHint) -> String {
+fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged: Logged, hint: FileHint) -> String {
     let mut advice = String::from("Anything that touches this disk freezes while it answers. ");
-    let main = if logged_errors { None } else { why.and_then(|w| w.main_cause()) };
+    // Logged errors add to what was measured, they do not replace it: a 0.9.1 report dropped the
+    // sleep advice for a drive that was measured waking up, because of one logged disconnect.
+    let main = why.and_then(|w| w.main_cause());
     match main {
         Some(Cause::Busy) => {
             let who = why.and_then(|w| w.top_movers(1).into_iter().next()).map(|m| m.0);
@@ -156,11 +185,18 @@ fn disk_advice(disk: &DiskInfo, why: Option<&DiskWhy>, logged_errors: bool, hint
         };
         advice.push_str(&format!("{list} {verb} nearly full, which by itself makes drives slow: free up space. "));
     }
-    if logged_errors {
+    if logged == Logged::Errors {
         advice.push_str(
             "Windows logged errors for this drive, which is not normal: back up what matters now. Then reseat or replace its cable \
-             (or move an M.2 drive to another slot), update its firmware, and check its health (SMART) with the maker's tool or \
-             CrystalDiskInfo.",
+             (or, for an M.2 drive inside the PC, move it to another slot), update its firmware, and check its health (SMART) with \
+             the maker's tool or CrystalDiskInfo.",
+        );
+    } else if logged == Logged::Disconnects {
+        advice.push_str(
+            "Windows logged that this drive disconnected unexpectedly. Windows logs that whenever a drive disappears without \
+             warning, for example when it is unplugged without being ejected, its cable comes loose or it loses power for a \
+             moment, so once is not a sign of failure. If it keeps happening, reseat or replace its cable and check its health \
+             (SMART) with the maker's tool or CrystalDiskInfo.",
         );
     } else if matches!(main, Some(Cause::Busy | Cause::WokeUp)) {
         advice.push_str("If it stays slow without that, check its health (SMART) with the maker's tool or CrystalDiskInfo.");
@@ -517,8 +553,8 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         }
         let key = format!("disk {n}");
         let why = cx.az.disk_why.get(n);
-        let busy = why.is_some_and(|w| w.main_cause() == Some(Cause::Busy));
-        let logged = storage_log.iter().any(|e| e.disk == Some(*n));
+        let cause = why.and_then(|w| w.main_cause());
+        let logged = logged_for(storage_log, *n);
         let on_disk: Vec<FileRow> = file_waits.iter().filter(|r| r.1 == *n).cloned().collect();
         let advice = disk_advice(&disk, why, logged, file_hint(&files::rank(&on_disk, 3)));
         cx.found.add(&key, sev, format!("{}  -  responding slowly", disk.title()), evidence, advice, worst * slow as i64);
@@ -559,7 +595,7 @@ pub(super) fn slow_disks(cx: &mut Ctx) {
         if cx.run.storage_trace.available {
             let split = cx.az.disk_split.get(n).copied().unwrap_or_default();
             let addr = cx.az.scsi_addr(*n);
-            let sentence = match storsplit::finding_sentence(&split, busy) {
+            let sentence = match storsplit::finding_sentence(&split, cause) {
                 Some(s) => Some(s),
                 None if cx.run.storage_trace.on_storport(addr, split.matched(), split.unmatched) == Some(false) => {
                     Some(storsplit::NOT_MEASURED.to_string())
@@ -996,7 +1032,9 @@ pub(super) fn event_log(cx: &mut Ctx) {
             Some(n) => {
                 let disk = cx.az.disks.get(n).clone();
                 let hint = file_hint(&files::rank(&file_waits.iter().filter(|r| r.1 == n).cloned().collect::<Vec<_>>(), 3));
-                (format!("disk {n}"), format!("{}  -  errors in the Windows event log", disk.title()), disk_advice(&disk, None, true, hint))
+                let logged = logged_for(storage_log, n);
+                let what = if logged == Logged::Disconnects { "disconnected unexpectedly" } else { "errors in the Windows event log" };
+                (format!("disk {n}"), format!("{}  -  {what}", disk.title()), disk_advice(&disk, None, logged, hint))
             }
             None => (
                 "storage controller".to_string(),
@@ -1008,7 +1046,7 @@ pub(super) fn event_log(cx: &mut Ctx) {
             // Old entries alone are a lead, not a verdict.
             let sev = if during {
                 Severity::High
-            } else if times.len() >= 3 {
+            } else if times.len() >= REPEATED {
                 Severity::Medium
             } else {
                 Severity::Low
@@ -1071,26 +1109,43 @@ mod tests {
         );
         assert!(!s[0].contains("chrome"), "minor movers stay out: {s:?}");
         assert!(s[1].contains("not traffic"), "{s:?}");
-        let advice = disk_advice(&usb_hdd(), Some(&why), false, FileHint::default());
+        let advice = disk_advice(&usb_hdd(), Some(&why), Logged::Nothing, FileHint::default());
         assert!(advice.contains("steam.exe: Pause the download") && !advice.contains("failing"), "{advice}");
 
         // Windows' own work cannot be paused or closed, so the advice must not say so.
         let mut win = DiskWhy::default();
         win.causes.insert(Cause::Busy, 3);
         win.movers.insert("backgroundTaskHost.exe".into(), 50_000_000);
-        let advice = disk_advice(&usb_hdd(), Some(&win), false, FileHint::default());
+        let advice = disk_advice(&usb_hdd(), Some(&win), Logged::Nothing, FileHint::default());
         assert!(advice.contains("part of Windows") && advice.contains("run in background"), "{advice}");
         assert!(!advice.contains("pause it") && !advice.contains("Let backgroundTaskHost"), "{advice}");
     }
 
     #[test]
-    fn a_sleeping_drive_gets_power_settings_and_logged_errors_override_everything() {
+    fn a_sleeping_drive_gets_power_settings_and_logged_errors_add_to_them() {
         let mut why = DiskWhy { longest_sleep_ms: 42_000.0, ..Default::default() };
         why.causes.insert(Cause::WokeUp, 2);
         assert!(why_sentences(&why, false)[0].contains("every time") && why_sentences(&why, false)[0].contains("42 s"));
-        assert!(disk_advice(&usb_hdd(), Some(&why), false, FileHint::default()).contains("Turn off hard disk after"));
-        let logged = disk_advice(&usb_hdd(), Some(&why), true, FileHint::default());
-        assert!(logged.contains("back up what matters now") && !logged.contains("Turn off hard disk"), "{logged}");
+        assert!(disk_advice(&usb_hdd(), Some(&why), Logged::Nothing, FileHint::default()).contains("Turn off hard disk after"));
+        // The measured cause survives logged errors (a 0.9.1 report lost it to one disconnect).
+        let logged = disk_advice(&usb_hdd(), Some(&why), Logged::Errors, FileHint::default());
+        assert!(logged.contains("back up what matters now") && logged.contains("Turn off hard disk"), "{logged}");
+        assert!(logged.contains("for an M.2 drive inside the PC"), "{logged}");
+    }
+
+    #[test]
+    fn one_unexpected_disconnect_is_not_a_failing_drive() {
+        let ev = |id, disk| evlog::StorageEvent { unix_time: 0, id, provider: "disk".into(), disk };
+        assert_eq!(logged_for(&[], 6), Logged::Nothing);
+        assert_eq!(logged_for(&[ev(157, Some(6)), ev(153, Some(2))], 6), Logged::Disconnects, "another disk's errors are not this one's");
+        assert_eq!(logged_for(&[ev(157, Some(6)), ev(153, Some(6))], 6), Logged::Errors);
+        assert_eq!(logged_for(&[ev(129, None)], 6), Logged::Nothing, "controller resets name no disk");
+        assert_eq!(logged_for(&vec![ev(157, Some(6)); 3], 6), Logged::Errors, "a drive that keeps disconnecting is a problem");
+        let mut why = DiskWhy::default();
+        why.causes.insert(Cause::WokeUp, 1);
+        let advice = disk_advice(&usb_hdd(), Some(&why), Logged::Disconnects, FileHint::default());
+        assert!(advice.contains("disconnected unexpectedly") && advice.contains("once is not a sign of failure"), "{advice}");
+        assert!(!advice.contains("back up what matters now") && advice.contains("Turn off hard disk"), "{advice}");
     }
 
     fn row(name: &str, disk: u32, count: u64, total_ms: f64, worst_ms: f64) -> FileRow {
@@ -1164,20 +1219,20 @@ mod tests {
     #[test]
     fn the_file_that_waited_changes_the_advice() {
         let hdd = usb_hdd();
-        let plain = disk_advice(&hdd, None, false, FileHint::default());
+        let plain = disk_advice(&hdd, None, Logged::Nothing, FileHint::default());
         assert!(!plain.contains("paging file"), "{plain}");
 
-        let paging = disk_advice(&hdd, None, false, file_hint(&[row("C:\\pagefile.sys", 0, 9, 100.0, 50.0)]));
+        let paging = disk_advice(&hdd, None, Logged::Nothing, file_hint(&[row("C:\\pagefile.sys", 0, 9, 100.0, 50.0)]));
         assert!(paging.contains("ran out of memory") && paging.contains("add RAM"), "{paging}");
         assert!(paging.contains("slowest place it can be"), "a paging file on a hard drive is its own problem: {paging}");
         assert!(paging.contains("CrystalDiskInfo"), "the drive checks still follow: {paging}");
 
-        let game = disk_advice(&hdd, None, false, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
+        let game = disk_advice(&hdd, None, Logged::Nothing, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
         assert!(game.contains("move that game to an SSD"), "{game}");
         // The same files on an SSD are not a reason to move anything.
         let mut ssd = usb_hdd();
         ssd.spinning = Some(false);
-        let on_ssd = disk_advice(&ssd, None, false, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
+        let on_ssd = disk_advice(&ssd, None, Logged::Nothing, file_hint(&[row("D:\\Games\\x\\data.pak", 1, 9, 100.0, 50.0)]));
         assert!(!on_ssd.contains("move that game"), "{on_ssd}");
     }
 

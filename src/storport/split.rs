@@ -21,6 +21,7 @@
 //! rest). The remainder of the DiskIo time is "waiting in Windows". Neither can go negative:
 //! anything that does not fit is clipped and counted as an anomaly.
 
+use crate::diskwhy::Cause;
 use crate::state::IoRec;
 use crate::util::{fmt_dur, ms_to_ticks, plural};
 
@@ -216,9 +217,16 @@ pub fn event_words(s: &Split) -> String {
 const MOSTLY: f64 = 0.75;
 
 /// The disk finding's line on where the slow time went, or `None` when nothing was matched.
-/// `busy` is whether the traffic around the requests already made the drive "busy": then time
-/// inside the drive includes waiting in the drive's own queue behind that traffic, which is said.
-pub fn finding_sentence(t: &SplitTotals, busy: bool) -> Option<String> {
+/// `cause` is why the slow requests seemed slow (`DiskWhy::main_cause`), and it decides what each
+/// side's time means:
+/// - Busy: time inside the drive includes the drive's own queue behind that traffic, and time in
+///   Windows is the queue the drive could not take yet.
+/// - WokeUp: time in Windows is Windows bringing the drive back to full power before it hands it
+///   the request. Measured on a field PC: the ~2.1 s above the port disappeared when the disk's
+///   idle power management was turned off (classpnp `DisableIdlePowerManagement`), with nothing
+///   else changed. A 0.9.1 report blamed "the programs using it" for this, for one request.
+/// - Flush / IdleSlow: little else was asked of the drive, so time in Windows was not a queue.
+pub fn finding_sentence(t: &SplitTotals, cause: Option<Cause>) -> Option<String> {
     let matched = t.matched();
     let total = t.inside + t.waiting;
     if matched == 0 || total <= 0 {
@@ -236,13 +244,30 @@ pub fn finding_sentence(t: &SplitTotals, busy: bool) -> Option<String> {
         // Measured live: a hard drive kept seeking by two programs showed 95% of the slow time
         // "inside the drive". That is the drive working through its own queue, and blaming the
         // drive, cable or firmware for it sends people to the wrong fix.
-        s.push_str(if busy {
-            " Mostly inside the drive, working through the requests it had been handed: the traffic named above is the cause, not the drive."
-        } else {
-            " Mostly inside the drive, with little else asked of it: the drive itself, its cable or its firmware was slow to answer."
+        s.push_str(match cause {
+            Some(Cause::Busy) => {
+                " Mostly inside the drive, working through the requests it had been handed: the traffic named above is the cause, not the drive."
+            }
+            Some(Cause::WokeUp) => " Mostly inside the drive: that is the drive's own time to wake up from sleep.",
+            _ => " Mostly inside the drive, with little else asked of it: the drive itself, its cable or its firmware was slow to answer.",
         });
     } else if share <= 1.0 - MOSTLY {
-        s.push_str(" Mostly waiting in Windows: more was asked of the drive at once than it could take, which points back at the programs using it.");
+        s.push_str(match cause {
+            Some(Cause::Busy) => {
+                " Mostly waiting in Windows: more was asked of the drive at once than it could take, which points back at the programs using it."
+            }
+            // No "the drive answered quickly": the share is relative, and 207 ms inside the drive
+            // (the field case) is itself past the slow-request threshold.
+            Some(Cause::WokeUp) => {
+                " Mostly waiting in Windows: the drive had gone to sleep, and Windows was bringing it back to full power before \
+                 handing it the request."
+            }
+            Some(Cause::Flush | Cause::IdleSlow) => {
+                " Mostly waiting in Windows: little else was asked of the drive, so this was not a queue."
+            }
+            // Why is unknown, and the numbers already say where the time was.
+            None => "",
+        });
     } else {
         s.push_str(" Both played a part.");
     }
@@ -396,24 +421,44 @@ mod tests {
             unmatched,
             ..SplitTotals::default()
         };
-        let drive = finding_sentence(&t(19_000.0, 400.0, 14, 2), false).unwrap();
+        let idle = Some(Cause::IdleSlow);
+        let drive = finding_sentence(&t(19_000.0, 400.0, 14, 2), idle).unwrap();
         assert!(
             drive.contains("14 of 16 slow requests") && drive.contains("with little else asked of it: the drive itself, its cable"),
             "{drive}"
         );
-        assert!(finding_sentence(&t(19_000.0, 400.0, 14, 0), true).unwrap().contains("all 14"));
-        let busy = finding_sentence(&t(19_000.0, 400.0, 14, 0), true).unwrap();
+        let busy_cause = Some(Cause::Busy);
+        assert!(finding_sentence(&t(19_000.0, 400.0, 14, 0), busy_cause).unwrap().contains("all 14"));
+        let busy = finding_sentence(&t(19_000.0, 400.0, 14, 0), busy_cause).unwrap();
         assert!(busy.contains("the traffic named above is the cause") && !busy.contains("cable"), "{busy}");
-        let queue = finding_sentence(&t(300.0, 9_000.0, 5, 0), false).unwrap();
+        let queue = finding_sentence(&t(300.0, 9_000.0, 5, 0), busy_cause).unwrap();
         assert!(queue.contains("Mostly waiting in Windows") && queue.contains("programs using it"), "{queue}");
-        assert!(finding_sentence(&t(500.0, 500.0, 5, 0), false).unwrap().ends_with("Both played a part."));
-        assert!(finding_sentence(&t(0.0, 0.0, 0, 9), false).is_none(), "nothing matched says nothing");
+        // Only a busy drive has a queue; on an idle one the programs are not to blame.
+        let quiet = finding_sentence(&t(300.0, 9_000.0, 5, 0), idle).unwrap();
+        assert!(quiet.contains("not a queue") && !quiet.contains("programs using it"), "{quiet}");
+        let unknown = finding_sentence(&t(300.0, 9_000.0, 5, 0), None).unwrap();
+        assert!(unknown.ends_with("waiting in Windows before reaching it.") && !unknown.contains("programs"), "{unknown}");
+        assert!(finding_sentence(&t(500.0, 500.0, 5, 0), idle).unwrap().ends_with("Both played a part."));
+        assert!(finding_sentence(&t(0.0, 0.0, 0, 9), idle).is_none(), "nothing matched says nothing");
         // The audience rule: nothing here tells anyone to close or stop anything.
-        for s in [drive, queue, NOT_MEASURED.to_string()] {
+        for s in [drive, queue, quiet, NOT_MEASURED.to_string()] {
             let l = s.to_lowercase();
             for bad in ["close", "end task", "uninstall", "pause", "stop"] {
                 assert!(!l.contains(bad), "{bad}: {s}");
             }
         }
+    }
+
+    /// The 0.9.1 field report: one request after 140 s of silence, 207 ms in the drive and 1459 ms
+    /// above it. That is Windows powering the drive back up, not a queue of programs.
+    #[test]
+    fn a_wake_up_wait_in_windows_is_power_not_a_queue() {
+        let t = SplitTotals { inside: ms(207.0), waiting: ms(1459.0), by_irp: 1, ..SplitTotals::default() };
+        let s = finding_sentence(&t, Some(Cause::WokeUp)).unwrap();
+        assert!(s.contains("back to full power") && !s.contains("programs using it") && !s.contains("more was asked"), "{s}");
+        assert!(!s.contains("quickly"), "207 ms is past the slow threshold, so it is never called quick: {s}");
+        let drive = SplitTotals { inside: ms(1800.0), waiting: ms(10.0), by_irp: 1, ..SplitTotals::default() };
+        let s = finding_sentence(&drive, Some(Cause::WokeUp)).unwrap();
+        assert!(s.contains("wake up from sleep") && !s.contains("cable"), "{s}");
     }
 }
