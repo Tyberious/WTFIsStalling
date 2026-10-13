@@ -20,6 +20,16 @@ What changed in each release, in short. The full notes, with details and downloa
 
 ### Fixed
 - The 64-bit build of an Intel utility driver (`semav6msr64.sys`) was never recognized.
+- A drive that had gone to sleep was said to have been asked for more than it could take, "which points back at
+  the programs using it", when the time was Windows bringing it back to full power. The split between time in
+  Windows and time in the drive is now explained by why the request was slow, and only a busy drive is said to
+  have had a queue.
+- Any entry in the Windows event log for a slow drive replaced the measured cause and its advice (for example how
+  to stop a drive from sleeping) with "back up what matters now". The measured advice now stays, and a drive
+  whose only entry is an unexpected disconnect is no longer treated as failing.
+- When all network filter drivers were Microsoft's, a stall in Windows' network stack was said not to be a VPN or
+  security product's doing. That list cannot see Windows Filtering Platform rules, which is where most VPNs and
+  firewalls hook in, so the report now says so instead.
 
 ## 0.9.1 (2026-09-24)
 
